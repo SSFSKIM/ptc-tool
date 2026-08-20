@@ -11,7 +11,8 @@ def test_exec_writes_log_and_record(ptc_home):
     assert isinstance(out, Completed)
     assert "hello 42" in out.output
     rec = read_record("c1", out.cell_id)
-    assert rec.status == "ok" and rec.result_repr == "42" and rec.duration_ms >= 0
+    assert rec.status == "ok" and rec.result_repr == "42"
+    assert 0 <= rec.duration_ms < 60_000     # a real elapsed span, not a since-boot counter
     text, off = read_output_since("c1", out.cell_id, 0)
     assert "hello 42" in text and off > 0
     # state persists across cells

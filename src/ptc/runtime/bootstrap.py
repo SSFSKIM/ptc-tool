@@ -33,16 +33,25 @@ class _Tee:
                 pass
             self._file = None
         if path is not None:
-            self._file = open(path, "a", errors="replace")
+            self._file = open(path, "a", errors="replace", encoding="utf-8")
 
     def write(self, s):
-        if self._file:
+        # Bind the handle once: a user background thread can be inside write() while
+        # _switch(None) closes and clears it, and a write to a closed file raises
+        # ValueError, not OSError (M3). Never let a mirror failure break the stream.
+        f = self._file
+        if f:
             try:
-                self._file.write(s)
-                self._file.flush()
-            except OSError:
+                f.write(s)
+                f.flush()
+            except (OSError, ValueError):
                 pass
         return self._inner.write(s)
+
+    def writelines(self, lines):
+        # Route through write() or the log misses everything written this way (M7).
+        for line in lines:
+            self.write(line)
 
     def flush(self):
         return self._inner.flush()
@@ -142,7 +151,8 @@ def _log_write(text: str) -> None:
     if STATE.current_cell is None:
         return
     try:
-        with open(cells() / f"{STATE.current_cell}.log", "a", errors="replace") as f:
+        with open(cells() / f"{STATE.current_cell}.log", "a",
+                  errors="replace", encoding="utf-8") as f:
             f.write(text)
     except OSError:
         pass
@@ -167,17 +177,33 @@ def _install_traceback_mirror():
     ip._showtraceback = _showtraceback
 
 
+def _in_flight() -> bool:
+    """True from a cell's pre_run_cell until its record lands on disk. The record is
+    the durable end-of-cell marker, so this stays true for a cell whose thread is
+    wedged and cannot update `last_activity`."""
+    n = STATE.current_cell
+    return n is not None and not (cells() / f"{n}.json").exists()
+
+
+def _is_idle(ttl: float) -> bool:
+    """Idle is BOTH halves: nothing running AND nothing happening for `ttl` seconds.
+    `last_activity` is stamped when a cell STARTS, so without the in-flight half the
+    watchdog kills any cell that runs longer than the TTL, mid-execution (I1)."""
+    return not _in_flight() and time.time() - STATE.last_activity > ttl
+
+
 def _watchdog():
     from ptc.lock import key_lock
     hours = float(STATE.config.get("idle_hours", 24.0))
+    ttl = hours * 3600
     while True:
-        time.sleep(min(30.0, max(hours * 3600 / 10, 0.5)))
-        idle = time.time() - STATE.last_activity
-        if idle < hours * 3600:
+        time.sleep(min(30.0, max(ttl / 10, 0.5)))
+        if not _is_idle(ttl):
             continue
+        idle = time.time() - STATE.last_activity
         try:
             with key_lock(STATE.key):
-                if time.time() - STATE.last_activity < hours * 3600:
+                if not _is_idle(ttl):
                     continue
                 (STATE.kernel_dir / "expired.marker").write_text(
                     f"expired after {idle / 3600:.2f} h idle at {time.strftime('%F %T')}")

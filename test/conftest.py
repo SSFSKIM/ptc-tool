@@ -27,6 +27,38 @@ def kernel_venv() -> Path:
     return CACHE_VENV
 
 
+@pytest.fixture(autouse=True)
+def _reap_kernels(tmp_path):
+    """Kill every kernel a test spawned under its own PTC_HOME, however it ended.
+
+    Tests kill their kernels on the happy path, but a failed assertion skips that line
+    and leaves a detached kernel running for the rest of the machine's uptime. Resolve
+    PTC_HOME from tmp_path rather than the environment: monkeypatch's env teardown may
+    already have run by the time this finalizer does.
+    """
+    yield
+    root = tmp_path / "ptc-home" / "kernels"
+    if not root.is_dir():
+        return
+    prev = os.environ.get("PTC_HOME")
+    os.environ["PTC_HOME"] = str(tmp_path / "ptc-home")
+    try:
+        from ptc.kernel import kill_kernel
+        for kd in root.iterdir():
+            if kd.is_dir():
+                try:
+                    kill_kernel(kd.name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        if prev is None:
+            os.environ.pop("PTC_HOME", None)
+        else:
+            os.environ["PTC_HOME"] = prev
+
+
 @pytest.fixture
 def ptc_home(tmp_path, monkeypatch, kernel_venv) -> Path:
     """Isolated PTC_HOME whose venv/ is the cached real venv."""
