@@ -1,7 +1,6 @@
 """Provision ~/.ptc/venv with uv. Stamp payload is shared with plugin/bin/ptc-launch."""
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
