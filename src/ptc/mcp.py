@@ -50,15 +50,25 @@ def _resolve(explicit: str | None):
     return Resolved(f"adapter-{os.getpid()}", "adapter-local", None, None, True)
 
 
+_MAX_IMAGE_BYTES = 1_500_000
+
+
 def _content(rendered) -> list:
     out = [TextContent(type="text", text=rendered.text)]
     budget = 4_000_000 - len(rendered.text)
     for p in rendered.images[:2]:
-        data = Path(p).read_bytes()
+        path = Path(p)
+        size = path.stat().st_size
+        if size > _MAX_IMAGE_BYTES:
+            out.append(TextContent(type="text", text=(
+                f"[image {path.name} skipped: {size} bytes exceeds 1.5MB per-image cap "
+                f"— saved at {path}]")))
+            continue
+        data = path.read_bytes()
         if len(data) * 1.4 > budget:      # base64 inflation
             break
         import base64
-        mime = "image/png" if str(p).endswith("png") else "image/jpeg"
+        mime = "image/png" if str(path).endswith("png") else "image/jpeg"
         out.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=mime))
         budget -= int(len(data) * 1.4)
     return out
