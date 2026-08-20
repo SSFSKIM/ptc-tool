@@ -33,7 +33,10 @@ def current() -> bool:
 
 def provision() -> None:
     uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-    subprocess.run([uv, "venv", str(VENV), "--python", "3.12", "--seed"], check=True)
+    # --clear: uv refuses to create a venv where one already exists, which is the state
+    # every upgrade starts from. It still declines to wipe a non-venv directory.
+    subprocess.run([uv, "venv", str(VENV), "--python", "3.12", "--seed", "--clear"],
+                   check=True)
     subprocess.run([uv, "pip", "install", "--python", str(PY), "-e", f"{PKG}[kernel]"], check=True)
     STAMP.write_text(json.dumps(payload()))
 

@@ -53,7 +53,10 @@ def ensure_venv(run=subprocess.run) -> Path:
                            f"remove {lock} if no other ptc process is running")
     try:
         uv = _uv()
-        run([uv, "venv", str(venv_dir()), "--python", "3.12", "--seed"], check=True)
+        # --clear: uv refuses to create a venv where one already exists, which is the
+        # state every upgrade starts from. It still declines to wipe a non-venv directory.
+        run([uv, "venv", str(venv_dir()), "--python", "3.12", "--seed", "--clear"],
+            check=True)
         run([uv, "pip", "install", "--python", str(venv_python()),
              "-e", f"{PKG_ROOT}[kernel]"], check=True)
         (venv_dir() / ".ptc-version").write_text(json.dumps(stamp_payload()))

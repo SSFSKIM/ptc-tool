@@ -1,4 +1,5 @@
 import json
+import subprocess
 import time
 
 import pytest
@@ -12,6 +13,11 @@ def _fake_run_factory(calls):
         # simulate uv creating the python binary on `uv venv`
         if cmd[1] == "venv":
             p = venv_dir() / "bin"
+            if p.exists() and "--clear" not in cmd:
+                # uv 0.11: "A virtual environment already exists at: ..." (exit 2).
+                # The re-provision path hits this on every upgrade, so the fake must
+                # refuse exactly as uv does.
+                raise subprocess.CalledProcessError(2, cmd)
             p.mkdir(parents=True, exist_ok=True)
             (p / "python").write_text("#!fake\n")
         class R: returncode = 0
