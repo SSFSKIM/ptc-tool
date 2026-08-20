@@ -120,7 +120,9 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                                    time.time(), secrets.token_hex(8), epoch))
             write_meta(key, kernel_key=key, claude_session_id=claude_session_id,
                        cwd=work, depth=cfg.depth, epoch=epoch)
-            (kd / "ready").write_text(epoch)
+            from .client import run_bootstrap
+            run_bootstrap(key, cfg)
+            (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
         except BaseException:
             proc.kill()
             for name in ("owner.json", "ready", "connection.json"):
