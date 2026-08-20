@@ -4,12 +4,18 @@ Three live scenarios against release Claude Code, driven headlessly:
   1 fresh session      2 --resume of that session      3 two concurrent sessions, one cwd
 
 Each scenario runs one tiny turn that execs test/spikes/s3_probe.py inside the kernel and
-calls mcp__ptc__kernels; the probe reports the adapter's own ancestry and what T13's
-run-file resolver returns for it. Raw stream-json tool_result blocks are printed verbatim.
+calls the kernels tool; the probe reports the adapter's own ancestry and what T13's
+run-file resolver returns for it. Raw stream-json tool_result blocks are printed verbatim,
+and so are the tool_use *names* the model emitted — that is the evidence for how a
+plugin-provided server's tools are actually named (`mcp__plugin_ptc_ptc__*` vs
+`mcp__ptc__*`), which the spec's install snippet depends on.
 
-Usage:  PTC_LIVE=1 uv run --group dev python test/spikes/s3_hook_discovery.py [1|2|3 ...]
-        (scenario numbers select stages; default runs all three. Stage 2 needs a session
-        id: pass it as SESSION=<id> in the environment when running stage 2 alone.)
+Usage:  PTC_LIVE=1 uv run --group dev python test/spikes/s3_hook_discovery.py [1|2|3|4 ...]
+        (scenario numbers select stages; default runs 1-3. Stages 2 and 4 need a session
+        id: pass it as SESSION=<id> in the environment when running either one alone.
+        Stage 4 is off by default because it KILLS the session's kernel: it re-resumes
+        with the kernel gone so the adapter must respawn it, and without the env stripped,
+        to read the adapter's ancestry under --resume and test keying fallback 4.)
 
 The launching environment is stripped of CLAUDE_CODE_SESSION_ID/CLAUDECODE: without that,
 a nested `claude` inherits the OUTER session's id and the adapter reads it as its own
@@ -26,13 +32,16 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 PLUGIN = ROOT / "plugin"
 PROBE = ROOT / "test" / "spikes" / "s3_probe.py"
 SCRATCH = Path("/tmp/ptc-s3-scratch")
-PROMPT = (f"Call the mcp__ptc__exec tool with exactly this code: "
+# Plugin-provided servers are namespaced `mcp__plugin_<plugin>_<server>__<tool>`; the
+# short `mcp__ptc__*` form only exists for a directly registered server. Naming the tools
+# the way an installed plugin exposes them is what makes the emitted tool_use names
+# evidence rather than an echo of the prompt.
+PROMPT = (f"Call the mcp__plugin_ptc_ptc__exec tool with exactly this code: "
           f"exec(open('{PROBE}').read())\n"
-          f"Then call the mcp__ptc__kernels tool. Then reply with just: DONE")
+          f"Then call the mcp__plugin_ptc_ptc__kernels tool. Then reply with just: DONE")
 
 CLEAN_ENV = {k: v for k, v in os.environ.items()
              if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
-assert "ANTHROPIC_API_KEY" not in CLEAN_ENV, "subscription auth only"
 
 
 def run_claude(label: str, extra: list[str], clean: bool = True) -> dict:
@@ -41,8 +50,8 @@ def run_claude(label: str, extra: list[str], clean: bool = True) -> dict:
            "--output-format", "stream-json", "--verbose", *extra, PROMPT]
     p = subprocess.run(cmd, cwd=str(SCRATCH), env=CLEAN_ENV if clean else dict(os.environ),
                        capture_output=True, text=True, timeout=600)
-    out = {"label": label, "session_id": None, "tool_results": [], "text": [],
-           "stderr": p.stderr[-2000:], "rc": p.returncode}
+    out = {"label": label, "session_id": None, "tool_names": [], "tool_results": [],
+           "text": [], "stderr": p.stderr[-2000:], "rc": p.returncode}
     for line in p.stdout.splitlines():
         try:
             msg = json.loads(line)
@@ -50,7 +59,9 @@ def run_claude(label: str, extra: list[str], clean: bool = True) -> dict:
             continue
         out["session_id"] = msg.get("session_id") or out["session_id"]
         for block in (msg.get("message") or {}).get("content", []) or []:
-            if block.get("type") == "tool_result":
+            if block.get("type") == "tool_use":     # assistant turns carry the real name
+                out["tool_names"].append(block.get("name"))
+            elif block.get("type") == "tool_result":
                 out["tool_results"].append(block.get("content"))
             elif block.get("type") == "text":
                 out["text"].append(block["text"])
@@ -72,6 +83,7 @@ def snapshot(tag: str) -> None:
 
 def show(r: dict) -> None:
     print(f"\n===== {r['label']} (rc={r['rc']}) session_id={r['session_id']} =====")
+    print("TOOL_USE_NAMES:", json.dumps(r["tool_names"]))
     for tr in r["tool_results"]:
         print("TOOL_RESULT:", json.dumps(tr)[:2500])
     print("TEXT:", " ".join(r["text"])[:300])
@@ -83,6 +95,7 @@ def main() -> int:
     if os.environ.get("PTC_LIVE") != "1":
         print("set PTC_LIVE=1 to run this spike (it bills real quota)")
         return 1
+    assert "ANTHROPIC_API_KEY" not in CLEAN_ENV, "subscription auth only"
     stages = {int(a) for a in sys.argv[1:]} or {1, 2, 3}
     SCRATCH.mkdir(exist_ok=True)
     snapshot("before")

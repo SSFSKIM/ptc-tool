@@ -28,9 +28,14 @@ def parent_of(pid: int) -> tuple[int, str] | None:
 
 
 def find_claude_ancestor() -> int | None:
-    pid = os.getpid()
+    """Nearest ancestor pid whose comm basename contains "claude", else None.
+
+    One `ps` per hop: the (grandparent, name-of-parent) pair fetched to name this hop's
+    candidate is exactly the pair the next hop needs, so it is carried forward, not
+    re-queried. Bounded to 12 hops and stopped at init (ppid <= 1).
+    """
+    info = parent_of(os.getpid())
     for _ in range(12):
-        info = parent_of(pid)
         if info is None:
             return None
         ppid, _comm = info
@@ -41,11 +46,11 @@ def find_claude_ancestor() -> int | None:
             return None
         if "claude" in os.path.basename(up[1]):
             return ppid
-        pid = ppid
+        info = up
     return None
 
 
-def main() -> int:
+def _record() -> int:
     try:
         data = json.load(sys.stdin)
     except json.JSONDecodeError:
@@ -69,6 +74,16 @@ def main() -> int:
         except PermissionError:
             pass
     return 0
+
+
+def main() -> int:
+    """Always rc 0. The belt below is what makes "never fails a session start" true for
+    the inputs the specific handling inside does not name: JSON that parses to a non-dict,
+    stdin that is not UTF-8, a PTC_HOME that cannot be written."""
+    try:
+        return _record()
+    except Exception:
+        return 0
 
 
 if __name__ == "__main__":
