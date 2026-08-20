@@ -1,3 +1,4 @@
+import json
 import multiprocessing as mp
 import os
 import time
@@ -16,17 +17,27 @@ def test_yield_wait_busy_interrupt(ptc_home):
     out = kc.exec_cell("import time\nprint('start', flush=True)\ntime.sleep(600)", timeout_s=3, config=cfg)
     assert isinstance(out, Running) and "start" in out.output
 
+    # the yield seeded the cursor sidecar: a wait that carries no cursor of its own
+    # resumes after what the yield already delivered instead of replaying it
+    w0 = KernelClient("y1").wait_cell(out.cell_id, timeout_s=1)
+    assert isinstance(w0, Running) and w0.output == "" and w0.next_offset == out.next_offset
+
     # busy: a second exec must NOT queue
     out2 = KernelClient("y1").exec_cell("1+1", timeout_s=3, config=cfg)
     assert isinstance(out2, Busy) and out2.cell_id == out.cell_id
+    assert out2.reason == "running"
 
     # wait from a FRESH client object (fresh-adapter recovery), caller-held cursor
     w = KernelClient("y1").wait_cell(out.cell_id, timeout_s=2, since=out.next_offset)
     assert isinstance(w, Running) and w.output == ""      # no new output while sleeping
 
+    t0 = time.monotonic()
     kc.interrupt()
     w2 = KernelClient("y1").wait_cell(out.cell_id, timeout_s=15)
     assert isinstance(w2, Completed) and w2.record.status == "interrupted"
+    # the control channel did the interrupting: interrupt() waits a 2 s grace before
+    # falling back to SIGINT, so a settle inside that window cannot be the fallback's
+    assert time.monotonic() - t0 < 2.0, "interrupt fell through to the SIGINT fallback"
 
     out3 = KernelClient("y1").exec_cell("print(6*7)", timeout_s=30, config=cfg)
     assert isinstance(out3, Completed) and "42" in out3.output
@@ -80,10 +91,44 @@ def test_unconfirmed_submit_fails_closed(ptc_home):
 
     with pytest.raises(RuntimeError, match="never published it"):
         kc.exec_cell("1+1", timeout_s=5, config=cfg)
-    assert (ptc_home / "kernels" / "y5" / "cells" / "pending.json").exists()
-    assert KernelClient("y5").is_busy() == -1
-    assert KernelClient("y5").exec_cell("2+2", timeout_s=5, config=cfg) == Busy(-1)
+    pend = ptc_home / "kernels" / "y5" / "cells" / "pending.json"
+    assert pend.exists()
+    # the kernel got as far as execute_input, so the marker names the cell it swallowed
+    stranded = json.loads(pend.read_text())["cell_id"]
+    assert stranded is not None
+    assert KernelClient("y5").is_busy() == Busy(stranded, reason="pending-unconfirmed")
+    assert KernelClient("y5").exec_cell("2+2", timeout_s=5, config=cfg) == Busy(
+        stranded, reason="pending-unconfirmed")
     kill_kernel("y5")
+
+
+def test_submit_that_dies_before_acknowledgement_fails_closed(ptc_home, monkeypatch):
+    """Fail-closed covers the whole sent-unacknowledged window, not only the confirm
+    loop. Once kc.execute() has put the request on the wire the kernel may run it, so
+    every later failure — a lost execute_input, a torn-down channel, a Ctrl-C — has to
+    leave the marker behind; without it the next caller admits a second cell on top."""
+    ensure_kernel("y6", cwd=str(ptc_home))
+    cfg = Config.from_env()
+
+    def never_acknowledged(self, kc, msg_id, timeout=15.0):
+        raise TimeoutError("kernel never acknowledged the cell (no execute_input)")
+
+    monkeypatch.setattr(KernelClient, "_await_cell_id", never_acknowledged)
+    with pytest.raises(TimeoutError):
+        KernelClient("y6").exec_cell("1+1", timeout_s=5, config=cfg)
+    pend = ptc_home / "kernels" / "y6" / "cells" / "pending.json"
+    assert pend.exists()
+    assert json.loads(pend.read_text())["cell_id"] is None    # id never learned
+
+    # let the cell the kernel really did accept finish, so the busy verdict below can
+    # only be coming from the marker
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and KernelClient("y6").is_busy().reason == "running":
+        time.sleep(0.05)
+    # still patched: a Busy here proves the second caller never reached the wire
+    assert KernelClient("y6").exec_cell("2+2", timeout_s=5, config=cfg) == Busy(
+        -1, reason="pending-unconfirmed")
+    kill_kernel("y6")
 
 
 def test_wait_on_archived_epoch_cell(ptc_home):
@@ -100,6 +145,11 @@ def test_wait_on_archived_epoch_cell(ptc_home):
     w = KernelClient("y3").wait_cell(old_id, timeout_s=5)
     assert isinstance(w, Completed)
     assert "previous kernel epoch" in w.output and "old-epoch" in w.output
+    # the archive honors the cursor too: settling it advanced the sidecar, so a repeat
+    # wait re-states which epoch the cell belongs to without replaying its log
+    again = KernelClient("y3").wait_cell(old_id, timeout_s=5)
+    assert isinstance(again, Completed)
+    assert "previous kernel epoch" in again.output and "old-epoch" not in again.output
     # monotonic: the new epoch's first user cell id is above the archived max
     out2 = KernelClient("y3").exec_cell("print('new')", timeout_s=30, config=cfg)
     assert out2.cell_id > old_id

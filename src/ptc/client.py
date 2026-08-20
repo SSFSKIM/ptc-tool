@@ -37,6 +37,17 @@ class Running:
 @dataclass
 class Busy:
     cell_id: int | None
+    #: why admission was refused — "running", "pending-unconfirmed", "lock-held"
+    reason: str = ""
+
+
+def _epoch_ended_record() -> dict:
+    """The settle for a cell whose kernel epoch ended before it did (F3)."""
+    return {"status": "error", "duration_ms": 0, "result_repr": None,
+            "error": {"ename": "KernelEpochEnded",
+                      "evalue": "the kernel restarted before this cell finished",
+                      "traceback": ""},
+            "images": [], "mutations": []}
 
 
 class KernelClient:
@@ -71,24 +82,42 @@ class KernelClient:
                 return Completed(cell_id, rec, out)
             time.sleep(0.2)
         out, off = read_output_since(self.key, cell_id, 0)
+        # seed the cursor sidecar: this output has been handed to the caller, so a
+        # later cursorless wait_cell must resume after it instead of replaying it
+        save_offset(self.key, cell_id, off)
         return Running(cell_id, out, off)
 
     # -- busy model (F2): a kernel is busy when the kernel-side current.json names a
     # cell with no terminal record, OR when a submitted request has not yet been
-    # acknowledged (pending.json, written only on the confirm-failure path).
-    def is_busy(self) -> int | None:
+    # confirmed (pending.json, left behind by any failure inside the window where a
+    # request is on the wire but current.json does not name it yet).
+    def is_busy(self) -> Busy | None:
         cur = current_cell(self.key)
         if cur is not None and read_record(self.key, cur) is None and kernel_alive(self.key):
-            return cur
+            return Busy(cur, reason="running")
         pend = kernel_dir(self.key) / "cells" / "pending.json"
         try:
             data = json.loads(pend.read_text())
             if time.time() - data.get("submitted_at", 0) < 60 and kernel_alive(self.key):
-                return -1          # busy admitting an unacknowledged cell
+                # busy admitting an unacknowledged cell; the marker names it when the
+                # kernel got as far as execute_input, else nobody knows its id yet
+                cid = data.get("cell_id")
+                return Busy(cid if cid is not None else -1, reason="pending-unconfirmed")
             pend.unlink(missing_ok=True)
         except (OSError, json.JSONDecodeError):
             pass
         return None
+
+    def _mark_pending(self, msg_id: str, cell_id: int | None) -> None:
+        """Record a request that is on the wire but unconfirmed. Best effort: a marker
+        we cannot write must not mask the fault that sent us here."""
+        try:
+            pend = kernel_dir(self.key) / "cells" / "pending.json"
+            pend.parent.mkdir(parents=True, exist_ok=True)
+            pend.write_text(json.dumps(
+                {"msg_id": msg_id, "cell_id": cell_id, "submitted_at": time.time()}))
+        except OSError:
+            pass
 
     def exec_cell(self, code: str, timeout_s: float, config: Config) -> Completed | Running | Busy:
         """Atomic admission (F2): the submit lock is held from the busy check until the
@@ -98,29 +127,34 @@ class KernelClient:
             lock_cm = submit_lock(self.key)
             lock_cm.__enter__()
         except TimeoutError:
-            return Busy(self.is_busy())
+            held = self.is_busy()
+            return Busy(held.cell_id if held is not None else None, reason="lock-held")
         try:
             busy = self.is_busy()
             if busy is not None:
-                return Busy(busy)
+                return busy
             kc = self._connect()
             try:
                 msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
-                cell_id = self._await_cell_id(kc, msg_id)
-                deadline = time.monotonic() + 15.0
-                while current_cell(self.key) != cell_id:
-                    if time.monotonic() >= deadline:
-                        # fail closed: mark the unacknowledged submission so every
-                        # later busy check sees it, then surface the fault (F2)
-                        pend = kernel_dir(self.key) / "cells" / "pending.json"
-                        pend.parent.mkdir(parents=True, exist_ok=True)
-                        pend.write_text(json.dumps(
-                            {"msg_id": msg_id, "submitted_at": time.time()}))
-                        raise RuntimeError(
-                            f"kernel {self.key} accepted cell {cell_id} but never "
-                            "published it; the kernel may be wedged — interrupt() or "
-                            "restart()")
-                    time.sleep(0.02)
+                # sent-unacknowledged window: the request is on the wire and nothing on
+                # disk records it. EVERY exit from here until current.json names our
+                # cell must fail closed with a marker — a lost acknowledgement, a
+                # wedged kernel, a Ctrl-C — or the next caller admits a second cell on
+                # top of one this kernel may still be about to run (F2).
+                cell_id = None
+                try:
+                    cell_id = self._await_cell_id(kc, msg_id)
+                    deadline = time.monotonic() + 15.0
+                    while current_cell(self.key) != cell_id:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(
+                                f"kernel {self.key} accepted cell {cell_id} but never "
+                                "published it; the kernel may be wedged — interrupt() or "
+                                "restart()")
+                        time.sleep(0.02)
+                except BaseException:
+                    self._mark_pending(msg_id, cell_id)
+                    raise
                 (kernel_dir(self.key) / "cells" / "pending.json").unlink(missing_ok=True)
             finally:
                 kc.stop_channels()
@@ -128,27 +162,26 @@ class KernelClient:
             lock_cm.__exit__(None, None, None)
         return self._follow(cell_id, timeout_s)
 
-    def _archived(self, cell_id: int) -> Completed | None:
-        """A cell id from a previous kernel epoch (F3): settle it from the archive."""
+    def _archived(self, cell_id: int, offset: int = 0) -> Completed | None:
+        """A cell id from a previous kernel epoch (F3): settle it from the archive,
+        resuming at the caller's cursor so an already-delivered log is not replayed."""
         for d in sorted(kernel_dir(self.key).glob("cells-prev-*"), reverse=True):
             log = d / f"{cell_id}.log"
             if not log.exists():
                 continue
-            text = log.read_text(errors="replace")
-            rec = None
+            raw = log.read_bytes()
+            text = raw[max(offset, 0):].decode(errors="replace")
+            save_offset(self.key, cell_id, len(raw))
             try:
                 rec = json.loads((d / f"{cell_id}.json").read_text())
-            except (OSError, json.JSONDecodeError):
-                pass
-            if rec is None:
-                rec = {"status": "error", "duration_ms": 0, "result_repr": None,
-                       "error": {"ename": "KernelEpochEnded",
-                                 "evalue": "the kernel restarted before this cell finished",
-                                 "traceback": ""},
-                       "images": [], "mutations": []}
-            rec.setdefault("error", None)
+                rec.setdefault("error", None)
+                record = CellRecord(**rec)
+            except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+                # missing, unreadable, or written to a schema this build does not
+                # know: an archived cell must still settle, never crash the wait
+                record = CellRecord(**_epoch_ended_record())
             note = f"\n[cell {cell_id} belongs to a previous kernel epoch — archived at {d}]"
-            return Completed(cell_id, CellRecord(**rec), text + note)
+            return Completed(cell_id, record, text + note)
         return None
 
     def wait_cell(self, cell_id: int, timeout_s: float, since: int = -1) -> Completed | Running:
@@ -161,7 +194,7 @@ class KernelClient:
                 save_offset(self.key, cell_id, new_off)
                 return Completed(cell_id, rec, text)
             if not (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
-                arch = self._archived(cell_id)
+                arch = self._archived(cell_id, offset)
                 if arch is not None:
                     return arch
             if not kernel_alive(self.key):
