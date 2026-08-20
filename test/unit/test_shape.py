@@ -1,7 +1,7 @@
 from ptc.cells import CellRecord
 from ptc.client import Busy, Completed, Running
 from ptc.paths import Config
-from ptc.shape import footer_line, render
+from ptc.shape import footer_line, render, to_dict
 
 
 def _rec(**kw):
@@ -44,3 +44,55 @@ def test_footer_and_error():
                             error={"ename": "ValueError", "evalue": "bad", "traceback": "tb"}), "")
     r = render(out, "k", Config.from_env(env={}))
     assert "[cell 2 · error" in r.text and "ValueError: bad" in r.text
+
+
+# --- self-review extension: Busy carries (cell_id, reason) since T6 — "running",
+# "pending-unconfirmed", "lock-held". None/-1 mean no real id is known; the three
+# reasons must render distinct guidance and never fabricate an id (client.py docs
+# this as the tri-state contract shape.render() must honor).
+
+def test_render_busy_reasons_distinguish_without_fabricating_ids():
+    cfg = Config.from_env(env={})
+
+    running = render(Busy(7, reason="running"), "k", cfg)
+    assert "cell 7 is still running" in running.text
+    assert "wait(cell_id=7)" in running.text
+
+    pending_known = render(Busy(7, reason="pending-unconfirmed"), "k", cfg)
+    assert "confirmation" in pending_known.text and "wait(cell_id=7)" in pending_known.text
+
+    # -1 is the wedged sentinel (client.py): the kernel never echoed execute_input,
+    # so no real id exists yet — must not be printed or handed to wait().
+    pending_sentinel = render(Busy(-1, reason="pending-unconfirmed"), "k", cfg)
+    assert "wait(cell_id=" not in pending_sentinel.text
+    assert "-1" not in pending_sentinel.text
+
+    lock_known = render(Busy(7, reason="lock-held"), "k", cfg)
+    assert "admission lock" in lock_known.text and "wait(cell_id=7)" in lock_known.text
+
+    # our own lock acquisition timed out and is_busy() found nothing conclusive:
+    # genuinely no id, must not print "None" or invent one.
+    lock_unknown = render(Busy(None, reason="lock-held"), "k", cfg)
+    assert "wait(cell_id=" not in lock_unknown.text and "None" not in lock_unknown.text
+
+    # the two id-less reasons must not collapse into identical guidance
+    assert pending_sentinel.text != lock_unknown.text
+
+
+def test_truncate_non_positive_cap_still_truncates():
+    """PTC_MAX_OUTPUT_CHARS=0 must not defeat truncation: Python's text[-0:] is the
+    WHOLE string (not empty), so a naive tail slice would leak everything back out
+    exactly when the operator asked for the strictest cap."""
+    big = "y" * 500
+    out = Completed(4, _rec(), big)
+    cfg = Config.from_env(env={"PTC_MAX_OUTPUT_CHARS": "0"})
+    r = render(out, "k", cfg)
+    assert ("y" * 500) not in r.text
+    assert "[truncated 500 chars" in r.text
+
+
+def test_to_dict_busy_carries_reason():
+    """to_dict is the JSON-facing twin of render(); a --json/MCP caller needs the
+    same reason distinction a text reader gets from the prose."""
+    d = to_dict(Busy(None, reason="lock-held"), "k")
+    assert d == {"status": "busy", "cell_id": None, "reason": "lock-held"}
