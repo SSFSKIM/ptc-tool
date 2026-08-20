@@ -2,6 +2,8 @@ import multiprocessing as mp
 import os
 import time
 
+import pytest
+
 from ptc.client import Busy, Completed, KernelClient, Running
 from ptc.kernel import ensure_kernel, kill_kernel
 from ptc.paths import Config
@@ -57,6 +59,31 @@ def test_two_simultaneous_execs_one_runs_one_is_told_busy(ptc_home):
     [p.join(timeout=30) for p in ps]
     assert kinds == ["Busy", "Running"], kinds
     kill_kernel("y4")
+
+
+def test_unconfirmed_submit_fails_closed(ptc_home):
+    """F2 fail-closed: a kernel that accepts a request but never publishes current.json
+    leaves a cell nobody can see. exec_cell refuses to pretend otherwise — it gives up
+    on its confirm budget, records the unacknowledged submission, and every later busy
+    check reports busy off that marker rather than admitting a second cell."""
+    ensure_kernel("y5", cwd=str(ptc_home))
+    cfg = Config.from_env()
+    kc = KernelClient("y5")
+    # take away the kernel's ability to publish current.json — precisely the fault the
+    # confirm loop exists for, and the only way to reach it without a wedged kernel
+    silence = kc.exec_cell(
+        "import ptc.runtime.bootstrap as _b\n"
+        "from IPython import get_ipython\n"
+        "get_ipython().events.unregister('pre_run_cell', _b._pre_run_cell)",
+        timeout_s=30, config=cfg)
+    assert isinstance(silence, Completed) and silence.record.status == "ok"
+
+    with pytest.raises(RuntimeError, match="never published it"):
+        kc.exec_cell("1+1", timeout_s=5, config=cfg)
+    assert (ptc_home / "kernels" / "y5" / "cells" / "pending.json").exists()
+    assert KernelClient("y5").is_busy() == -1
+    assert KernelClient("y5").exec_cell("2+2", timeout_s=5, config=cfg) == Busy(-1)
+    kill_kernel("y5")
 
 
 def test_wait_on_archived_epoch_cell(ptc_home):
