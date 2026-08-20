@@ -1,7 +1,12 @@
 import json
 import multiprocessing as mp
 import os
+import subprocess
+import time
 
+import pytest
+
+from ptc import kernel
 from ptc.kernel import ensure_kernel, kernel_alive, kill_kernel, list_kernels
 from ptc.ownership import read_owner
 
@@ -46,3 +51,25 @@ def test_dead_owner_is_cleaned_and_respawned(ptc_home):
     # old cells dir rotated
     assert any(p.name.startswith("cells-prev-") for p in (ptc_home / "kernels" / "k2").iterdir())
     kill_kernel("k2")
+
+
+def test_spawn_failure_leaks_no_process(ptc_home, monkeypatch):
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(kernel, "write_meta", _boom)
+
+    conn_path = ptc_home / "kernels" / "failkey" / "connection.json"
+    with pytest.raises(RuntimeError, match="boom"):
+        ensure_kernel("failkey")
+
+    assert read_owner("failkey") is None
+    assert not (ptc_home / "kernels" / "failkey" / "ready").exists()
+
+    deadline = time.monotonic() + 5.0
+    result = subprocess.run(["pgrep", "-f", str(conn_path)],
+                            capture_output=True, text=True)
+    while result.returncode == 0 and time.monotonic() < deadline:
+        time.sleep(0.2)
+        result = subprocess.run(["pgrep", "-f", str(conn_path)],
+                                capture_output=True, text=True)
+    assert result.returncode != 0, f"kernel process(es) leaked: {result.stdout!r}"

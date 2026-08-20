@@ -115,15 +115,20 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             _wait_ports(conn)
             os.chmod(conn, 0o600)
             _kernel_info_roundtrip(conn)
-        except Exception:
+            epoch = str(int(time.time()))
+            write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
+                                   time.time(), secrets.token_hex(8), epoch))
+            write_meta(key, kernel_key=key, claude_session_id=claude_session_id,
+                       cwd=work, depth=cfg.depth, epoch=epoch)
+            (kd / "ready").write_text(epoch)
+        except BaseException:
             proc.kill()
+            for name in ("owner.json", "ready", "connection.json"):
+                try:
+                    (kd / name).unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
-        epoch = str(int(time.time()))
-        write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
-                               time.time(), secrets.token_hex(8), epoch))
-        write_meta(key, kernel_key=key, claude_session_id=claude_session_id,
-                   cwd=work, depth=cfg.depth, epoch=epoch)
-        (kd / "ready").write_text(epoch)
         return KernelInfo(key, proc.pid, conn, True, expired)
 
 
