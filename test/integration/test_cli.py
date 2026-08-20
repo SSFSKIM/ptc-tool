@@ -5,7 +5,10 @@ import sys
 
 
 def _cli(*args, env_extra=None, input_=None):
-    env = {**os.environ, **(env_extra or {})}
+    env = dict(os.environ)
+    env.pop("PTC_SESSION", None)
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    env.update(env_extra or {})
     return subprocess.run([sys.executable, "-m", "ptc.cli", *args],
                           capture_output=True, text=True, env=env, input=input_, timeout=120)
 
