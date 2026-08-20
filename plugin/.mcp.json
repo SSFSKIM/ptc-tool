@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "ptc": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ptc-launch"
+    }
+  }
+}

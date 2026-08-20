@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Provision ~/.ptc/venv if missing/stale, then exec the ptc MCP adapter from it.
+
+Stamp payload MUST stay byte-identical to ptc.venv.stamp_payload().
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("PTC_HOME") or (Path.home() / ".ptc"))
+VENV = HOME / "venv"
+PY = VENV / "bin" / "python"
+STAMP = VENV / ".ptc-version"
+PKG = Path(__file__).resolve().parent.parent.parent      # plugin/bin/ptc-launch -> ptc/
+
+
+def payload() -> dict:
+    sha = hashlib.sha256((PKG / "pyproject.toml").read_bytes()).hexdigest()
+    return {"schema": 1, "pyproject_sha": sha, "pkg": str(PKG)}
+
+
+def current() -> bool:
+    try:
+        return PY.exists() and json.loads(STAMP.read_text()) == payload()
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def provision() -> None:
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    subprocess.run([uv, "venv", str(VENV), "--python", "3.12", "--seed"], check=True)
+    subprocess.run([uv, "pip", "install", "--python", str(PY), "-e", f"{PKG}[kernel]"], check=True)
+    STAMP.write_text(json.dumps(payload()))
+
+
+def main() -> None:
+    if not current():
+        lock = HOME / "provision.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock.mkdir()
+            try:
+                provision()
+            finally:
+                lock.rmdir()
+        except FileExistsError:
+            for _ in range(1200):
+                if not lock.exists():
+                    break
+                time.sleep(0.5)
+            if not current():
+                print("ptc-launch: venv stale and provisioning lock held; "
+                      f"remove {lock} if nothing is provisioning", file=sys.stderr)
+                sys.exit(1)
+    os.environ["PTC_LAUNCHER"] = os.path.abspath(__file__)
+    os.execv(str(PY), [str(PY), "-m", "ptc.mcp"])
+
+
+if __name__ == "__main__":
+    main()
