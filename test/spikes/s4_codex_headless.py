@@ -45,12 +45,17 @@ def artifacts_dir() -> Path:
 
 
 def auto_reply(method: str, params: dict) -> dict:
-    """The fallback path: a result payload valid for each server→client request.
+    """The fallback path: a schema-valid result payload for each server→client request.
 
-    Keyed by the ten `ServerRequest` methods the installed binary declares. The
-    payloads are the *permissive* branch of each response schema where one exists,
-    and an explicit refusal where accepting would mean fabricating user data
-    (elicitations, free-text questions) or a credential we do not hold.
+    Keyed by the ten `ServerRequest` methods the installed binary declares. Where accepting
+    is unambiguous and low-risk (command/file-change approvals) the reply accepts. Elsewhere
+    it explicitly declines or denies rather than fabricating user data. Note in particular:
+    `{"answers": {}}` for `item/tool/requestUserInput` is schema-valid, but
+    `parse_mcp_tool_approval_response` (core/src/mcp_tool_call.rs:1884-1897) treats a missing
+    question id -- which an empty `answers` map always is -- as
+    `McpToolApprovalDecision::Cancel`, i.e. this *denies* the tool call rather than answering
+    it permissively. `mcpServer/elicitation/request` likewise explicitly declines. T22 should
+    treat each of these as a deliberate policy decision, not inherit them silently.
     """
     if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
         return {"decision": "accept"}
@@ -67,7 +72,13 @@ def auto_reply(method: str, params: dict) -> dict:
     if method == "item/tool/call":
         return {"contentItems": [{"type": "inputText", "text": ""}], "success": False}
     # attestation/generate and account/chatgptAuthTokens/refresh are host-credential
-    # requests we cannot satisfy; a JSON-RPC error is the honest reply.
+    # requests we cannot satisfy. This falls through to an empty {} *result*, which is
+    # NOT a valid reply for either method (their schemas require token / accessToken +
+    # chatgptAccountId respectively) -- a JSON-RPC error object would be the honest
+    # reply, but this probe does not send one (AppServer._next always replies with
+    # {"id": ..., "result": ...}, never {"id": ..., "error": ...}). Neither method was
+    # reached by this spike's live run. T22's real client must reply with a proper
+    # JSON-RPC error for methods it cannot satisfy, not an empty result.
     return {}
 
 
