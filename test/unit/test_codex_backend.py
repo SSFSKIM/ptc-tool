@@ -10,8 +10,10 @@ import asyncio
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -337,6 +339,52 @@ def test_close_leaves_no_codex_process_behind(fake):
     assert returncode is not None, "close() must wait for the child, not just signal it"
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)                    # reaped: signalling it must fail
+
+
+def test_close_lets_the_server_exit_on_its_own_after_eof(fake):
+    """A stdio app-server runs its shutdown — and with it the cleanup of the tool
+    subprocesses and stdio MCP servers it started — on the way out of the main loop, which
+    stdin EOF is what triggers. Closing stdin and signalling in the same breath pre-empted
+    that: stdio mode installs no SIGTERM handler, so the signal killed the server at the
+    default disposition and its process-tree cleanup never ran.
+    """
+    async def flow():
+        s = await codex_backend.open_session("hi", opts())
+        await s.wait_result()
+        child = s._proc._proc
+        await s.close()
+        return child.returncode
+
+    rc = asyncio.run(flow())
+    assert rc == 0, f"the child was signalled ({rc}) instead of being let go on EOF"
+
+
+def test_close_escalates_when_the_server_ignores_eof_and_sigterm(monkeypatch, tmp_path):
+    """The other side: a server that refuses both hints must still be gone, and close()
+    must stay bounded. `--stuck` is the fake's deliberately unfaithful mode — it ignores
+    SIGTERM and outlives EOF — because a faithful one can never reach this branch.
+
+    The two budgets are shortened here: what is under test is the ladder, not the
+    seconds, and the real values would spend ten of them on one test.
+    """
+    monkeypatch.setenv("CODEX_BIN", f"{FAKE_CMD} --stuck")
+    monkeypatch.delenv("PTC_CODEX_INHERIT", raising=False)
+    monkeypatch.setattr(codex_backend, "_EOF_GRACE_S", 1.0)
+    monkeypatch.setattr(codex_backend, "_TERMINATE_S", 1.0)
+
+    async def flow():
+        s = await codex_backend.open_session("hi", opts())
+        await s.wait_result()
+        child = s._proc._proc
+        t0 = time.monotonic()
+        await s.close()
+        return child.pid, child.returncode, time.monotonic() - t0
+
+    pid, rc, elapsed = asyncio.run(flow())
+    assert rc == -signal.SIGKILL, f"the stuck server was not escalated to SIGKILL ({rc})"
+    assert elapsed < 8, f"close() ran past its own budgets ({elapsed:.1f}s)"
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)                    # reaped, not merely signalled
 
 
 def test_close_mid_turn_settles_the_pending_turn(fake):

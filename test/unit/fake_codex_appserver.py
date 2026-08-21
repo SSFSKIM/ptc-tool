@@ -36,12 +36,23 @@ the exact bytes a client put on the wire. It is an ARGV option rather than an en
 variable because the backend builds its child's environment from an allowlist and forwards
 nothing else — a fake configured through the environment would be untraceable there, which
 is exactly the property the allowlist exists to have.
+
+``--stuck`` is the one mode that is deliberately NOT faithful: it ignores SIGTERM and
+outlives stdin EOF. The real 0.146.0 stdio server does the opposite of both (EOF ends its
+main loop and it then shuts its threads down, and it installs no SIGTERM handler at all, so
+the signal kills it). It exists to exercise the client's escalation ladder — the branch a
+faithful fake can never reach — not to model any server anyone should expect.
 """
 import json
+import signal
 import sys
+import time
 
 #: Where `--trace` writes, set in main().
 TRACE_PATH = None
+
+#: `--stuck`: outlive stdin EOF and ignore SIGTERM. Set in main().
+STUCK = False
 
 #: What the ``JSON`` marker answers with — a document a schema-constrained turn would send.
 _FINAL_JSON = '{"ok": 1}'
@@ -315,9 +326,12 @@ def _request_params(method, turn):
 
 
 def main():
-    global TRACE_PATH
+    global TRACE_PATH, STUCK
     if "--trace" in sys.argv:
         TRACE_PATH = sys.argv[sys.argv.index("--trace") + 1]
+    if "--stuck" in sys.argv:
+        STUCK = True
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     fake = Fake()
     for line in sys.stdin:
         line = line.strip()
@@ -338,6 +352,8 @@ def main():
         if rid is None:
             continue                      # some other client notification: nothing to do
         fake.on_request(m, rid, p)
+    while STUCK:                          # stdin hit EOF and this mode refuses to notice
+        time.sleep(3600)
 
 
 if __name__ == "__main__":

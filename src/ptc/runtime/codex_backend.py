@@ -52,6 +52,18 @@ _INTERRUPT_S = 30.0
 _TERMINATE_S = 5.0
 _STDERR_TAIL = 4000
 
+#: Grace for a VOLUNTARY exit after stdin EOF, taken before any signal.
+#:
+#: Closing stdin is how a stdio app-server is told its client is gone: the reader breaks on
+#: EOF, the main loop breaks with `stdio_connection_closed`, and only then does the server
+#: shut its threads down — which is what reaps the tool processes and stdio MCP servers it
+#: started (codex-rs/app-server/src/lib.rs, app-server-transport/src/transport/stdio.rs).
+#: Signalling in the same breath skipped all of that: stdio is `single_client_mode`, so
+#: `graceful_signal_restart_enabled` is false and NO shutdown handler is installed, meaning
+#: SIGTERM lands at the default disposition and kills the server outright. Signals are the
+#: fallback for a server that does not take the hint, not the first move.
+_EOF_GRACE_S = 5.0
+
 #: asyncio's StreamReader defaults to a 64 KiB line limit and raises
 #: `ValueError("Separator is not found, and chunk exceed the limit")` past it. Real
 #: app-server lines blow through that: a single `mcpServerStatus/list` result carrying the
@@ -69,6 +81,17 @@ _ISOLATION_ARGS = ("--disable", "hooks", "--disable", "plugins")
 
 #: Why this thread had no human on it, handed back wherever a reply needs a sentence.
 _UNATTENDED = "PTC runs this Codex thread unattended; no user is available to answer."
+
+
+async def _exited(proc, budget: float) -> bool:
+    """True once the child has been reaped, waiting at most `budget` seconds for it."""
+    if proc.returncode is not None:
+        return True
+    try:
+        await asyncio.wait_for(proc.wait(), budget)
+    except (TimeoutError, asyncio.TimeoutError):
+        return False
+    return True
 
 
 def _grant_nothing(_p: dict) -> dict:
@@ -251,17 +274,30 @@ class CodexProc:
         self._reader_task = self._stderr_task = None
         if proc is None:
             return
+        # EOF first, and then WAIT for it to be acted on: the app-server's own shutdown —
+        # the thing that reaps its tool subprocesses and stdio MCP servers — runs only on
+        # the way out of the main loop, and a SIGTERM sent in the same breath pre-empts it
+        # (see `_EOF_GRACE_S`). Escalation is per-pid, not a killpg, because this child is
+        # deliberately left in the KERNEL's process group: that membership is what makes
+        # `kill_process_tree` on kill/restart and the TTL watchdog reap it and anything it
+        # leaves behind, exactly as they reap agents.py's `claude` children
+        # (test/integration/test_child_reaping.py). Giving it a session of its own would
+        # buy a group kill here and forfeit that.
         if proc.stdin is not None and not proc.stdin.is_closing():
             proc.stdin.close()
-        if proc.returncode is None:
+        if await _exited(proc, _EOF_GRACE_S):
+            return
+        try:
             proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), _TERMINATE_S)
-            except (TimeoutError, asyncio.TimeoutError):
-                proc.kill()
-                await proc.wait()
-        else:
-            await proc.wait()
+        except ProcessLookupError:
+            pass
+        if await _exited(proc, _TERMINATE_S):
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
 
     # -- io ---------------------------------------------------------------
     async def _send(self, obj: dict) -> None:
