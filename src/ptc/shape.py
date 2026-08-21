@@ -27,7 +27,32 @@ def _truncate(text: str, cap: int, full_log: Path) -> str:
     return f"{head}\n… [truncated {cut} chars — full output: {full_log}]\n{tail}"
 
 
-def footer_line(mutations: list) -> str | None:
+_SEP = " · "
+
+
+def _more(n: int) -> str:
+    return f"… and {n} more mutation" + ("" if n == 1 else "s")
+
+
+def footer_budget(cap: int) -> int:
+    """The slice of the response budget the mutation footer may claim.
+
+    The footer is not a free tail: a cell that writes ten thousand files produced ~179k
+    characters of footer appended AFTER the output was truncated, so the cap the caller
+    asked for was bypassed by the one line nobody bounded. A tenth of the cap (floor 200)
+    is enough for the handful of mutations a normal cell makes — those render byte for
+    byte as before — and everything past it is summarized.
+    """
+    return max(cap // 10, 200)
+
+
+def footer_line(mutations: list, budget: int | None = None) -> str | None:
+    """The mutation footer, optionally bounded to `budget` characters.
+
+    With no budget (the CLI's `--json` twin, tests, callers with their own bound) the line
+    is the full join. With one, whole entries are kept while they fit and the rest becomes
+    "… and N more mutations" — never a partial entry, so what is shown is always true.
+    """
     parts = []
     for m in mutations:
         k = m.get("kind")
@@ -39,7 +64,21 @@ def footer_line(mutations: list) -> str | None:
             parts.append(f"ran: {m.get('command', '')[:80]}")
         elif k == "agent":
             parts.append(f"spawned agent \"{m.get('name', '?')}\"")
-    return " · ".join(parts) if parts else None
+    if not parts:
+        return None
+    line = _SEP.join(parts)
+    if budget is None or len(line) <= budget:
+        return line
+    kept: list[str] = []
+    used = 0
+    for i, p in enumerate(parts):
+        add = len(p) + (len(_SEP) if kept else 0)
+        if used + add + len(_SEP) + len(_more(len(parts) - i - 1)) > budget:
+            break
+        kept.append(p)
+        used += add
+    # the whole line did not fit, so at least one entry is always summarized here
+    return _SEP.join([*kept, _more(len(parts) - len(kept))]) if kept else _more(len(parts))
 
 
 def _header(cell_id, status: str, dur_ms: int | None, degraded: bool) -> str:
@@ -83,7 +122,12 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             "for more output, or interrupt() to stop]", [])
     rec: CellRecord = outcome.record
     lines = [_header(outcome.cell_id, rec.status, rec.duration_ms, degraded)]
-    body = _truncate(outcome.output, config.max_output_chars, log_path / f"{outcome.cell_id}.log")
+    # The footer is rendered FIRST and inside the same budget: what it takes, the body no
+    # longer has. Rendering it last and unbounded is how a mutation-heavy cell smuggled
+    # ~179k characters past max_output_chars.
+    f = footer_line(rec.mutations, budget=footer_budget(config.max_output_chars))
+    body = _truncate(outcome.output, config.max_output_chars - len(f or ""),
+                     log_path / f"{outcome.cell_id}.log")
     if body:
         lines.append(body.rstrip("\n"))
     if rec.status == "error" and rec.error and rec.error.get("ename") not in (None, ""):
@@ -91,7 +135,6 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             lines.append(f"{rec.error['ename']}: {rec.error.get('evalue', '')}")
     if rec.result_repr is not None:
         lines.append(f"→ result: {rec.result_repr}")
-    f = footer_line(rec.mutations)
     if f:
         lines.append(f)
     return Rendered("\n".join(lines), [Path(p) for p in rec.images if Path(p).exists()])

@@ -91,6 +91,33 @@ def test_truncate_non_positive_cap_still_truncates():
     assert "[truncated 500 chars" in r.text
 
 
+def test_footer_joins_the_same_response_budget():
+    """The mutation footer is part of the response budget, not a tail appended after it.
+
+    Rendered last and unbounded, a cell that wrote ten thousand files added ~179k
+    characters AFTER the output had been truncated to the caller's cap — the cap the
+    caller asked for, bypassed by the one line nobody bounded.
+    """
+    ms = [{"kind": "write", "path": f"generated/file-{i:05d}.txt"} for i in range(10_000)]
+    cfg = Config.from_env(env={"PTC_MAX_OUTPUT_CHARS": "2000"})
+    r = render(Completed(7, _rec(mutations=ms), "out\n"), "k", cfg)
+
+    assert len(r.text) < 2_000, f"footer bypassed the cap: {len(r.text)} chars"
+    assert "wrote generated/file-00000.txt" in r.text     # whole entries, never a
+    assert "wrote generated/file-0000" in r.text          # half-written path
+    assert "more mutations" in r.text
+
+    # what the summary claims must be true: kept entries + summarized count == all of them
+    footer = r.text.splitlines()[-1]
+    kept = [p for p in footer.split(" · ") if p.startswith("wrote ")]
+    summarized = int(footer.rsplit("… and ", 1)[1].split(" ")[0])
+    assert len(kept) + summarized == 10_000
+
+    # small counts are byte-identical to before: the common cell sees no change at all
+    assert footer_line(ms[:2]) == ("wrote generated/file-00000.txt · "
+                                   "wrote generated/file-00001.txt")
+
+
 def test_to_dict_busy_carries_reason():
     """to_dict is the JSON-facing twin of render(); a --json/MCP caller needs the
     same reason distinction a text reader gets from the prose."""

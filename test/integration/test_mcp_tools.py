@@ -36,6 +36,30 @@ def test_exec_wait_interrupt_roundtrip(ptc_home):
     kill_kernel("m1")
 
 
+def test_interrupt_returns_the_interrupted_cells_tail(ptc_home):
+    """The spec promises `interrupt` returns the interrupted cell's tail. A static ack
+    ("[interrupt sent]") threw away the one thing the caller needed — which cell stopped,
+    whether it actually stopped, and what it had printed before it did."""
+    r = _run(exec_tool(code="import time\nprint('before the interrupt', flush=True)\ntime.sleep(300)",
+                       session="m3", timeout_s=5))
+    assert "running" in r[0].text
+    cell_id = int(r[0].text.split("cell ")[1].split(" ")[0])
+
+    out = _run(interrupt_tool(session="m3"))[0].text
+
+    assert "[interrupt sent to kernel m3]" in out       # the ack survives
+    assert f"[cell {cell_id} · interrupted" in out, out  # settled, and says which cell
+    assert "KeyboardInterrupt" in out
+    kill_kernel("m3")
+
+
+def test_interrupt_with_nothing_running_says_so(ptc_home):
+    _run(exec_tool(code="1", session="m4", timeout_s=60))
+    out = _run(interrupt_tool(session="m4"))[0].text
+    assert out == "[interrupt sent to kernel m4] — no cell was running"
+    kill_kernel("m4")
+
+
 def test_truncation_and_clamp(ptc_home):
     r = _run(exec_tool(code="print('y' * 100_000)", session="m2",
                        timeout_s=60, max_output_chars=999_999))

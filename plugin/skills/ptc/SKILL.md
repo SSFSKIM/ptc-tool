@@ -27,7 +27,8 @@ user should see and approve step by step.
   (~12k chars) with a path to the full log.
 - Never poll with `time.sleep` in a cell. If a cell yields `running`, call
   `mcp__plugin_ptc_ptc__wait` with the cell id; call `mcp__plugin_ptc_ptc__interrupt` to
-  stop a runaway cell.
+  stop a runaway cell — it comes back with that cell's own tail, so there is nothing left
+  to wait for afterwards.
 - If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
   queues silently.
 - Run a project's code in the project's own environment (its venv, its npm scripts) via

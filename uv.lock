@@ -1168,7 +1168,7 @@ requires-dist = [
     { name = "jupyter-client", specifier = ">=8.6" },
     { name = "markdownify", specifier = ">=0.13" },
     { name = "matplotlib", marker = "extra == 'kernel'" },
-    { name = "mcp", specifier = ">=1.2" },
+    { name = "mcp", specifier = ">=2.0" },
     { name = "numpy", marker = "extra == 'kernel'" },
     { name = "pandas", marker = "extra == 'kernel'" },
     { name = "pydantic", specifier = ">=2.7" },

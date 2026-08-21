@@ -1,4 +1,5 @@
 """The ptc MCP server (stdio). Tools: exec, wait, interrupt, restart, kernels."""
+import asyncio
 from pathlib import Path
 
 # Installed mcp SDK is 2.0.0: FastMCP (mcp.server.fastmcp) was replaced by MCPServer
@@ -60,12 +61,28 @@ def _cfg(timeout_s: float, max_output_chars: int) -> Config:
     return cfg
 
 
+# Every handler below does its kernel work in a WORKER THREAD. The client library is
+# synchronous by design (blocking flock, poll-and-sleep follow loops), and running it on
+# the stdio server's own event loop meant one in-flight exec/wait froze the whole adapter
+# for its full timeout — an interrupt arriving in parallel could not be dispatched until
+# the call it was meant to stop had already returned. T8 parked this and named to_thread
+# as the remedy; parallel tool calls are the story that needed it.
+#
+# Nothing about the protocol changes: each handler still runs the same calls in the same
+# order and renders the same text. Mutual exclusion still holds across threads, too —
+# lock.py opens a fresh descriptor per acquisition and `flock` locks the open file
+# DESCRIPTION, so two threads in this process contend exactly like two processes do, and
+# a loser still gets its "lock-held" Busy from the same timeout.
+
+
 async def exec_tool(code: str, session: str | None = None,
                     timeout_s: float = 300, max_output_chars: int = 12_000) -> list:
-    r = _resolve(session)
+    r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
-    info = ensure_kernel(r.key, cwd=r.cwd, claude_session_id=r.claude_session_id, config=cfg)
-    outcome = KernelClient(r.key).exec_cell(code, timeout_s=timeout_s, config=cfg)
+    info = await asyncio.to_thread(ensure_kernel, r.key, cwd=r.cwd,
+                                   claude_session_id=r.claude_session_id, config=cfg)
+    outcome = await asyncio.to_thread(KernelClient(r.key).exec_cell, code,
+                                      timeout_s=timeout_s, config=cfg)
     rendered = render(outcome, r.key, cfg, degraded=r.degraded)
     if info.expired_notice:
         rendered.text = (f"[previous kernel expired: {info.expired_notice.strip()} — fresh "
@@ -77,28 +94,61 @@ async def exec_tool(code: str, session: str | None = None,
 async def wait_tool(cell_id: int, session: str | None = None,
                     timeout_s: float = 300, max_output_chars: int = 12_000,
                     since: int = -1) -> list:
-    r = _resolve(session)
+    r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
-    outcome = KernelClient(r.key).wait_cell(cell_id, timeout_s=timeout_s, since=since)
+    outcome = await asyncio.to_thread(KernelClient(r.key).wait_cell, cell_id,
+                                      timeout_s=timeout_s, since=since)
     return _content(render(outcome, r.key, cfg, degraded=r.degraded))
 
 
+#: How long the interrupt tool waits for the cell it stopped to settle. interrupt() itself
+#: already spends up to ~4 s (control-channel reply, then the 2 s grace before the SIGINT
+#: fallback); the KeyboardInterrupt lands well inside a second after that. Past this budget
+#: the cell is reported as still running rather than waited on — the tool stays bounded.
+_INTERRUPT_SETTLE_S = 10.0
+
+
+def _interrupt_and_settle(key: str):
+    """Interrupt whatever is running and follow that cell to its terminal record.
+
+    The cell id has to be read BEFORE the interrupt: once the cell settles, current.json
+    no longer names anything running and the id the caller needs is gone. Returns None
+    when nothing was running (or when no real id exists yet — the pending sentinel).
+    """
+    client = KernelClient(key)
+    busy = client.is_busy()
+    client.interrupt()
+    cell_id = busy.cell_id if busy is not None else None
+    if cell_id in (None, -1):
+        return None
+    return client.wait_cell(cell_id, timeout_s=_INTERRUPT_SETTLE_S, since=-1)
+
+
 async def interrupt_tool(session: str | None = None) -> list:
-    r = _resolve(session)
-    KernelClient(r.key).interrupt()
-    return [TextContent(type="text", text=f"[interrupt sent to kernel {r.key}]")]
+    r = await asyncio.to_thread(_resolve, session)
+    ack = f"[interrupt sent to kernel {r.key}]"
+    outcome = await asyncio.to_thread(_interrupt_and_settle, r.key)
+    if outcome is None:
+        return [TextContent(type="text", text=f"{ack} — no cell was running")]
+    # the interrupted cell's own tail, through the same wait/render path a wait() call
+    # takes (same cursor, so nothing is replayed and nothing is consumed twice)
+    cfg = _cfg(_INTERRUPT_SETTLE_S, 12_000)
+    rendered = render(outcome, r.key, cfg, degraded=r.degraded)
+    rendered.text = f"{ack}\n{rendered.text}"
+    return _content(rendered)
 
 
 async def restart_tool(session: str | None = None) -> list:
-    r = _resolve(session)
-    restart_kernel(r.key, cwd=r.cwd, claude_session_id=r.claude_session_id)
+    r = await asyncio.to_thread(_resolve, session)
+    await asyncio.to_thread(restart_kernel, r.key, cwd=r.cwd,
+                            claude_session_id=r.claude_session_id)
     return [TextContent(type="text", text=(
         f"[kernel {r.key} restarted — the Python namespace was lost; variables and imports "
         "must be recreated. Agent sessions remain resumable via agent.list().]"))]
 
 
 async def kernels_tool() -> list:
-    rows = list_kernels()
+    rows = await asyncio.to_thread(list_kernels)
     import datetime
     def _ts(v):
         return datetime.datetime.fromtimestamp(v).strftime("%m-%d %H:%M") if v else "-"
