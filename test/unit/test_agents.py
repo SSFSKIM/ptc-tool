@@ -16,6 +16,7 @@ from ptc.runtime.state import STATE
 class FakeSession:
     def __init__(self, task, o, *, sid: str | None = None, hang: bool = False,
                  fail: Exception | None = None, send_hang: bool = False,
+                 send_aborts: bool = False,
                  close_hang: bool = False, ignore_interrupt: bool = False,
                  drain_s: float = 0.05):
         #: The real Session leaves this None until a ResultMessage is folded — a fake
@@ -32,6 +33,7 @@ class FakeSession:
         self._hang = hang
         self._fail = fail
         self._send_hang = send_hang
+        self._send_aborts = send_aborts
         self._close_hang = close_hang
         self._ignore_interrupt = ignore_interrupt
         self._drain_s = drain_s
@@ -55,6 +57,13 @@ class FakeSession:
 
     async def send(self, msg):
         self.send_entered.append(msg)      # entered — before anything can hang
+        if self._send_aborts:
+            # A follow-up turn under S1's contract: the interrupt does not raise, the
+            # turn ends NORMALLY with whatever partial it had.
+            await self._aborted.wait()
+            await asyncio.sleep(self._drain_s)
+            self.session_id = self._sid
+            return AgentResult(f"partial:{msg}", self.session_id, None, None, 1, 0)
         if self._send_hang:
             await asyncio.sleep(3600)
         self.sent.append(msg)
@@ -586,3 +595,115 @@ def test_child_env_is_ptc_only_and_carries_no_secrets(monkeypatch, tmp_path):
     assert env["PTC_DEPTH"] == "1" and env["PTC_MAX_DEPTH"] == "1"
     for name, value in env.items():
         assert not _secretish(name, value), name
+
+
+# -- r2 review: child keys, follow-up-turn lifecycle, name reuse ---------------------
+
+def test_child_key_survives_a_parent_key_at_the_length_bound(tmp_path):
+    """safe_key() truncates at 128 characters. Appending the child suffix to a parent key
+    already at the bound truncated the suffix straight back off, so the child resolved to
+    the PARENT's key: it attached to the parent's kernel and inherited its depth-0
+    bootstrap, losing session isolation and the recursion brake together."""
+    from ptc.paths import kernel_dir, safe_key
+    from ptc.runtime.agents import child_ptc_env
+
+    parent = "p" * 128
+    _agent(tmp_path, key=parent)           # sets STATE.config, which child_ptc_env reads
+    child = child_ptc_env(AgentOpts())["PTC_SESSION"]
+
+    assert safe_key(child) == child, "the child key must survive sanitization unchanged"
+    assert child != parent
+    assert kernel_dir(child) != kernel_dir(parent), "the child attached to the parent kernel"
+    assert child_ptc_env(AgentOpts())["PTC_DEPTH"] == "1"
+
+    # short parents keep the readable form, and the shortening is per-parent deterministic
+    _agent(tmp_path, key="short")
+    assert child_ptc_env(AgentOpts())["PTC_SESSION"].startswith("short-a")
+    _agent(tmp_path, key=parent)
+    other = child_ptc_env(AgentOpts())["PTC_SESSION"]
+    assert other != child and other[:-8] == child[:-8], "same parent, same prefix"
+
+
+def test_interrupt_during_a_follow_up_send_reaches_the_backend(tmp_path):
+    """A follow-up send is an ACTIVE turn. While it was left looking 'done', interrupt()
+    took the terminal branch: it closed the session without ever signalling the backend,
+    and the send settled as an error instead of returning the interrupted partial."""
+    b = FakeBackend(send_aborts=True)
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.spawn("alpha", name="fu1")
+        await asyncio.wait_for(h.result(), 5)
+        assert h.status == "done"
+
+        send = asyncio.ensure_future(h.send("more"))
+        await asyncio.sleep(0.1)
+        assert h.status == "running", "the follow-up turn is not tracked as active"
+        assert _row(tmp_path, "fu1")["status"] == "running"
+
+        await asyncio.wait_for(h.interrupt(), 5)
+        assert b.sessions[0].interrupted, "the interrupt never reached the backend"
+        assert (await asyncio.wait_for(send, 5)).text == "partial:more"
+        assert h.status == "interrupted"
+        assert b.sessions[0].closed
+        # the turn's permit came back
+        assert (await asyncio.wait_for(a.run("after"), 5)).text == "after"
+
+    asyncio.run(flow())
+    assert _row(tmp_path, "fu1")["status"] == "interrupted"
+
+
+def test_a_completed_send_returns_the_handle_to_done(tmp_path):
+    """The running/interrupt lifecycle is borrowed for the turn, not kept: an ordinary
+    send leaves the handle exactly as it found it, still a live send target."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.spawn("alpha", name="fu2")
+        await asyncio.wait_for(h.result(), 5)
+        assert (await asyncio.wait_for(h.send("more"), 5)).text == "reply:more"
+        assert h.status == "done"
+        assert (await asyncio.wait_for(h.send("again"), 5)).text == "reply:again"
+
+    asyncio.run(flow())
+    assert _row(tmp_path, "fu2")["status"] == "done"
+
+
+def test_concurrent_sends_are_serialized_on_one_session(tmp_path):
+    """Two turns interleaved on one CLI session would each drain part of the other's
+    stream; the handle runs them one at a time instead."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.spawn("alpha", name="fu3")
+        await asyncio.wait_for(h.result(), 5)
+        out = await asyncio.wait_for(asyncio.gather(h.send("one"), h.send("two")), 5)
+        assert {r.text for r in out} == {"reply:one", "reply:two"}
+        assert b.sessions[0].sent == ["one", "two"], "the sends overlapped"
+
+    asyncio.run(flow())
+
+
+def test_spawn_refuses_a_name_whose_session_is_still_live(tmp_path):
+    """A finished handle deliberately keeps its CLI session open as a send() target.
+    Reusing the name overwrote the handle and the registry row and left that process
+    running with no owner and no cleanup path."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.spawn("alpha", name="dup")
+        await asyncio.wait_for(h.result(), 5)
+        assert h.status == "done"
+
+        with pytest.raises(ValueError, match="close"):
+            a.spawn("beta", name="dup")
+        assert len(b.sessions) == 1, "the refused spawn still opened a session"
+
+        await h.close()
+        h2 = a.spawn("beta", name="dup")       # closed: the name is free again
+        assert (await asyncio.wait_for(h2.result(), 5)).text == "did:beta"
+
+    asyncio.run(flow())

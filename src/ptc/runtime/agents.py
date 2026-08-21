@@ -11,11 +11,14 @@ Lifecycle contract every path here honors (plan review F6):
   * no path leaves a permit held or a CLI process tree alive.
 """
 import asyncio
+import hashlib
 import json
 import os
 import time
 import uuid
 from dataclasses import dataclass
+
+from ptc.paths import private_write_text, secure_dir
 
 from . import audit
 from .state import STATE
@@ -98,6 +101,29 @@ class AgentResult:
     duration_ms: int
 
 
+#: The bound safe_key() enforces on every session key. A child key is built to fit INSIDE
+#: it — see child_key().
+_KEY_MAX = 128
+
+
+def child_key(parent_key: str) -> str:
+    """A child session key that is always distinct from its parent's.
+
+    safe_key() truncates to 128 characters, so appending a suffix to a parent key already
+    at that bound truncated the suffix straight back off: the child resolved to the
+    PARENT's key, attached to the parent's kernel and inherited its depth-0 bootstrap,
+    losing session isolation and the recursion brake in one step. The parent portion is
+    hash-shortened when it has to be, so the suffix always survives, and the shortening is
+    deterministic — the same parent always contributes the same prefix.
+    """
+    suffix = f"-a{uuid.uuid4().hex[:6]}"
+    room = _KEY_MAX - len(suffix)
+    if len(parent_key) > room:
+        digest = hashlib.sha256(parent_key.encode()).hexdigest()[:12]
+        parent_key = f"{parent_key[:room - len(digest) - 1]}-{digest}"
+    return parent_key + suffix
+
+
 def child_ptc_env(o: AgentOpts) -> dict:
     """PTC's own variables for a child agent process — the same four for every backend.
 
@@ -108,7 +134,7 @@ def child_ptc_env(o: AgentOpts) -> dict:
     """
     parent_key = STATE.config.get("key") or "root"
     return {
-        "PTC_SESSION": f"{parent_key}-a{uuid.uuid4().hex[:6]}",
+        "PTC_SESSION": child_key(parent_key),
         "PTC_DEPTH": str(int(STATE.config.get("depth", 0)) + 1),
         "PTC_MAX_DEPTH": str(STATE.config.get("max_depth", 1)),
         "PTC_CWD": o.cwd or STATE.config.get("cwd") or os.getcwd(),
@@ -161,6 +187,9 @@ class AgentHandle:
         #: last session id the backend reported, kept across close() so a post-teardown
         #: registry row still names the session the caller can resume.
         self._session_id_seen: str | None = None
+        #: One turn at a time on one CLI session: two follow-up sends interleaved on the
+        #: same stream would each drain part of the other's messages.
+        self._turn_lock = asyncio.Lock()
         self._result_fut: asyncio.Future = asyncio.get_running_loop().create_future()
 
     @property
@@ -176,24 +205,44 @@ class AgentHandle:
         return await asyncio.shield(self._result_fut)
 
     async def send(self, msg: str) -> AgentResult:
-        if self._status == "running":
-            await self.result()
-        # Bind the session BEFORE the lambda: _guarded evaluates it after the semaphore
-        # wait, and a close()/interrupt() landing in that window would otherwise turn the
-        # intended refusal into an AttributeError on None (M2).
-        session = self._session
-        if session is None:
-            raise RuntimeError(f"agent {self.name!r} has no live session to send to")
-        try:
-            r = await self._owner._guarded(lambda: session.send(msg), self._timeout)
-        except asyncio.CancelledError:
-            await self._poison("interrupted")
-            raise
-        except BaseException:                 # timeout, backend error, anything
-            await self._poison("error")
-            raise
-        self._owner._registry_update(self, self._status)
-        return r
+        """A follow-up turn, run under the SAME running/interrupt lifecycle as the first.
+
+        The turn is retained as this handle's driver and the status flips to 'running' for
+        its duration, so a concurrent interrupt() takes the live branch: it signals the
+        backend, waits the drain out, and the send returns the interrupted partial (S1: an
+        aborted turn ends NORMALLY). Left at 'done' the handle looked terminal — interrupt()
+        closed the session without ever signalling it, and the send settled as an error.
+        Settlement stays exactly-once: `_result_fut` belongs to the first turn and is
+        already done, so a send never re-settles it.
+        """
+        async with self._turn_lock:
+            if self._status == "running":
+                await self.result()
+            # Bind the session BEFORE the lambda: _guarded evaluates it after the semaphore
+            # wait, and a close()/interrupt() landing in that window would otherwise turn
+            # the intended refusal into an AttributeError on None (M2).
+            session = self._session
+            if session is None:
+                raise RuntimeError(f"agent {self.name!r} has no live session to send to")
+            self._status = "running"
+            self._owner._registry_update(self, "running")
+            turn = asyncio.ensure_future(
+                self._owner._guarded(lambda: session.send(msg), self._timeout))
+            self._driver = turn      # retained AND reachable by interrupt() (F6)
+            try:
+                r = await turn
+            except asyncio.CancelledError:
+                await self._poison("interrupted")
+                raise
+            except BaseException:                 # timeout, backend error, anything
+                await self._poison("error")
+                raise
+            # An interrupt that landed mid-drain owns the terminal transition; this turn
+            # returning its partial does not undo it.
+            if not self._interrupting and self._status not in _TERMINAL:
+                self._status = "done"
+                self._owner._registry_update(self, self._status)
+            return r
 
     async def _poison(self, status: str) -> None:
         """A send() that did not return leaves the session unusable, whatever the reason.
@@ -360,10 +409,8 @@ class _Agent:
             row["task_head"] = task_head[:120]
         try:
             path = self._registry_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(rows))
-            tmp.replace(path)
+            secure_dir(path.parent)
+            private_write_text(path, json.dumps(rows), tmp=path.with_suffix(".tmp"))
         except OSError:
             pass
 
@@ -382,8 +429,14 @@ class _Agent:
         self._check_depth()
         o = self._opts(kw)
         name = name or f"agent-{uuid.uuid4().hex[:6]}"
-        if name in self._handles and self._handles[name].status == "running":
-            raise ValueError(f"agent name already in use: {name!r}")
+        prior = self._handles.get(name)
+        if prior is not None and (prior.status == "running" or prior._session is not None):
+            # "done" is not free: a finished handle deliberately keeps its CLI session
+            # open as a send() target, so overwriting the entry and the registry row would
+            # strand that process with no owner and no cleanup path.
+            raise ValueError(
+                f"agent name already in use: {name!r} (status={prior.status}, its session "
+                "is still live) — await that handle's close() before reusing the name")
         h = AgentHandle(self, name, o.provider, o.timeout)
         self._handles[name] = h
         audit.append("agent", name=name, task=task[:120], provider=o.provider)
