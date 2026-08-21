@@ -24,6 +24,7 @@ def _fake_home(tmp_path, monkeypatch, sid="s-42", cwd="/my/proj"):
     d.mkdir(parents=True)
     (d / f"{sid}.jsonl").write_text("\n".join(json.dumps(r) for r in ROWS))
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)   # the default root, explicitly
     return d / f"{sid}.jsonl"
 
 
@@ -129,3 +130,25 @@ def test_history_default_needs_meta(tmp_path, monkeypatch):
     STATE.config = {"key": "nometa"}
     with pytest.raises(RuntimeError, match="no claude_session_id known"):
         transcript.history()
+
+
+def test_claude_config_dir_moves_the_projects_root(tmp_path, monkeypatch):
+    """The engine resolves its config home as CLAUDE_CONFIG_DIR or ~/.claude and writes
+    `projects/` under it (`Claude Code Src/src/utils/envUtils.ts`). A session launched
+    with that variable set has no transcript under ~/.claude at all, so hardcoding the
+    home made history() raise FileNotFoundError for every one of them."""
+    cfg = tmp_path / "elsewhere"
+    d = cfg / "projects" / "-my-proj"
+    d.mkdir(parents=True)
+    (d / "s-99.jsonl").write_text("\n".join(json.dumps(r) for r in ROWS))
+    monkeypatch.setenv("HOME", str(tmp_path))        # nothing under ~/.claude at all
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+
+    assert transcript.history("s-99", cwd="/my/proj").path == d / "s-99.jsonl"
+    # the glob fallback follows the same root, not a second hardcoded one
+    assert transcript.history("s-99", cwd="/wrong/cwd").path == d / "s-99.jsonl"
+
+
+def test_an_unset_config_dir_still_means_the_home_directory(tmp_path, monkeypatch):
+    p = _fake_home(tmp_path, monkeypatch)
+    assert transcript.history("s-42", cwd="/my/proj").path == p

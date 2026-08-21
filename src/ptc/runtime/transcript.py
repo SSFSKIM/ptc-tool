@@ -12,8 +12,22 @@ def _munge(cwd: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
+def _projects_root() -> Path:
+    """Where the engine writes session transcripts.
+
+    Claude Code resolves its config home as `CLAUDE_CONFIG_DIR` or `~/.claude`
+    (`Claude Code Src/src/utils/envUtils.ts` `getClaudeConfigHomeDir`) and puts `projects/`
+    under it. A session launched with that variable set has no transcript under `~/.claude`
+    at all, so hardcoding the home made `history()` raise FileNotFoundError for every one
+    of them. The kernel inherits the launching Claude's environment, so reading it here
+    reads the same value the engine used.
+    """
+    home = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(home) if home else Path.home() / ".claude") / "projects"
+
+
 def _resolve_path(session_id: str, cwd: str | None) -> Path:
-    root = Path.home() / ".claude" / "projects"
+    root = _projects_root()
     if cwd:
         p = root / _munge(cwd) / f"{session_id}.jsonl"
         if p.exists():
