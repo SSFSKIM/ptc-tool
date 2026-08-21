@@ -71,7 +71,9 @@ otherwise). Claude children default to `permission_mode="bypassPermissions"` —
 only work you would run yourself. Codex children are spawned `--disable hooks --disable
 plugins`, so your own `~/.codex` hooks and plugins stay out of PTC's thread (set
 `PTC_CODEX_INHERIT=1` to opt back in), and their environment is built from an allowlist,
-so no Claude credentials cross into another vendor's binary.
+so no Claude credentials cross into another vendor's binary. `read-only` there constrains
+WRITES only — a codex child can still read anything this user can, and what it reads leaves
+in a request to another vendor, so give it tasks whose reading you would send.
 
 Handles live in the namespace, so "spawn now, gather next turn" works; awaiting a
 handle blocks the CELL, not you. `h.interrupt()` aborts a child's turn — it waits out the

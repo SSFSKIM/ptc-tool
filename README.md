@@ -46,6 +46,14 @@ or a registry row, and Codex children get an environment built from an allowlist
 than an inherited copy, so Claude-side credentials never cross into another vendor's
 binary.
 
+Before you enable `provider="codex"`, know what it costs. PTC starts every codex thread
+`sandbox: "read-only"`, and read-only in Codex means no WRITES — it grants full-disk
+**reads**, and the child gets your real `HOME` (that is where its subscription auth lives).
+So a codex task, or a prompt injection that reaches one, can read any file you can —
+`~/.claude` among them — and whatever it reads leaves in a request to OpenAI. Nothing in
+PTC prevents that; it is the same bargain as allowing `exec` in the first place. Keep codex
+children out of directories whose contents you would not send to another vendor.
+
 Billing: all kernel-originated Claude model calls go through the `claude` CLI (your
 subscription when OAuth-logged-in). Do not put `ANTHROPIC_API_KEY` in the environment — it
 silently shadows OAuth and flips billing to the metered API. `codex` children authenticate

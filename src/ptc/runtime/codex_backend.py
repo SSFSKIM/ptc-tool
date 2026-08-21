@@ -177,7 +177,17 @@ def _cwd(o: AgentOpts) -> str:
 
 
 def _thread_params(o: AgentOpts, resume: str | None = None) -> dict:
-    """S4's promoted params, verbatim. `sandbox` is the kebab-case SandboxMode string."""
+    """S4's promoted params, verbatim. `sandbox` is the kebab-case SandboxMode string.
+
+    `read-only` bounds WRITES, not reads: `SandboxPolicy::has_full_disk_read_access` is
+    `true` for every policy, `ReadOnly` included (codex-rs/protocol/src/protocol.rs), and
+    `_child_env` forwards the real `HOME`/`CODEX_HOME` because subscription auth lives
+    there. So a codex child reads whatever this user can, and what it reads leaves in a
+    request to another vendor — the one place the child-env allowlist's vendor boundary does
+    not hold. Adjudicated as the kernel's own trust class rather than a defect and recorded
+    as such (final review r4, finding 1; spec Trust model + residual 8); the hardening, when
+    it comes, is a read-restricted permission profile rather than this shorthand.
+    """
     p: dict = {"cwd": _cwd(o), "approvalPolicy": "never", "sandbox": "read-only"}
     if resume:
         p["threadId"] = resume
