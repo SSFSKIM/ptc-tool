@@ -1,5 +1,6 @@
 """Lossless access to Claude Code session transcripts (the PRO-LONG lever)."""
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,13 +71,19 @@ class Transcript:
 
 
 def history(session: str | None = None, cwd: str | None = None) -> Transcript:
+    from ptc.discovery import read_meta
+    meta = read_meta(STATE.config.get("key", ""))
     if session is None:
-        from ptc.discovery import read_meta
-        session = read_meta(STATE.config.get("key", "")).get("claude_session_id")
+        session = meta.get("claude_session_id")
         if not session:
             raise RuntimeError("no claude_session_id known for this kernel "
                                "(alias-keyed session) — pass history(session=...) explicitly")
-    cwd = cwd or STATE.config.get("cwd")
+    # meta.json's cwd is the session's real working directory (ensure_kernel writes it
+    # from discovery's resolved hook-runfile value); the kernel process's own PTC_CWD is
+    # the same value, kept as a fallback for a meta.json that predates the field. NOT
+    # STATE.config: the bootstrap payload has no cwd key, which made the direct-path tier
+    # dead code in every real kernel and sent every history() call through the glob.
+    cwd = cwd or meta.get("cwd") or os.environ.get("PTC_CWD")
     path = _resolve_path(session, cwd)
     messages = []
     for line in path.read_text().splitlines():

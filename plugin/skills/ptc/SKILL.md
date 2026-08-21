@@ -106,9 +106,9 @@ searching.
 
 ## History (lossless memory)
 
-    h = history()                        # this session's full transcript, pre-compaction
-    h.user(); h.assistant(); h.tool_calls("Bash"); h.search(r"regex")
-    child_h = h1.history()               # a child's transcript (any spawned/resumed handle)
+    t = history()                        # this session's full transcript, pre-compaction
+    t.user(); t.assistant(); t.tool_calls("Bash"); t.search(r"regex")
+    child_t = hs[0].history()            # a child's transcript (any spawned/resumed handle)
 
 `history(session=None)` defaults to this kernel's own Claude session id (from `meta.json`);
 pass `session=` explicitly for any other session id. Raises `RuntimeError` if no session id

@@ -28,7 +28,7 @@ def test_star_import_yields_the_real_object_for_every_all_name():
         assert name in ns, f"{name!r} missing from `from ptc.runtime import *`"
 
     for name in ("read", "write", "edit", "bash", "llm", "web_fetch", "web_search",
-                "history"):
+                 "history"):
         obj = ns[name]
         assert callable(obj), f"{name!r} should be callable, got {obj!r}"
         assert not inspect.ismodule(obj), (
