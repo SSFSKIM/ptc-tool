@@ -54,11 +54,18 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     if a.cmd == "setup":
-        ensure_venv()
-        print("ptc venv ready:", ensure_venv())
+        venv = ensure_venv()
+        if a.json:
+            print(json.dumps({"venv": str(venv)}))
+        else:
+            print("ptc venv ready:", venv)
         return 0
     if a.cmd == "list":
-        for r in list_kernels():
+        rows = list_kernels()
+        if a.json:
+            print(json.dumps({"kernels": rows}))
+            return 0
+        for r in rows:
             print(f"{r['key']}  pid={r['pid']}  alive={r['alive']}  cwd={r['cwd']}")
         return 0
     if a.cmd == "doctor":
@@ -68,18 +75,24 @@ def main(argv=None) -> int:
         # of someone asking why the venv looked wrong.
         import shutil
         ready = stamp_current()
-        print(json.dumps({"venv": str(venv_python()), "venv_ready": ready,
-                          "setup_would": "nothing (venv is current)" if ready else
-                                         "provision the venv (run: ptc setup)",
-                          "uv": shutil.which("uv"),
-                          "claude": shutil.which("claude"), "codex": shutil.which("codex"),
-                          "PTC_SESSION": os.environ.get("PTC_SESSION"),
-                          "CLAUDE_CODE_SESSION_ID": os.environ.get("CLAUDE_CODE_SESSION_ID")}, indent=2))
+        report = {"venv": str(venv_python()), "venv_ready": ready,
+                  "setup_would": "nothing (venv is current)" if ready else
+                                 "provision the venv (run: ptc setup)",
+                  "uv": shutil.which("uv"),
+                  "claude": shutil.which("claude"), "codex": shutil.which("codex"),
+                  "PTC_SESSION": os.environ.get("PTC_SESSION"),
+                  "CLAUDE_CODE_SESSION_ID": os.environ.get("CLAUDE_CODE_SESSION_ID")}
+        # doctor's human form is already JSON — indented, for a person reading a terminal;
+        # `--json` is the same document in the one-line machine form.
+        print(json.dumps(report) if a.json else json.dumps(report, indent=2))
         return 0
     if a.cmd == "kill" and a.all:
         # ownership-verified per key: kill_kernel only signals an owner whose pid AND
         # start time still match, so a recycled pid is never killed
         killed = [r["key"] for r in list_kernels() if kill_kernel(r["key"])]
+        if a.json:
+            print(json.dumps({"all": True, "killed": killed}))
+            return 0
         for k in killed:
             print(f"[killed {k}]")
         if not killed:
@@ -90,21 +103,32 @@ def main(argv=None) -> int:
     if notice:
         print(notice, file=sys.stderr)
     if a.cmd == "kill":
-        return 0 if kill_kernel(key) else 1
+        killed = kill_kernel(key)
+        if a.json:
+            print(json.dumps({"key": key, "killed": killed}))
+        return 0 if killed else 1
     if a.cmd == "restart":
         # The respawn must land where the kernel already lived and keep the Claude session
         # id it was keyed to: passing neither respawned the kernel in whatever directory
         # the CLI happened to run from and blanked meta.json's claude_session_id, which is
         # what history() and fork() read.
         meta = read_meta(key)
-        restart_kernel(key, cwd=meta.get("cwd") or resolved.cwd,
-                       claude_session_id=(meta.get("claude_session_id")
-                                          or resolved.claude_session_id))
-        print(f"[kernel {key} restarted — namespace lost]")
+        work = meta.get("cwd") or resolved.cwd
+        info = restart_kernel(key, cwd=work,
+                              claude_session_id=(meta.get("claude_session_id")
+                                                 or resolved.claude_session_id))
+        if a.json:
+            print(json.dumps({"key": key, "pid": info.pid, "cwd": work,
+                              "namespace_lost": True}))
+        else:
+            print(f"[kernel {key} restarted — namespace lost]")
         return 0
     if a.cmd == "interrupt":
         KernelClient(key).interrupt()
-        print(f"[interrupt sent to {key}]")
+        if a.json:
+            print(json.dumps({"key": key, "interrupted": True}))
+        else:
+            print(f"[interrupt sent to {key}]")
         return 0
 
     cfg = Config.from_env()

@@ -5,10 +5,12 @@ test is the command's own contract, not a kernel round trip (test/integration/te
 covers that).
 """
 import json
+from pathlib import Path
 
 import pytest
 
 from ptc import cli
+from ptc.kernel import KernelInfo
 
 
 def _no_session(monkeypatch):
@@ -91,3 +93,107 @@ def test_setup_still_provisions(monkeypatch, capsys):
 def test_kill_all_flag_is_only_on_kill():
     with pytest.raises(SystemExit):
         cli.main(["list", "--all"])
+
+
+# -- --json is advertised on every subcommand, so every subcommand must honor it ---------
+# The shared parser puts `--json` on all nine commands, but only exec/wait ever read it:
+# `ptc list --json`, `ptc doctor --json` and the lifecycle commands went on printing human
+# text, so a caller that selected the accepted machine-readable option got something it
+# could not parse. Human output is the default and is unchanged — the tests above are the
+# guard on that half.
+
+ROWS = [{"key": "k1", "pid": 11, "alive": True, "cwd": "/proj", "depth": 0,
+         "spawned_at": 1.0, "last_used": 2.0}]
+
+
+def _json_out(capsys) -> dict:
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, f"--json must emit one JSON document, got: {out!r}"
+    return json.loads(out)
+
+
+def test_list_json_carries_the_kernel_rows(monkeypatch, capsys):
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: ROWS)
+
+    assert cli.main(["list", "--json"]) == 0
+
+    d = _json_out(capsys)
+    assert d["kernels"] == ROWS
+
+
+def test_list_json_on_an_empty_machine_is_still_a_document(monkeypatch, capsys):
+    """The human form prints nothing at all when there is no kernel; the machine form must
+    still be parseable rather than empty."""
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: [])
+
+    assert cli.main(["list", "--json"]) == 0
+    assert _json_out(capsys) == {"kernels": []}
+
+
+def test_setup_json_names_the_venv(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "ensure_venv", lambda: "/somewhere/python")
+
+    assert cli.main(["setup", "--json"]) == 0
+    assert _json_out(capsys) == {"venv": "/somewhere/python"}
+
+
+def test_doctor_json_is_the_same_report_on_one_line(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli, "stamp_current", lambda: True)
+
+    assert cli.main(["doctor", "--json"]) == 0
+    d = _json_out(capsys)
+    assert d["venv_ready"] is True and d["venv"].endswith("/venv/bin/python")
+    assert "setup_would" in d and "uv" in d
+
+
+def test_kill_all_json_lists_what_it_killed(monkeypatch, capsys):
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: [{"key": "k1"}, {"key": "k2"}])
+    monkeypatch.setattr(cli, "kill_kernel", lambda k: k != "k2")
+
+    assert cli.main(["kill", "--all", "--json"]) == 0
+    assert _json_out(capsys) == {"all": True, "killed": ["k1"]}
+
+
+def test_kill_one_json_reports_the_outcome_and_keeps_the_exit_code(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli, "kill_kernel", lambda k: False)
+
+    assert cli.main(["kill", "-s", "k9", "--json"]) == 1, "the exit code still reports it"
+    assert _json_out(capsys) == {"key": "k9", "killed": False}
+
+
+def test_interrupt_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli.KernelClient, "interrupt", lambda self: None)
+
+    assert cli.main(["interrupt", "-s", "k9", "--json"]) == 0
+    assert _json_out(capsys) == {"key": "k9", "interrupted": True}
+
+
+def test_restart_json_names_the_respawned_kernel(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli, "read_meta", lambda k: {"cwd": "/proj", "claude_session_id": "s"})
+    monkeypatch.setattr(cli, "restart_kernel",
+                        lambda k, **kw: KernelInfo(k, 4242, Path("/c.json"), True, None))
+
+    assert cli.main(["restart", "-s", "k9", "--json"]) == 0
+    d = _json_out(capsys)
+    assert d == {"key": "k9", "pid": 4242, "cwd": "/proj", "namespace_lost": True}
+
+
+def test_restart_json_still_respawns_where_the_kernel_lived(monkeypatch, capsys):
+    """The --json branch must not become a second, divergent code path: the stored cwd and
+    session id travel with the respawn there too."""
+    seen = {}
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli, "read_meta", lambda k: {"cwd": "/proj", "claude_session_id": "s"})
+    monkeypatch.setattr(cli, "restart_kernel",
+                        lambda k, **kw: seen.update(kw) or
+                        KernelInfo(k, 1, Path("/c.json"), True, None))
+
+    cli.main(["restart", "-s", "k9", "--json"])
+    assert seen == {"cwd": "/proj", "claude_session_id": "s"}
