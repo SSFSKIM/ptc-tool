@@ -4,7 +4,7 @@ import os
 import subprocess
 from dataclasses import asdict, dataclass
 
-from .paths import kernel_dir
+from .paths import kernel_dir, private_write_text, secure_dir
 
 
 def proc_start_time(pid: int) -> str | None:
@@ -28,11 +28,8 @@ class Owner:
 
 
 def write_owner(key: str, o: Owner) -> None:
-    d = kernel_dir(key)
-    d.mkdir(parents=True, exist_ok=True)
-    tmp = d / "owner.json.tmp"
-    tmp.write_text(json.dumps(asdict(o)))
-    tmp.replace(d / "owner.json")
+    d = secure_dir(kernel_dir(key))
+    private_write_text(d / "owner.json", json.dumps(asdict(o)), tmp=d / "owner.json.tmp")
 
 
 def read_owner(key: str) -> Owner | None:

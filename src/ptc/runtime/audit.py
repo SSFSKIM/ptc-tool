@@ -2,13 +2,15 @@
 import json
 import time
 
+from ptc.paths import private_open
+
 from .state import STATE
 
 
 def append(kind: str, **fields) -> None:
     entry = {"ts": time.time(), "cell": STATE.current_cell, "kind": kind, **fields}
     STATE.cell_mutations.append(entry)
-    with open(STATE.kernel_dir / "audit.jsonl", "a") as f:
+    with private_open(STATE.kernel_dir / "audit.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 

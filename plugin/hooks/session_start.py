@@ -67,8 +67,17 @@ def _record() -> int:
         return 0
     rd = Path(os.environ.get("PTC_HOME") or (Path.home() / ".ptc")) / "run"
     rd.mkdir(parents=True, exist_ok=True)
+    # A run-file names the session and the directory it works in, and it is the channel
+    # the adapter keys off. Owner-only, like every other PTC state file — with the common
+    # 022 umask the default would be a world-readable 0755 directory of 0644 files.
+    try:
+        os.chmod(rd, 0o700)
+    except OSError:
+        pass
     tmp = rd / f".claude-{target}.tmp"
-    tmp.write_text(json.dumps({"session_id": sid, "cwd": cwd, "written_at": time.time()}))
+    payload = json.dumps({"session_id": sid, "cwd": cwd, "written_at": time.time()})
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(payload)
     tmp.replace(rd / f"claude-{target}.json")
     for f in rd.glob("claude-*.json"):        # GC dead-pid files
         try:

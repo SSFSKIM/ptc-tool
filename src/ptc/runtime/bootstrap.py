@@ -12,6 +12,8 @@ import time
 import traceback
 from pathlib import Path
 
+from ptc.paths import private_open, private_write_text, secure_dir
+
 from .state import STATE, cells
 
 _MAX_REPR = 4096
@@ -34,7 +36,7 @@ class _Tee:
                 pass
             self._file = None
         if path is not None:
-            self._file = open(path, "a", errors="replace", encoding="utf-8")
+            self._file = private_open(path, "a", errors="replace", encoding="utf-8")
 
     def write(self, s):
         # Bind the handle once: a user background thread can be inside write() while
@@ -65,9 +67,7 @@ _tees: list[_Tee] = []
 
 
 def _write_json_atomic(path: Path, obj) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj))
-    tmp.replace(path)
+    private_write_text(path, json.dumps(obj), tmp=path.with_suffix(path.suffix + ".tmp"))
 
 
 def _cell_no(ip, info) -> int:
@@ -88,7 +88,7 @@ def _pre_run_cell(info):
     STATE.last_activity = time.time()
     STATE.cell_images = []
     STATE.cell_mutations = []
-    cells().mkdir(parents=True, exist_ok=True)
+    secure_dir(cells())
     for t in _tees:
         t._switch(cells() / f"{n}.log")
     _write_json_atomic(cells() / "current.json", {"cell_id": n, "started_at": time.time()})
@@ -137,7 +137,8 @@ def _install_display_shim():
                         if len(raw) <= _MAX_IMAGE_BYTES:
                             k = len(STATE.cell_images)
                             p = cells() / f"{STATE.current_cell}-{k}.{ext}"
-                            p.write_bytes(raw)
+                            with private_open(p, "wb") as f:
+                                f.write(raw)
                             STATE.cell_images.append(str(p))
                         break
         except Exception:
@@ -152,8 +153,8 @@ def _log_write(text: str) -> None:
     if STATE.current_cell is None:
         return
     try:
-        with open(cells() / f"{STATE.current_cell}.log", "a",
-                  errors="replace", encoding="utf-8") as f:
+        with private_open(cells() / f"{STATE.current_cell}.log", "a",
+                          errors="replace", encoding="utf-8") as f:
             f.write(text)
     except OSError:
         pass

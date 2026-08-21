@@ -11,6 +11,7 @@ import ast
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -93,9 +94,14 @@ def test_hook_writes_runfile_for_claude_ancestor(tmp_path, monkeypatch):
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
     monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s-2","cwd":"/w2"}'))
     assert m.main() == 0
-    f = json.loads((tmp_path / "run" / f"claude-{os.getpid()}.json").read_text())
+    runfile = tmp_path / "run" / f"claude-{os.getpid()}.json"
+    f = json.loads(runfile.read_text())
     assert f["session_id"] == "s-2" and f["cwd"] == "/w2"
     assert isinstance(f["written_at"], float)
+    # a run-file names the session and its working directory, and it is the channel the
+    # adapter keys off: owner-only, like every other piece of PTC state
+    assert stat.S_IMODE(runfile.stat().st_mode) == 0o600
+    assert stat.S_IMODE(runfile.parent.stat().st_mode) & 0o077 == 0
 
 
 def test_hook_gcs_dead_pid_runfiles(tmp_path, monkeypatch):

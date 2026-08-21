@@ -2,7 +2,7 @@
 import json
 from dataclasses import dataclass
 
-from .paths import cells_dir
+from .paths import cells_dir, secure_dir
 
 
 @dataclass
@@ -51,6 +51,5 @@ def default_offset(key: str, cell_id: int) -> int:
 
 
 def save_offset(key: str, cell_id: int, offset: int) -> None:
-    d = cells_dir(key) / "offsets"
-    d.mkdir(parents=True, exist_ok=True)
+    d = secure_dir(cells_dir(key) / "offsets")
     (d / f"{cell_id}.offset").write_text(str(offset))

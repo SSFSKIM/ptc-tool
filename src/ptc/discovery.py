@@ -24,7 +24,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-from .paths import kernel_dir, run_dir, safe_key
+from .paths import kernel_dir, private_write_text, run_dir, safe_key, secure_dir
 
 # 8+ hex/hyphen chars: good enough to tell a Claude session UUID apart from a
 # human-chosen PTC_SESSION key (which is not itself a Claude session id).
@@ -92,13 +92,10 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
 
 
 def write_meta(key: str, **fields) -> None:
-    d = kernel_dir(key)
-    d.mkdir(parents=True, exist_ok=True)
+    d = secure_dir(kernel_dir(key))
     merged = read_meta(key)
     merged.update(fields)
-    tmp = d / "meta.json.tmp"
-    tmp.write_text(json.dumps(merged))
-    tmp.replace(d / "meta.json")
+    private_write_text(d / "meta.json", json.dumps(merged), tmp=d / "meta.json.tmp")
 
 
 def read_meta(key: str) -> dict:
