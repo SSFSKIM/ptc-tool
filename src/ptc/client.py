@@ -16,7 +16,7 @@ from .cells import (
 from .kernel import kernel_alive
 from .lock import submit_lock
 from .ownership import read_owner
-from .paths import Config, kernel_dir
+from .paths import Config, kernel_dir, private_write_text, secure_dir
 from .venv import venv_python  # noqa: F401  (imported for kernel spawn parity)
 
 
@@ -98,24 +98,63 @@ class KernelClient:
         pend = kernel_dir(self.key) / "cells" / "pending.json"
         try:
             data = json.loads(pend.read_text())
-            if time.time() - data.get("submitted_at", 0) < 60 and kernel_alive(self.key):
-                # busy admitting an unacknowledged cell; the marker names it when the
-                # kernel got as far as execute_input, else nobody knows its id yet
-                cid = data.get("cell_id")
-                return Busy(cid if cid is not None else -1, reason="pending-unconfirmed")
-            pend.unlink(missing_ok=True)
         except (OSError, json.JSONDecodeError):
-            pass
-        return None
+            return None
+        if not isinstance(data, dict):
+            pend.unlink(missing_ok=True)
+            return None
+        if self._pending_discharged(data):
+            pend.unlink(missing_ok=True)
+            return None
+        # busy admitting an unacknowledged cell; the marker names it when the kernel got
+        # as far as execute_input, else nobody knows its id yet
+        cid = data.get("cell_id")
+        return Busy(cid if cid is not None else -1, reason="pending-unconfirmed")
+
+    def _pending_discharged(self, data: dict) -> bool:
+        """Durable evidence that a sent-but-unconfirmed request can no longer execute.
+
+        AGE is not evidence. The marker covers the case where the kernel accepted an
+        execute_request that never reached current.json, and such a request may still be
+        queued behind a wedged cell however old it is — deleting it on a stopwatch admits
+        a second cell on top of one the kernel is still about to run, which is the one
+        guarantee this whole path exists to keep: nothing is ever silently queued.
+
+        Three things do discharge it, and only these three:
+          * the kernel that took the request is gone, or came back under a new epoch —
+            whatever it accepted died with it;
+          * a terminal record exists for the cell the marker names — that cell settled;
+          * current.json names a LATER cell — the kernel runs cells in order, so a later
+            one can only have started after ours left the queue.
+        With none of them the verdict stays busy. The escape hatch for a request whose id
+        was never learned is restart(), which archives cells/ and the marker with it.
+        """
+        if not kernel_alive(self.key):
+            return True
+        o = read_owner(self.key)
+        if data.get("epoch") and o is not None and o.epoch != data["epoch"]:
+            return True
+        cid = data.get("cell_id")
+        if cid is None:
+            return False
+        if read_record(self.key, cid) is not None:
+            return True
+        cur = current_cell(self.key)
+        return cur is not None and cur > cid
 
     def _mark_pending(self, msg_id: str, cell_id: int | None) -> None:
         """Record a request that is on the wire but unconfirmed. Best effort: a marker
-        we cannot write must not mask the fault that sent us here."""
+        we cannot write must not mask the fault that sent us here. The epoch is stamped
+        in so a later kernel can tell the marker is not about IT (see
+        `_pending_discharged`)."""
         try:
-            pend = kernel_dir(self.key) / "cells" / "pending.json"
-            pend.parent.mkdir(parents=True, exist_ok=True)
-            pend.write_text(json.dumps(
-                {"msg_id": msg_id, "cell_id": cell_id, "submitted_at": time.time()}))
+            o = read_owner(self.key)
+            secure_dir(kernel_dir(self.key) / "cells")
+            private_write_text(
+                kernel_dir(self.key) / "cells" / "pending.json",
+                json.dumps({"msg_id": msg_id, "cell_id": cell_id,
+                            "submitted_at": time.time(),
+                            "epoch": o.epoch if o else None}))
         except OSError:
             pass
 

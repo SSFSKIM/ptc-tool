@@ -96,7 +96,12 @@ _BUSY_TEXT = {
     "lock-held": "cell {id} is busy — another submission currently holds the kernel's admission lock",
 }
 _BUSY_TEXT_NO_ID = {
-    "pending-unconfirmed": "a cell was just submitted — its id is not yet confirmed",
+    # No id was ever confirmed, so no terminal record can discharge the marker either
+    # (client.py `_pending_discharged`): restart() is the escape hatch, and saying so is
+    # the difference between a busy kernel and one that looks permanently stuck.
+    "pending-unconfirmed": ("a cell was just submitted and the kernel never confirmed its "
+                            "id — nothing else is admitted until it settles or restart() "
+                            "clears it"),
     "lock-held": "another submission currently holds the kernel's admission lock",
 }
 

@@ -76,7 +76,14 @@ def test_unconfirmed_submit_fails_closed(ptc_home):
     """F2 fail-closed: a kernel that accepts a request but never publishes current.json
     leaves a cell nobody can see. exec_cell refuses to pretend otherwise — it gives up
     on its confirm budget, records the unacknowledged submission, and every later busy
-    check reports busy off that marker rather than admitting a second cell."""
+    check reports busy off that marker rather than admitting a second cell.
+
+    The swallowed cell is a LONG one on purpose. The marker is discharged by evidence
+    (r2 finding 4), never by age, and a swallowed cell that finishes on its own produces
+    the strongest evidence there is — its terminal record. Keeping this one running is
+    what makes the refusal below mean something, and interrupting it at the end is what
+    proves the door reopens on evidence rather than on a clock.
+    """
     ensure_kernel("y5", cwd=str(ptc_home))
     cfg = Config.from_env()
     kc = KernelClient("y5")
@@ -90,7 +97,7 @@ def test_unconfirmed_submit_fails_closed(ptc_home):
     assert isinstance(silence, Completed) and silence.record.status == "ok"
 
     with pytest.raises(RuntimeError, match="never published it"):
-        kc.exec_cell("1+1", timeout_s=5, config=cfg)
+        kc.exec_cell("import time; time.sleep(600)", timeout_s=5, config=cfg)
     pend = ptc_home / "kernels" / "y5" / "cells" / "pending.json"
     assert pend.exists()
     # the kernel got as far as execute_input, so the marker names the cell it swallowed
@@ -99,6 +106,15 @@ def test_unconfirmed_submit_fails_closed(ptc_home):
     assert KernelClient("y5").is_busy() == Busy(stranded, reason="pending-unconfirmed")
     assert KernelClient("y5").exec_cell("2+2", timeout_s=5, config=cfg) == Busy(
         stranded, reason="pending-unconfirmed")
+
+    # evidence, not the clock: the swallowed cell's terminal record is what reopens
+    # admission, and interrupting it is how that record finally lands
+    KernelClient("y5").interrupt()
+    deadline = time.monotonic() + 30
+    while KernelClient("y5").is_busy() is not None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert KernelClient("y5").is_busy() is None
+    assert not pend.exists(), "a discharged marker must be consumed"
     kill_kernel("y5")
 
 
