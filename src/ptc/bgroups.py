@@ -56,8 +56,11 @@ def _recycled(row: dict) -> bool:
     A leader that no longer exists is NOT this case: a pid cannot be reused while it is
     still a live group's id, so an absent leader means the group is either gone (ESRCH,
     harmless) or holds only the orphaned children this reap exists for — a background
-    `bash` whose shell exited leaving its own children behind. Rows written before
-    identities were recorded carry no `leader_start` and keep the pre-identity behavior.
+    `bash` whose shell exited leaving its own children behind. That is the row the shell
+    keeps deliberately, flagged `leader_exited` (`runtime/shell.py` `_retire`): it is
+    retained precisely because its group outlived its leader, and this branch is what lets
+    it still be reaped. Rows written before identities were recorded carry no
+    `leader_start` and keep the pre-identity behavior.
     """
     recorded = row.get("leader_start")
     if not recorded:

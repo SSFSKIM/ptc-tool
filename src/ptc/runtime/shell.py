@@ -49,6 +49,44 @@ def _unregister(pgid: int | None) -> None:
         _persist()
 
 
+def _group_alive(pgid: int | None) -> bool:
+    """True while the process GROUP still has members — not merely its leader.
+
+    `killpg(pgid, 0)` is the only question that asks about the group: ESRCH proves it is
+    empty (and the pgid free for the OS to hand out again), success proves it is not.
+    """
+    if pgid is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                       # members exist, just not signalable by us
+    except OSError:
+        return False
+    return True
+
+
+def _retire(pgid: int | None) -> None:
+    """The shell leader has exited: drop the row only if the whole GROUP went with it.
+
+    A daemonizing command (`sleep 300 >/dev/null 2>&1 &`) exits its shell immediately and
+    leaves the descendant behind in the SAME group, so unregistering on the leader's exit
+    threw away the only PGID anything could still reap it by, and the descendant outlived
+    the kernel. The row stays, marked `leader_exited` — the shape bgroups._recycled is
+    written to accept, since a pid cannot be recycled while it is still a live group's id,
+    so an absent leader is never the identity-mismatch case that suppresses a reap.
+    """
+    if not _group_alive(pgid):
+        _unregister(pgid)
+        return
+    row = _LIVE.get(pgid)
+    if row is not None and not row.get("leader_exited"):
+        row["leader_exited"] = True
+        _persist()
+
+
 @dataclass
 class BashResult:
     code: int | None
@@ -65,6 +103,23 @@ def _killpg_or_kill(proc) -> None:
             proc.kill()
         except ProcessLookupError:
             pass
+
+
+async def _reap_foreground(proc, readers) -> None:
+    """Kill a foreground command's group and settle its readers, raising nothing.
+
+    This runs with an exception already in flight (usually CancelledError), which the
+    caller re-raises — so a second CancelledError arriving here must be swallowed rather
+    than replace it. The output is discarded on this path, so the pumps are cancelled
+    rather than drained; awaiting them is what guarantees no reader task is left running
+    against a dead pipe.
+    """
+    _killpg_or_kill(proc)
+    readers.cancel()
+    try:
+        await readers
+    except BaseException:
+        pass
 
 
 async def _pump(stream, buf: list[bytes]) -> None:
@@ -94,12 +149,13 @@ class BashHandle:
         watcher.add_done_callback(_WATCHERS.discard)
 
     async def _forget_when_done(self) -> None:
-        """Drop the registry entry the moment the group ends, so a reap never signals a
-        pgid the OS has since handed to somebody else."""
+        """Drop the registry entry the moment the GROUP ends, so a reap never signals a
+        pgid the OS has since handed to somebody else — and never before, or a daemonized
+        descendant loses the only handle anything has on it (`_retire`)."""
         try:
             await self._proc.wait()
         finally:
-            _unregister(self._pgid)
+            _retire(self._pgid)
 
     @property
     def pid(self) -> int:
@@ -114,7 +170,7 @@ class BashHandle:
     async def wait(self) -> BashResult:
         await self._proc.wait()
         await self._pump
-        _unregister(self._pgid)     # the watcher would too; this makes it observable to
+        _retire(self._pgid)         # the watcher would too; this makes it observable to
                                     # whoever awaited, without a scheduling race
         return BashResult(self._proc.returncode, self.output(),
                            b"".join(self._err).decode(errors="replace"), False)
@@ -157,3 +213,11 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
         await readers
         return BashResult(None, b"".join(out).decode(errors="replace"),
                            b"".join(err).decode(errors="replace"), True)
+    except BaseException:
+        # Cancellation — a cell interrupt, a task torn down — or any other failure. It
+        # bypasses the timeout handler above, and a foreground command is the one child
+        # nothing else can reap: it is its own session (so the kernel's group kill misses
+        # it) and it is not in the bgroups registry (so kill/restart/TTL miss it too).
+        # Kill the group here, settle the readers, and let the original propagate.
+        await _reap_foreground(proc, readers)
+        raise
