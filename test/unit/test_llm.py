@@ -1,14 +1,16 @@
 """llm() against a fake _run_once — no SDK, no auth, no network.
 
 Covers the plan-specified contract (delegates to claude_backend.run_once with bare_llm=True,
-json_schema round-trips through structured output) and the deadline: a hung call must not
-strand the shared semaphore's permit past its own timeout.
+json_schema round-trips through structured output), the deadline (a hung call must not
+strand the shared semaphore's permit past its own timeout), and the audit record `llm()`
+writes into the same governance class as `agent.*`.
 """
 import asyncio
+import json
 
 import pytest
 
-from ptc.runtime import llm as llm_mod
+from ptc.runtime import _llm as llm_mod
 from ptc.runtime.state import STATE
 
 
@@ -29,6 +31,33 @@ def test_llm_calls_backend_bare(monkeypatch, tmp_path):
     assert seen["task"] == "classify this" and seen["system"] == "be terse"
     out2 = asyncio.run(llm_mod.llm("classify", json_schema={"type": "object"}))
     assert out2 == {"a": 1}
+
+
+def test_llm_audits_the_call(monkeypatch, tmp_path):
+    """`llm()` shares its semaphore with `agent.*`, so it shares the audit trail too: one
+    "llm" record per call, attributed to the current cell, with the model and a
+    bash-style-truncated (200 char) prompt — mirroring `agent.run`'s "agent" record shape
+    (name/task/provider) and `bash`'s `command[:200]` truncation."""
+    STATE.kernel_dir = tmp_path
+    STATE.config = {"key": "k", "max_concurrency": 8, "depth": 0, "max_depth": 1}
+    STATE.current_cell = 3
+    STATE.cell_mutations = []
+
+    async def fake_run_once(task, o, *, resume=None, fork=False, bare_llm=False):
+        from ptc.runtime.agents import AgentResult
+        return AgentResult("ok", "s", None, 0, 1, 5)
+
+    monkeypatch.setattr(llm_mod, "_run_once", fake_run_once)
+    long_prompt = "x" * 500
+    asyncio.run(llm_mod.llm(long_prompt, model="sonnet"))
+
+    entry = STATE.cell_mutations[-1]
+    assert entry["kind"] == "llm" and entry["cell"] == 3
+    assert entry["model"] == "sonnet"
+    assert entry["prompt"] == "x" * 200 and len(entry["prompt"]) == 200
+
+    on_disk = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert on_disk[-1] == entry
 
 
 def test_llm_default_system_prompt_is_terse(monkeypatch, tmp_path):

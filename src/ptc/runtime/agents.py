@@ -40,10 +40,15 @@ _TERMINAL = ("done", "error", "interrupted")
 _SHARED_SEM: asyncio.Semaphore | None = None
 
 
-def shared_semaphore() -> asyncio.Semaphore:
+def shared_semaphore(config: dict | None = None) -> asyncio.Semaphore:
+    """The one semaphore shared by every SDK-spawning caller. `config` sizes it on first
+    creation (defaults to `STATE.config` for callers with no config of their own — `llm()`,
+    `web.py` in M3); `_Agent` passes its own `self._config` explicitly (see `_Agent._semaphore`)
+    so it reads its own config rather than reaching past it into global state."""
     global _SHARED_SEM
     if _SHARED_SEM is None:
-        _SHARED_SEM = asyncio.Semaphore(int(STATE.config.get("max_concurrency", 8)))
+        cfg = STATE.config if config is None else config
+        _SHARED_SEM = asyncio.Semaphore(int(cfg.get("max_concurrency", 8)))
     return _SHARED_SEM
 
 
@@ -272,9 +277,12 @@ class _Agent:
 
     # -- plumbing -----------------------------------------------------------
     #: The pool itself lives at module level (`shared_semaphore`) — one pool across
-    #: agent/llm/web_search, per spec. `_config` is always STATE.config by construction
-    #: (see `_make_agent`), so this and `shared_semaphore()` read the same bound.
-    _semaphore = staticmethod(shared_semaphore)
+    #: agent/llm/web_search, per spec. Reads self._config, not STATE.config directly: in
+    #: production and every test today `_config is STATE.config` by construction (see
+    #: `_make_agent`), so the pool is sized the same either way, but this keeps `_Agent`
+    #: honoring its own constructor argument rather than silently reaching past it.
+    def _semaphore(self) -> asyncio.Semaphore:
+        return shared_semaphore(self._config)
 
     async def _guarded(self, make_coro, timeout: float | None):
         return await guarded(self._semaphore(), make_coro, timeout)
