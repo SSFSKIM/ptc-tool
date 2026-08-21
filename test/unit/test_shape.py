@@ -123,3 +123,23 @@ def test_to_dict_busy_carries_reason():
     same reason distinction a text reader gets from the prose."""
     d = to_dict(Busy(None, reason="lock-held"), "k")
     assert d == {"status": "busy", "cell_id": None, "reason": "lock-held"}
+
+
+def test_result_and_error_ride_inside_the_response_budget():
+    """`result_repr` (up to 4096 chars from the kernel) and the error summary are appended
+    AFTER the body has spent its budget, so a 100-character cap still returned over 4 KB —
+    the same bypass the mutation footer had, from the other end of the render."""
+    cfg = Config.from_env(env={"PTC_MAX_OUTPUT_CHARS": "100"})
+    rec = _rec(status="error", result_repr="R" * 4096,
+               error={"ename": "ValueError", "evalue": "E" * 2000, "traceback": "tb"})
+    r = render(Completed(8, rec, "body\n"), "k", cfg)
+
+    assert len(r.text) < 800, f"the cap was bypassed: {len(r.text)} chars"
+    assert r.text.startswith("[cell 8 · error"), "the header must survive intact"
+    assert "ValueError: EE" in r.text and "→ result: RR" in r.text     # both still SAID
+    assert r.text.count("…") >= 2, "both were clipped, and say so"
+
+    # small cases are byte-identical: nothing at or under the cap is touched at all
+    small = Config.from_env(env={})
+    plain = render(Completed(8, _rec(result_repr="42"), "hi\n"), "k", small)
+    assert plain.text == "[cell 8 · ok · 1.2s]\nhi\n→ result: 42"

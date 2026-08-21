@@ -34,16 +34,21 @@ def _more(n: int) -> str:
     return f"… and {n} more mutation" + ("" if n == 1 else "s")
 
 
-def footer_budget(cap: int) -> int:
-    """The slice of the response budget the mutation footer may claim.
+def trailing_budget(cap: int) -> int:
+    """The slice of the response budget EACH line trailing the body may claim.
 
-    The footer is not a free tail: a cell that writes ten thousand files produced ~179k
-    characters of footer appended AFTER the output was truncated, so the cap the caller
-    asked for was bypassed by the one line nobody bounded. A tenth of the cap (floor 200)
-    is enough for the handful of mutations a normal cell makes — those render byte for
-    byte as before — and everything past it is summarized.
+    None of them is a free tail. A cell that writes ten thousand files produced ~179k
+    characters of mutation footer appended AFTER the output was truncated, and
+    `result_repr` is 4096 characters straight from the kernel — so the cap the caller asked
+    for was bypassed by the lines nobody bounded. A tenth of the cap (floor 200) is enough
+    for what a normal cell produces — a handful of mutations, a short repr, a one-line
+    exception, all rendering byte for byte as before — and everything past it is cut.
     """
     return max(cap // 10, 200)
+
+
+def _clip(line: str, budget: int) -> str:
+    return line if len(line) <= budget else line[:max(budget - 1, 0)] + "…"
 
 
 def footer_line(mutations: list, budget: int | None = None) -> str | None:
@@ -126,22 +131,26 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             f"[still running — call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
             "for more output, or interrupt() to stop]", [])
     rec: CellRecord = outcome.record
+    cap = config.max_output_chars
     lines = [_header(outcome.cell_id, rec.status, rec.duration_ms, degraded)]
-    # The footer is rendered FIRST and inside the same budget: what it takes, the body no
-    # longer has. Rendering it last and unbounded is how a mutation-heavy cell smuggled
-    # ~179k characters past max_output_chars.
-    f = footer_line(rec.mutations, budget=footer_budget(config.max_output_chars))
-    body = _truncate(outcome.output, config.max_output_chars - len(f or ""),
-                     log_path / f"{outcome.cell_id}.log")
-    if body:
-        lines.append(body.rstrip("\n"))
+    # Everything that trails the body is rendered FIRST and inside the same budget: what
+    # the footer, the error summary and the result line take, the body no longer has.
+    # Rendered last and unbounded, any of the three walks straight past max_output_chars —
+    # the footer did it with ~179k characters of mutations, `result_repr` can do it with
+    # the 4096 the kernel allows it against a cap of 100.
+    f = footer_line(rec.mutations, budget=trailing_budget(cap))
+    err_line = None
     if rec.status == "error" and rec.error and rec.error.get("ename") not in (None, ""):
         if rec.error["ename"] not in outcome.output:
-            lines.append(f"{rec.error['ename']}: {rec.error.get('evalue', '')}")
-    if rec.result_repr is not None:
-        lines.append(f"→ result: {rec.result_repr}")
-    if f:
-        lines.append(f)
+            err_line = _clip(f"{rec.error['ename']}: {rec.error.get('evalue', '')}",
+                             trailing_budget(cap))
+    res_line = (_clip(f"→ result: {rec.result_repr}", trailing_budget(cap))
+                if rec.result_repr is not None else None)
+    trailing = sum(len(x) for x in (f, err_line, res_line) if x)
+    body = _truncate(outcome.output, cap - trailing, log_path / f"{outcome.cell_id}.log")
+    if body:
+        lines.append(body.rstrip("\n"))
+    lines.extend(x for x in (err_line, res_line, f) if x)
     return Rendered("\n".join(lines), [Path(p) for p in rec.images if Path(p).exists()])
 
 
