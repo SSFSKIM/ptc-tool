@@ -17,7 +17,7 @@ def test_all_lists_exactly_the_promised_names():
     # Locks the promise's shape itself — a name silently added/dropped from __all__
     # should fail this test, not slip through unnoticed alongside the exports below.
     assert rt.__all__ == ["read", "write", "edit", "bash", "agent", "llm",
-                          "web_fetch", "web_search", "history", "asyncio"]
+                          "web_fetch", "web_search", "history", "workflow", "asyncio"]
 
 
 def test_star_import_yields_the_real_object_for_every_all_name():
@@ -37,6 +37,14 @@ def test_star_import_yields_the_real_object_for_every_all_name():
 
     import asyncio as real_asyncio
     assert ns["asyncio"] is real_asyncio
+
+    # `workflow` is a namespace object, not a callable — same defect class though: the
+    # module is `wf`, so nothing can leave the submodule bound under this name.
+    from ptc.runtime import wf
+    assert not inspect.ismodule(ns["workflow"])
+    assert ns["workflow"] is wf.workflow
+    for helper in ("parallel", "pipeline", "phase"):
+        assert callable(getattr(ns["workflow"], helper))
 
     # `agent` is constructed per-kernel by bind() (module docstring); star-import before
     # any bind() has run in-process reaches the documented None placeholder, so this pins
@@ -63,6 +71,7 @@ def test_bind_populates_a_real_agent_object_reachable_by_star_import():
         assert isinstance(ip.user_ns["agent"], _Agent)
         assert callable(ip.user_ns["llm"]) and not inspect.ismodule(ip.user_ns["llm"])
         assert ip.user_ns["llm"] is rt.llm
+        assert ip.user_ns["workflow"] is rt.workflow
 
         ns: dict = {}
         exec("from ptc.runtime import *", ns)

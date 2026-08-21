@@ -15,9 +15,12 @@ from .transcript import history  # noqa: F401 — plain function, no submodule-n
 from .web import web_fetch, web_search  # noqa: F401 — plain functions, so (unlike `llm`)
 # no private-submodule dance is needed: `web` the module keeps its own name and the two
 # callables are bound over nothing.
+from .wf import workflow  # noqa: F401 — module `wf`, namespace object `workflow`: the
+# two names differ, so the submodule attribute cannot shadow the exported object the way
+# it did for `llm`. Tests reach internals via `from ptc.runtime import wf`.
 
 __all__ = ["read", "write", "edit", "bash", "agent", "llm", "web_fetch", "web_search",
-           "history", "asyncio"]
+           "history", "workflow", "asyncio"]
 
 #: constructed per-kernel by bind(); None until then (importing this module must not
 #: require a live kernel).

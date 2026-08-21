@@ -114,12 +114,42 @@ searching.
 pass `session=` explicitly for any other session id. Raises `RuntimeError` if no session id
 is known (an alias-keyed kernel) or `FileNotFoundError` if no transcript is found on disk.
 
+## Workflow helpers
+
+    workflow.phase("collect")                                     # progress marker
+    pages = await workflow.parallel(*[web_fetch(u) for u in urls], limit=5)
+    out = await workflow.pipeline(chunks, extract, verify)        # per-item stage chain
+
+There is no workflow *engine* here — a cell of Python is the workflow. The three helpers
+add only what `asyncio.gather` lacks: `parallel(*aws, limit=8)` caps how many run at once
+and returns one result per input **in input order**, with a failure returned in place as
+the exception object (`[r for r in out if not isinstance(r, Exception)]` to keep the good
+ones). `pipeline(items, *stages, limit=8)` runs each item through every stage with no
+barrier between stages — a fast item reaches the last stage while a slow one is still in
+the first — and a stage exception ends that item's chain, becoming its result.
+`workflow.phase(name)` prints a marker and records it.
+
+Write multi-phase work as ordinary cells: fan out, filter in Python, verify, synthesize.
+
+    workflow.phase("fan out")
+    drafts = await workflow.parallel(*[agent.run(t) for t in tasks], limit=4)
+    ok = [d for d in drafts if not isinstance(d, Exception)]
+    workflow.phase("synthesize")
+    print(await llm("Merge these findings:\n" + "\n---\n".join(d.text for d in ok)))
+
+Pass unstarted awaitables (`agent.run(...)`, `llm(...)`, `web_fetch(...)`) — `agent.spawn`
+starts its child the moment you call it, so `spawn` handles belong in `agent.gather`, not
+in `parallel`. Stages may be sync or async, so a parse or a filter is a fine stage.
+`limit` bounds the fan-out in front of you; the global `PTC_MAX_CONCURRENCY` cap still
+governs everything that spawns a child, so the tighter of the two wins. One thing not to
+fan out: `agent.fork` copies the whole parent conversation into each child and pays for
+it, so it is a deliberate one-shot, never a loop body.
+
 ## Pitfalls
 
-- Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`,
-  `agent`, `llm`, `web_fetch`, `web_search`, `history`, `asyncio`. Do not call `workflow`
-  — it is not defined in the kernel namespace yet. Do not invent wrappers such as
-  `call_skill(...)` or `run_subagent(...)` either.
+- Only these names are bound in the kernel: `read`, `write`, `edit`, `bash`, `agent`,
+  `llm`, `web_fetch`, `web_search`, `history`, `workflow`, `asyncio`. Do not invent
+  wrappers such as `call_skill(...)` or `run_subagent(...)`.
 - The kernel is your notebook, not the project's runtime.
 - A kernel restart loses variables.
 
