@@ -30,3 +30,21 @@ def test_archived_settle_resumes_at_the_cursor(monkeypatch, tmp_path):
     _archive(tmp_path, "a2", 3, "one\ntwo\n", None)
     out = KernelClient("a2")._archived(3, len("one\n"))
     assert "one" not in out.output and "two" in out.output
+
+
+def test_two_archives_in_the_same_second_both_succeed(tmp_path):
+    """`cells-prev-<timestamp>` collided when a cleanup and the retry after a failed
+    spawn landed in one second: renaming onto a NONEMPTY archive raises FileExistsError,
+    so the first attempt's archive blocked every later attempt to recover."""
+    from ptc import kernel
+
+    kd = tmp_path / "k"
+    for text in ("first", "second"):
+        (kd / "cells").mkdir(parents=True)
+        (kd / "cells" / "1.log").write_text(text)
+        kernel._rotate_cells(kd)
+
+    archives = list(kd.glob("cells-prev-*"))
+    assert len(archives) == 2, archives
+    assert {p.read_text() for a in archives for p in a.glob("*.log")} == {"first", "second"}
+    assert not (kd / "cells").exists()

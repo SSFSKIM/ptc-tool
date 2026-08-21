@@ -12,7 +12,14 @@ from . import bgroups
 from .discovery import read_meta, write_meta
 from .lock import key_lock
 from .ownership import Owner, owner_alive, proc_start_time, read_owner, write_owner
-from .paths import Config, cells_dir, kernel_dir, kernels_root
+from .paths import (
+    Config,
+    cells_dir,
+    kernel_dir,
+    kernels_root,
+    private_open,
+    secure_dir,
+)
 from .venv import venv_python
 
 
@@ -42,16 +49,29 @@ def consume_expiry(key: str) -> str | None:
 
 def _rotate_cells(kd: Path) -> None:
     cd = kd / "cells"
-    if cd.exists():
-        cd.rename(kd / f"cells-prev-{int(time.time())}")
+    if not cd.exists():
+        return
+    # Two rotations in the same second — a cleanup, then the retry after a failed spawn —
+    # otherwise target the same name, and renaming onto a NONEMPTY archive raises
+    # FileExistsError. That is how a recoverable spawn failure became a permanent one:
+    # the archive from the first attempt blocked every later attempt to clean up.
+    stamp = int(time.time())
+    target = kd / f"cells-prev-{stamp}"
+    n = 0
+    while target.exists():
+        n += 1
+        target = kd / f"cells-prev-{stamp}-{n}"
+    cd.rename(target)
 
 
 def _clean_stale(kd: Path, key: str) -> None:
     o = read_owner(key)
     if o and owner_alive(o):
-        # a live kernel with no `ready` (e.g. bootstrap failed) must be reaped
-        # before respawn, or every retry leaks a detached process (F4) — and its
-        # children with it, for the same reason kill_kernel takes the group
+        # A live kernel with no `ready` must be reaped before respawn, or every retry
+        # leaks a detached process (F4) — and its children with it, for the same reason
+        # kill_kernel takes the group. Ownership is keyed off owner.json alone, never
+        # `ready`, so this reaps a PROVISIONAL kernel too: one whose spawner died between
+        # the fork and the end of bootstrap.
         kill_process_tree(o.pid)
     # the dead kernel's background bash groups are in sessions of their own, so the group
     # kill above never reached them (F4)
@@ -90,16 +110,26 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                   claude_session_id: str | None = None,
                   config: Config | None = None) -> KernelInfo:
     cfg = config or Config.from_env()
-    kd = kernel_dir(key)
-    kd.mkdir(parents=True, exist_ok=True)
+    # secure_dir, not mkdir: kernel state is owner-only, and a directory from before this
+    # rule (or from a laxer umask) has its mode repaired here on every ensure — including
+    # the attach path below, which is the only ensure a long-lived kernel ever sees again.
+    kd = secure_dir(kernel_dir(key))
+    secure_dir(cells_dir(key))
+    secure_dir(cells_dir(key) / "offsets")
     with key_lock(key):
         o = read_owner(key)
         if o and owner_alive(o) and (kd / "ready").exists():
+            # Attaching to a live kernel is the only chance to repair a meta.json that
+            # was written before anyone knew the Claude session id (a CLI exec keyed off
+            # an env rung, an MCP attach after the CLI spawned the kernel): history() and
+            # agent.fork() read the id back from there and are unavailable without it.
+            if claude_session_id and not read_meta(key).get("claude_session_id"):
+                write_meta(key, claude_session_id=claude_session_id)
             return KernelInfo(key, o.pid, kd / "connection.json", False, None)
         expired = consume_expiry(key)
         _clean_stale(kd, key)
-        cells_dir(key).mkdir(parents=True, exist_ok=True)
-        (cells_dir(key) / "offsets").mkdir(exist_ok=True)
+        secure_dir(cells_dir(key))          # the rotation above took the old one away
+        secure_dir(cells_dir(key) / "offsets")
         conn = kd / "connection.json"
         work = cwd or cfg.cwd or os.getcwd()
         env = {**os.environ,
@@ -108,18 +138,27 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                "PTC_IDLE_HOURS": str(cfg.idle_hours),
                "PTC_MAX_CONCURRENCY": str(cfg.max_concurrency),
                "PTC_HOME": str(kernels_root().parent)}
-        log = open(kd / "kernel.log", "ab")
+        log = private_open(kd / "kernel.log", "ab")
+        epoch = str(int(time.time()))
         proc = subprocess.Popen(
             [str(venv_python()), "-m", "ipykernel_launcher", "-f", str(conn)],
             cwd=work, env=env, stdout=log, stderr=log,
             stdin=subprocess.DEVNULL, start_new_session=True)
         try:
+            # Ownership is published IMMEDIATELY, before the readiness checks rather than
+            # after them. A spawner killed inside that window (the adapter shut down, a
+            # Ctrl-C) leaves a detached kernel behind, and with no owner.json nothing can
+            # identify or reap it: the key lock dies with the parent and the next
+            # ensure_kernel spawns a second orphan on top of the first. `ready` remains
+            # the completed-BOOTSTRAP marker, so a provisional owner is never mistaken
+            # for a usable kernel — kernel_alive() and the reuse check above both require
+            # `ready`, while _clean_stale and kill_kernel key off the owner alone and so
+            # reap it.
+            write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
+                                   time.time(), secrets.token_hex(8), epoch))
             _wait_ports(conn)
             os.chmod(conn, 0o600)
             _kernel_info_roundtrip(conn)
-            epoch = str(int(time.time()))
-            write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
-                                   time.time(), secrets.token_hex(8), epoch))
             # A caller that does not know the Claude session id (an env-keyed rung, a CLI
             # restart) passes None — which must not ERASE the id a previous spawn under
             # this key already learned: history() and fork() read it back from here.
