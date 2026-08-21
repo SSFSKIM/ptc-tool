@@ -26,7 +26,8 @@ from .state import STATE
 _TEARDOWN_S = 30.0
 
 #: How long an interrupted turn is given to end the way S1 says it ends: NORMALLY, with a
-#: ResultMessage carrying terminal_reason='aborted_streaming' (4.0-13.0 s measured). Within
+#: ResultMessage carrying terminal_reason='aborted_streaming'. Drain length is workload-shaped:
+#: 4.0-13.0 s in S1's longer turns, and 0.6 s observed live in T28 on a short turn. Within
 #: this budget the drain settles the handle through its own completion path; past it the
 #: drain is treated as wedged and the driver is cancelled instead.
 _INTERRUPT_DRAIN_S = 30.0
