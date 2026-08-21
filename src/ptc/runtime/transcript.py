@@ -85,8 +85,15 @@ class Transcript:
         return out
 
     def search(self, pattern: str) -> list:
+        """Rows whose JSON serialization matches `pattern`.
+
+        `ensure_ascii=False` is the whole contract of this line: the default escapes every
+        non-ASCII character to \\uXXXX, so a Korean or CJK pattern was matched against text
+        that no longer contained it and a search of a plainly visible turn came back empty.
+        """
         rx = re.compile(pattern)
-        return [row for row in self.messages if rx.search(json.dumps(row))]
+        return [row for row in self.messages
+                if rx.search(json.dumps(row, ensure_ascii=False))]
 
     def text(self) -> str:
         """The conversation as text, in the order the JSONL recorded it.

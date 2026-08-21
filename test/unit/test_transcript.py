@@ -152,3 +152,26 @@ def test_claude_config_dir_moves_the_projects_root(tmp_path, monkeypatch):
 def test_an_unset_config_dir_still_means_the_home_directory(tmp_path, monkeypatch):
     p = _fake_home(tmp_path, monkeypatch)
     assert transcript.history("s-42", cwd="/my/proj").path == p
+
+
+def test_search_matches_non_ascii_text(tmp_path, monkeypatch):
+    """The rows are serialized to JSON before the regex runs, and json.dumps escapes
+    every non-ASCII character to \\uXXXX by default — so a Korean or CJK pattern never
+    matched text that is plainly visible in the transcript."""
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "커널을 다시 시작해줘"}},
+        {"type": "assistant", "message": {"role": "assistant",
+                                          "content": [{"type": "text", "text": "restarted"}]}},
+    ]
+    d = tmp_path / ".claude" / "projects" / "-ko"
+    d.mkdir(parents=True)
+    (d / "s-ko.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "p"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(STATE, "config", {"key": "ko"})
+
+    h = transcript.history("s-ko", cwd="/ko")
+    hits = h.search("커널")
+    assert len(hits) == 1 and hits[0]["type"] == "user"
+    assert h.search("restarted")           # ASCII search still works
