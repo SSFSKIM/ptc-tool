@@ -21,10 +21,21 @@ Log for the substring-vs-exact-match call and its wrapper-launcher caveat.
 import json
 import os as _os
 import re
+import secrets
 import subprocess
 from dataclasses import dataclass
 
 from .paths import kernel_dir, private_write_text, run_dir, safe_key, secure_dir
+
+#: One nonce per adapter PROCESS, drawn once at import.
+#:
+#: The adapter-local rung is the only key not derived from something the client told us, and
+#: its kernel outlives the adapter that made it by up to the idle TTL — so a bare pid is not
+#: enough of a name. The OS recycles pids, and a later adapter that drew the same one
+#: attached to the previous client's namespace instead of getting the fresh adapter-local
+#: kernel this rung documents. Fixed for the life of the process (two resolve() calls in one
+#: adapter must agree), distinct across processes.
+_ADAPTER_NONCE = secrets.token_hex(4)
 
 # 8+ hex/hyphen chars: good enough to tell a Claude session UUID apart from a
 # human-chosen PTC_SESSION key (which is not itself a Claude session id).
@@ -88,7 +99,8 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
     v = env.get("CLAUDE_CODE_SESSION_ID")
     if v:
         return Resolved(safe_key(v), "env-claude-session", v, None, False)
-    return Resolved(f"adapter-{_os.getpid()}", "adapter-local", None, None, True)
+    return Resolved(safe_key(f"adapter-{_os.getpid()}-{_ADAPTER_NONCE}"),
+                    "adapter-local", None, None, True)
 
 
 def write_meta(key: str, **fields) -> None:

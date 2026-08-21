@@ -9,6 +9,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ImageContent, TextContent
 
 from .client import KernelClient
+from .discovery import read_meta
 from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
 from .paths import MAX_OUTPUT_CLAMP, Config
@@ -151,8 +152,18 @@ async def interrupt_tool(session: str | None = None) -> list:
 
 async def restart_tool(session: str | None = None) -> list:
     r = await asyncio.to_thread(_resolve, session)
-    await asyncio.to_thread(restart_kernel, r.key, cwd=r.cwd,
-                            claude_session_id=r.claude_session_id)
+    # The stored metadata first, exactly as the CLI restart path does it. Only the
+    # hook-runfile rung resolves a cwd at all: an explicit `session=`, either env rung and
+    # the adapter-local fallback all carry `cwd=None`, so without this the respawn landed in
+    # whatever directory the ADAPTER happened to be in and overwrote meta.json's cwd with
+    # it — a kernel created from another project then ran its file tools and its agents in
+    # the wrong place. `claude_session_id` is the same story: history() and agent.fork()
+    # read it back from meta.json, and a restart must not blank it.
+    meta = await asyncio.to_thread(read_meta, r.key)
+    await asyncio.to_thread(restart_kernel, r.key,
+                            cwd=meta.get("cwd") or r.cwd,
+                            claude_session_id=(meta.get("claude_session_id")
+                                               or r.claude_session_id))
     return [TextContent(type="text", text=(
         f"[kernel {r.key} restarted — the Python namespace was lost; variables and imports "
         "must be recreated. Agent sessions remain resumable via agent.list().]"))]

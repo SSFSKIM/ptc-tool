@@ -1,6 +1,7 @@
 import asyncio
+import json
 
-from ptc.kernel import kill_kernel
+from ptc.kernel import ensure_kernel, kill_kernel
 from ptc.mcp import exec_tool, interrupt_tool, kernels_tool, restart_tool, wait_tool
 
 
@@ -34,6 +35,25 @@ def test_exec_wait_interrupt_roundtrip(ptc_home):
     r7 = _run(exec_tool(code="print('x' in dir())", session="m1", timeout_s=60))
     assert "False" in r7[0].text            # namespace really was lost
     kill_kernel("m1")
+
+
+def test_mcp_restart_respawns_where_the_kernel_lived(ptc_home, tmp_path):
+    """The MCP twin of test_cli.py's `test_cli_restart_preserves_meta`. Only the
+    hook-runfile rung resolves a cwd: an explicit `session=` (as here), either env rung and
+    the adapter-local fallback all carry `cwd=None`, so the respawn fell back to the
+    ADAPTER's own directory and overwrote meta.json's cwd with it — a kernel created from
+    another project then ran its file tools and agents in the wrong place."""
+    project = tmp_path / "project"
+    project.mkdir()
+    ensure_kernel("m9", cwd=str(project), claude_session_id="sess-m9-123")
+    meta_path = ptc_home / "kernels" / "m9" / "meta.json"
+
+    _run(restart_tool(session="m9"))
+
+    meta = json.loads(meta_path.read_text())
+    assert meta["cwd"] == str(project), "the kernel was respawned in the adapter's cwd"
+    assert meta["claude_session_id"] == "sess-m9-123", "the session id was blanked"
+    kill_kernel("m9")
 
 
 def test_interrupt_returns_the_interrupted_cells_tail(ptc_home):

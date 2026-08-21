@@ -121,6 +121,46 @@ def test_env_ptc_session_wins_over_env_claude_session_when_both_present(monkeypa
     assert r.source == "env-ptc-session" and r.key == "childkey-1"
 
 
+def test_adapter_local_key_is_stable_in_a_process_but_more_than_a_pid(monkeypatch, tmp_path):
+    """A detached kernel outlives its adapter by up to the TTL, so a key that is only the
+    adapter's pid is a name the OS can hand out again: the next adapter to draw that pid
+    attached to the previous client's namespace instead of getting the fresh adapter-local
+    kernel this rung promises. The key must still be FIXED within one process — two
+    resolve() calls from the same adapter are the same session."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    a = resolve(ppid=1, env={}, proc_name=lambda pid: "", proc_parent=lambda pid: None)
+    b = resolve(ppid=1, env={}, proc_name=lambda pid: "", proc_parent=lambda pid: None)
+
+    assert a.degraded and a.source == "adapter-local"
+    assert a.key == b.key, "two calls in one adapter must resolve to one kernel"
+    assert a.key != f"adapter-{os.getpid()}", "the bare pid is all a later adapter can reuse"
+    assert a.key.startswith(f"adapter-{os.getpid()}-")
+    # kernel_dir() refuses anything that is not a single safe name under the kernels root
+    from ptc.paths import kernel_dir, safe_key
+    assert safe_key(a.key) == a.key and kernel_dir(a.key).name == a.key
+
+
+def test_the_part_of_an_adapter_key_that_is_not_the_pid_varies(tmp_path):
+    """The half a same-process test cannot see: two adapter processes differ in the
+    component that ISN'T the pid, so the key still names one adapter after the OS has
+    handed that pid to another. (Two live processes always have different pids — only this
+    component still distinguishes them once one has exited and its number come round.)"""
+    import subprocess
+    import sys
+    src = ("import ptc.discovery as d; "
+           "print(d.resolve(ppid=1, env={}, proc_name=lambda p: '', "
+           "proc_parent=lambda p: None).key)")
+    env = {**os.environ, "PTC_HOME": str(tmp_path)}
+    keys = [subprocess.run([sys.executable, "-c", src], capture_output=True, text=True,
+                           env=env, check=True).stdout.strip() for _ in range(2)]
+    tails = set()
+    for k in keys:
+        prefix, pid, tail = k.split("-", 2)
+        assert (prefix, pid.isdigit()) == ("adapter", True), k
+        tails.add(tail)
+    assert len(tails) == 2, f"the component that is not the pid is constant: {keys}"
+
+
 def test_resolve_defaults_env_to_os_environ(monkeypatch, tmp_path):
     """env=None falls back to the real process environment (documented default)."""
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
