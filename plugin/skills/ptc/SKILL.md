@@ -104,17 +104,22 @@ does not make it search harder. It runs a scoped sub-agent, so it shares the `ag
 concurrency cap and is not free; one search then fan-out `web_fetch` beats repeated
 searching.
 
-## History (coming in M3)
+## History (lossless memory)
 
-Not available yet. `history()` (this session's full transcript, pre-compaction) and
-`handle.history()` (a child's transcript) ship with M3.
+    h = history()                        # this session's full transcript, pre-compaction
+    h.user(); h.assistant(); h.tool_calls("Bash"); h.search(r"regex")
+    child_h = h1.history()               # a child's transcript (any spawned/resumed handle)
+
+`history(session=None)` defaults to this kernel's own Claude session id (from `meta.json`);
+pass `session=` explicitly for any other session id. Raises `RuntimeError` if no session id
+is known (an alias-keyed kernel) or `FileNotFoundError` if no transcript is found on disk.
 
 ## Pitfalls
 
 - Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`,
-  `agent`, `llm`, `web_fetch`, `web_search`, `asyncio`. Do not call `history` or
-  `workflow` — they are not defined in the kernel namespace yet. Do not invent wrappers
-  such as `call_skill(...)` or `run_subagent(...)` either.
+  `agent`, `llm`, `web_fetch`, `web_search`, `history`, `asyncio`. Do not call `workflow`
+  — it is not defined in the kernel namespace yet. Do not invent wrappers such as
+  `call_skill(...)` or `run_subagent(...)` either.
 - The kernel is your notebook, not the project's runtime.
 - A kernel restart loses variables.
 

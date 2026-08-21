@@ -10,12 +10,14 @@ from ._llm import llm  # noqa: F401 — `llm` lives in the private `_llm` submod
 # `from ptc.runtime import _llm`.
 from .files import edit, read, write  # noqa: F401
 from .shell import bash  # noqa: F401
+from .transcript import history  # noqa: F401 — plain function, no submodule-name
+# collision (module is `transcript`, callable is `history`).
 from .web import web_fetch, web_search  # noqa: F401 — plain functions, so (unlike `llm`)
 # no private-submodule dance is needed: `web` the module keeps its own name and the two
 # callables are bound over nothing.
 
 __all__ = ["read", "write", "edit", "bash", "agent", "llm", "web_fetch", "web_search",
-           "asyncio"]
+           "history", "asyncio"]
 
 #: constructed per-kernel by bind(); None until then (importing this module must not
 #: require a live kernel).

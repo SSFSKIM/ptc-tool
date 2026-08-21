@@ -191,11 +191,16 @@ class AgentHandle:
         return self._session.messages() if self._session else []
 
     def history(self):
+        """The child's own transcript (T25's `Transcript`, same type `history()` returns).
+
+        The child writes its own JSONL under a cwd this handle never tracked (only
+        `AgentOpts.cwd`, which is not retained past spawn), so this resolves by session
+        id alone — `transcript._resolve_path`'s glob fallback covers exactly that case.
+        """
         if not self.session_id:
             raise RuntimeError(f"agent {self.name!r} has no session id yet")
-        raise NotImplementedError(
-            "AgentHandle.history() ships in M3 with the transcript reader; "
-            f"use .messages() meanwhile (session id: {self.session_id})")
+        from .transcript import history as _history
+        return _history(session=self.session_id)
 
     async def interrupt(self) -> None:
         """Interrupt the turn, let its drain END NORMALLY, settle exactly once (F6).

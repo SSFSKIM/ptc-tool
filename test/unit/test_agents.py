@@ -168,6 +168,46 @@ def test_spawn_gather_registry_send(tmp_path):
     assert h.session_id == "fake-alpha"
 
 
+def test_handle_history_needs_a_session_id(tmp_path):
+    a = _agent(tmp_path)
+
+    async def flow():
+        h = a.spawn("alpha", name="one")
+        # Nothing has awaited the driver yet, so open_session hasn't run and no session
+        # id is bound — history() must refuse legibly rather than delegate with None.
+        with pytest.raises(RuntimeError, match="has no session id yet"):
+            h.history()
+        await a.gather(h)   # let the driver settle so it doesn't outlive the loop
+    asyncio.run(flow())
+
+
+def test_handle_history_delegates_to_transcript_by_session_id(tmp_path, monkeypatch):
+    # T25's history() locates a transcript by session id (with a glob fallback when the
+    # cwd guess misses); AgentHandle.history() (spec: "returns the same type for
+    # children") is a thin delegate — this proves the wiring, not transcript.py's logic
+    # (that's test_transcript.py's job).
+    import json as _json
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    proj = tmp_path / ".claude" / "projects" / "somewhere"
+    proj.mkdir(parents=True)
+    rows = [{"type": "user", "message": {"role": "user", "content": "hi from child"}}]
+    (proj / "fake-alpha.jsonl").write_text(_json.dumps(rows[0]))
+
+    a = _agent(tmp_path)
+
+    async def flow():
+        h = a.spawn("alpha", name="one")
+        await a.gather(h)
+        return h
+    h = asyncio.run(flow())
+    assert h.session_id == "fake-alpha"
+
+    t = h.history()
+    assert t.path == proj / "fake-alpha.jsonl"
+    assert t.user() == ["hi from child"]
+
+
 def test_spawn_name_collision_and_timeout(tmp_path):
     a = _agent(tmp_path)
 

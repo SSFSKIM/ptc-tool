@@ -17,7 +17,7 @@ def test_all_lists_exactly_the_promised_names():
     # Locks the promise's shape itself — a name silently added/dropped from __all__
     # should fail this test, not slip through unnoticed alongside the exports below.
     assert rt.__all__ == ["read", "write", "edit", "bash", "agent", "llm",
-                          "web_fetch", "web_search", "asyncio"]
+                          "web_fetch", "web_search", "history", "asyncio"]
 
 
 def test_star_import_yields_the_real_object_for_every_all_name():
@@ -27,7 +27,8 @@ def test_star_import_yields_the_real_object_for_every_all_name():
     for name in rt.__all__:
         assert name in ns, f"{name!r} missing from `from ptc.runtime import *`"
 
-    for name in ("read", "write", "edit", "bash", "llm", "web_fetch", "web_search"):
+    for name in ("read", "write", "edit", "bash", "llm", "web_fetch", "web_search",
+                "history"):
         obj = ns[name]
         assert callable(obj), f"{name!r} should be callable, got {obj!r}"
         assert not inspect.ismodule(obj), (
