@@ -89,8 +89,9 @@ class KernelClient:
 
     # -- busy model (F2): a kernel is busy when the kernel-side current.json names a
     # cell with no terminal record, OR when a submitted request has not yet been
-    # confirmed (pending.json, left behind by any failure inside the window where a
-    # request is on the wire but current.json does not name it yet).
+    # confirmed (pending.json, written before the send and cleared only once current.json
+    # names our cell, so it covers the whole wire window including the submitter's death
+    # inside it).
     def is_busy(self) -> Busy | None:
         cur = current_cell(self.key)
         if cur is not None and read_record(self.key, cur) is None and kernel_alive(self.key):
@@ -142,11 +143,19 @@ class KernelClient:
         cur = current_cell(self.key)
         return cur is not None and cur > cid
 
-    def _mark_pending(self, msg_id: str, cell_id: int | None) -> None:
-        """Record a request that is on the wire but unconfirmed. Best effort: a marker
-        we cannot write must not mask the fault that sent us here. The epoch is stamped
-        in so a later kernel can tell the marker is not about IT (see
-        `_pending_discharged`)."""
+    def _mark_pending(self, msg_id: str | None, cell_id: int | None, *,
+                      best_effort: bool = True) -> None:
+        """Record a request that is (or is about to be) on the wire but unconfirmed.
+
+        `best_effort` is the difference between the two callers. Written BEFORE the send
+        the marker IS the admission guard, so one that cannot be written aborts the
+        submission rather than letting it proceed unguarded. Written from the failure
+        handler afterwards it is a refresh of a marker that already exists, and must not
+        mask the fault that sent us there.
+
+        The epoch is stamped in so a later kernel can tell the marker is not about IT (see
+        `_pending_discharged`).
+        """
         try:
             o = read_owner(self.key)
             secure_dir(kernel_dir(self.key) / "cells")
@@ -156,7 +165,8 @@ class KernelClient:
                             "submitted_at": time.time(),
                             "epoch": o.epoch if o else None}))
         except OSError:
-            pass
+            if not best_effort:
+                raise
 
     def exec_cell(self, code: str, timeout_s: float, config: Config) -> Completed | Running | Busy:
         """Atomic admission (F2): the submit lock is held from the busy check until the
@@ -174,14 +184,24 @@ class KernelClient:
                 return busy
             kc = self._connect()
             try:
-                msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
-                # sent-unacknowledged window: the request is on the wire and nothing on
-                # disk records it. EVERY exit from here until current.json names our
-                # cell must fail closed with a marker — a lost acknowledgement, a
-                # wedged kernel, a Ctrl-C — or the next caller admits a second cell on
-                # top of one this kernel may still be about to run (F2).
-                cell_id = None
+                # The marker goes on disk BEFORE the request goes on the wire. An
+                # exception handler cannot cover the window that matters: a SIGKILL landing
+                # between the send and the handler leaves no marker at all, and process
+                # death releases the submit lock — so the next adapter sees neither
+                # current.json nor a marker while this kernel still holds the request, and
+                # silently queues a second cell on top of it. Nothing has been sent yet, so
+                # a marker that cannot be written aborts the submission (OSError out of
+                # here) rather than sending unguarded.
+                self._mark_pending(None, None, best_effort=False)
+                # sent-unacknowledged window: the request is on the wire and only the
+                # marker records it. EVERY exit from here until current.json names our
+                # cell must fail closed — a lost acknowledgement, a wedged kernel, a
+                # Ctrl-C — or the next caller admits a second cell on top of one this
+                # kernel may still be about to run (F2).
+                msg_id = cell_id = None
                 try:
+                    msg_id = kc.execute(code, store_history=True, allow_stdin=False,
+                                        stop_on_error=False)
                     cell_id = self._await_cell_id(kc, msg_id)
                     deadline = time.monotonic() + 15.0
                     while current_cell(self.key) != cell_id:
@@ -192,6 +212,11 @@ class KernelClient:
                                 "restart()")
                         time.sleep(0.02)
                 except BaseException:
+                    # Refresh the marker with whatever was learned — a marker naming the
+                    # cell is dischargeable by that cell's record, one naming nothing only
+                    # by the kernel's death or by restart(). It is never REMOVED here: an
+                    # exception out of execute() does not prove the request stayed off the
+                    # wire, and only proof discharges the marker (`_pending_discharged`).
                     self._mark_pending(msg_id, cell_id)
                     raise
                 (kernel_dir(self.key) / "cells" / "pending.json").unlink(missing_ok=True)

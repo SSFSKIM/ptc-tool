@@ -8,9 +8,11 @@ import json
 import os
 import time
 
+import pytest
+
 from ptc.client import Busy, KernelClient
 from ptc.ownership import Owner, proc_start_time, write_owner
-from ptc.paths import kernel_dir
+from ptc.paths import Config, kernel_dir
 
 _RECORD = {"status": "ok", "duration_ms": 1, "result_repr": None, "error": None,
            "images": [], "mutations": []}
@@ -92,3 +94,66 @@ def test_a_dead_kernel_discharges_it(monkeypatch, tmp_path):
     (kd / "owner.json").unlink()
 
     assert KernelClient("p6").is_busy() is None
+
+
+# --- r3 finding 1: the marker is written BEFORE the request goes on the wire ----------
+
+class _Killed(BaseException):
+    """Stands in for the adapter dying between the send and the exception handler."""
+
+
+class _FakeKC:
+    """A kernel client whose execute() records what is on disk at the instant of the send
+    and then never returns — the shape of a SIGKILL landing inside the wire window."""
+
+    def __init__(self, marker):
+        self._marker = marker
+        self.marker_at_send = None
+
+    def execute(self, *a, **kw):
+        self.marker_at_send = self._marker.exists()
+        raise _Killed()
+
+    def stop_channels(self):
+        pass
+
+
+def test_the_marker_is_on_disk_before_the_request_is_sent(monkeypatch, tmp_path):
+    """An exception handler cannot cover the window that matters.
+
+    A submitter killed between `kc.execute()` putting the request on the wire and the
+    handler running leaves NO marker, and its death releases the submit lock — so the next
+    adapter sees neither current.json nor a marker while the kernel still holds the first
+    request, and queues a second cell silently on top of it. The marker therefore goes down
+    first, and survives a failed send: only proof discharges it, and an exception out of
+    execute() does not prove the request stayed off the wire.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p7")
+    marker = kd / "cells" / "pending.json"
+    kc = _FakeKC(marker)
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: kc)
+
+    with pytest.raises(_Killed):
+        KernelClient("p7").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
+
+    assert kc.marker_at_send is True, "the request went out before the marker was written"
+    assert marker.exists(), "the marker was cleared by a send whose failure proves nothing"
+    # a NEW client — the one that would have queued the second cell — refuses admission
+    assert KernelClient("p7").is_busy() == Busy(-1, reason="pending-unconfirmed")
+
+
+def test_a_marker_that_cannot_be_written_aborts_the_submission(monkeypatch, tmp_path):
+    """Before the send the marker IS the admission guard, so one that cannot be written
+    fails the submission rather than sending unguarded."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p8")
+    kc = _FakeKC(kd / "cells" / "pending.json")
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: kc)
+    monkeypatch.setattr("ptc.client.private_write_text",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("read-only")))
+
+    with pytest.raises(OSError):
+        KernelClient("p8").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
+
+    assert kc.marker_at_send is None, "the request was sent with no marker behind it"
