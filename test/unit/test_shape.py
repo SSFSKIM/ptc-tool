@@ -143,3 +143,16 @@ def test_result_and_error_ride_inside_the_response_budget():
     small = Config.from_env(env={})
     plain = render(Completed(8, _rec(result_repr="42"), "hi\n"), "k", small)
     assert plain.text == "[cell 8 · ok · 1.2s]\nhi\n→ result: 42"
+
+
+def test_render_and_to_dict_report_a_cell_that_does_not_exist():
+    """A wait on an id this kernel never ran must read as an answer, not as a cell that
+    happens to be quiet — and the Busy tri-state keeps its own shapes."""
+    from ptc.client import NotFound
+
+    cfg = Config.from_env(env={})
+    r = render(NotFound(4242), "k", cfg)
+    assert "4242" in r.text and "not found" in r.text and r.images == []
+    assert "still running" not in r.text
+    assert to_dict(NotFound(4242), "k") == {"status": "not_found", "cell_id": 4242}
+    assert render(Busy(7, reason="running"), "k", cfg).text != r.text

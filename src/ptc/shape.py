@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .cells import CellRecord
-from .client import Busy, Completed, Running
+from .client import Busy, Completed, NotFound, Running
 from .paths import Config, cells_dir
 
 
@@ -124,6 +124,14 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             f"{which}. "
             + (f"Use wait(cell_id={outcome.cell_id}) for its output, " if has_id else "")
             + "interrupt() to stop it, or resubmit after it finishes. Nothing was queued.", [])
+    if isinstance(outcome, NotFound):
+        # Said plainly, because the alternative is a caller waiting on an id that will
+        # never resolve: nothing is running under this number and nothing will be.
+        return Rendered(
+            f"[cell {outcome.cell_id} · not found{' · [keying: adapter-local]' if degraded else ''}] "
+            f"kernel {key} has no cell {outcome.cell_id} — no output, no record and no "
+            "archive of one. Check the id (it may belong to a different session), or "
+            "submit the code again; nothing is running under it.", [])
     if isinstance(outcome, Running):
         body = _truncate(outcome.output, config.max_output_chars, log_path / f"{outcome.cell_id}.log")
         return Rendered(
@@ -157,6 +165,8 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
 def to_dict(outcome, key: str) -> dict:
     if isinstance(outcome, Busy):
         return {"status": "busy", "cell_id": outcome.cell_id, "reason": outcome.reason}
+    if isinstance(outcome, NotFound):
+        return {"status": "not_found", "cell_id": outcome.cell_id}
     if isinstance(outcome, Running):
         return {"status": "running", "cell_id": outcome.cell_id,
                 "output": outcome.output, "next_offset": outcome.next_offset}

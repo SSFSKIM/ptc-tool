@@ -151,7 +151,9 @@ def main(argv=None) -> int:
         if info is not None and info.expired_notice:
             print(f"[previous kernel expired: {info.expired_notice.strip()}]")
         print(render(outcome, key, cfg).text)
-    from .client import Completed
+    from .client import Completed, NotFound
+    if isinstance(outcome, NotFound):
+        return 1          # a wait on an id this kernel never ran is a failed wait
     return 0 if not isinstance(outcome, Completed) or outcome.record.status != "error" else 1
 
 

@@ -181,3 +181,24 @@ def test_wait_on_dead_kernel_reports_kernel_died(ptc_home):
     time.sleep(0.5)
     w = KernelClient("y2").wait_cell(out.cell_id, timeout_s=3)
     assert isinstance(w, Completed) and w.record.error["ename"] == "KernelDied"
+
+
+def test_exec_whose_cell_kills_the_kernel_settles_instead_of_yielding(ptc_home):
+    """The initial follow polled only for a record.
+
+    A cell that takes the kernel down with it — os._exit here, a segfault or an OOM kill
+    in the field — can never write one, so the follow burned the whole yield budget (300 s
+    by default) and then reported the cell as Running: two lies for the price of one wait.
+    wait_cell has made the liveness check since F3; this path owes the same answer.
+    """
+    ensure_kernel("y6", cwd=str(ptc_home))
+    t0 = time.monotonic()
+    out = KernelClient("y6").exec_cell(
+        "import os\nprint('bye', flush=True)\nos._exit(9)", timeout_s=60,
+        config=Config.from_env())
+    elapsed = time.monotonic() - t0
+
+    assert isinstance(out, Completed), f"still following a dead kernel after {elapsed:.1f}s"
+    assert out.record.error["ename"] == "KernelDied"
+    assert "bye" in out.output
+    assert elapsed < 20, f"the follow blocked on a dead kernel for {elapsed:.1f}s"

@@ -41,6 +41,17 @@ class Busy:
     reason: str = ""
 
 
+@dataclass
+class NotFound:
+    """No such cell under this key: no record, no log, no archive, and a live kernel.
+
+    PTC never queues a cell and a confirmed one has its log before any caller can learn
+    its number, so this state cannot become valid later — waiting on it is waiting on
+    nothing. A mistyped id and an id from another session both land here.
+    """
+    cell_id: int
+
+
 def _epoch_ended_record() -> dict:
     """The settle for a cell whose kernel epoch ended before it did (F3)."""
     return {"status": "error", "duration_ms": 0, "result_repr": None,
@@ -48,6 +59,31 @@ def _epoch_ended_record() -> dict:
                       "evalue": "the kernel restarted before this cell finished",
                       "traceback": ""},
             "images": [], "mutations": []}
+
+
+def _kernel_died_record() -> dict:
+    """The settle for a cell whose kernel process died while it was still running."""
+    return {"status": "error", "duration_ms": 0, "result_repr": None,
+            "error": {"ename": "KernelDied",
+                      "evalue": "kernel process died before the cell finished",
+                      "traceback": ""},
+            "images": [], "mutations": []}
+
+
+def _rebased_images(images: list, d) -> list:
+    """Recorded image paths, remapped onto the archive directory that now holds them.
+
+    A record names its images by the path they had under cells/, and restart MOVED those
+    files into cells-prev-*. The renderer drops paths that no longer exist, so an archived
+    wait silently lost every image the cell had produced. Only files really present in the
+    archive survive the remap — a missing one is dropped exactly as before.
+    """
+    out = []
+    for p in images:
+        q = d / os.path.basename(str(p))
+        if q.exists():
+            out.append(str(q))
+    return out
 
 
 class KernelClient:
@@ -73,6 +109,18 @@ class KernelClient:
                 return int(msg["content"]["execution_count"])
         raise TimeoutError("kernel never acknowledged the cell (no execute_input)")
 
+    def _settle_dead(self, cell_id: int, offset: int) -> Completed:
+        """The kernel is gone: settle the cell from whatever it left behind.
+
+        The record is re-read first — the settle may have landed in the window between the
+        caller's last look and the kernel's death — and only with none is KernelDied the
+        verdict. The cursor is deliberately NOT advanced: a dead kernel writes no more
+        output, so there is nothing to resume after.
+        """
+        rec = read_record(self.key, cell_id) or CellRecord(**_kernel_died_record())
+        text, _ = read_output_since(self.key, cell_id, offset)
+        return Completed(cell_id, rec, text)
+
     def _follow(self, cell_id: int, timeout_s: float) -> Completed | Running:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -80,6 +128,12 @@ class KernelClient:
             if rec is not None:
                 out, off = read_output_since(self.key, cell_id, 0)
                 return Completed(cell_id, rec, out)
+            if not kernel_alive(self.key):
+                # The cell took the kernel down with it — os._exit, a segfault, an OOM
+                # kill. Polling for a record nothing can write any more burns the whole
+                # yield budget (300 s by default) and then calls the cell Running, which
+                # is false twice over. wait_cell has answered this correctly since F3.
+                return self._settle_dead(cell_id, 0)
             time.sleep(0.2)
         out, off = read_output_since(self.key, cell_id, 0)
         # seed the cursor sidecar: this output has been handed to the caller, so a
@@ -272,6 +326,7 @@ class KernelClient:
                 rec = json.loads((d / f"{cell_id}.json").read_text())
                 rec.setdefault("error", None)
                 record = CellRecord(**rec)
+                record.images = _rebased_images(record.images, d)
             except (OSError, json.JSONDecodeError, TypeError, AttributeError):
                 # missing, unreadable, or written to a schema this build does not
                 # know: an archived cell must still settle, never crash the wait
@@ -280,7 +335,21 @@ class KernelClient:
             return Completed(cell_id, record, text + note)
         return None
 
-    def wait_cell(self, cell_id: int, timeout_s: float, since: int = -1) -> Completed | Running:
+    def _pending_names(self, cell_id: int) -> bool:
+        """Is this the cell the sent-but-unconfirmed marker names?
+
+        The kernel acknowledged it (execute_input carried the number) but has not started
+        it — it is queued behind a wedged cell — so it has no log of its own yet. That id
+        is known to be real, which is exactly what separates it from an unknown one.
+        """
+        try:
+            data = json.loads((kernel_dir(self.key) / "cells" / "pending.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        return isinstance(data, dict) and data.get("cell_id") == cell_id
+
+    def wait_cell(self, cell_id: int, timeout_s: float,
+                  since: int = -1) -> Completed | Running | NotFound:
         offset = default_offset(self.key, cell_id) if since < 0 else since
         deadline = time.monotonic() + timeout_s
         while True:
@@ -293,14 +362,17 @@ class KernelClient:
                 arch = self._archived(cell_id, offset)
                 if arch is not None:
                     return arch
+                # Nothing under this key ever ran this cell: no record, no log, no
+                # archive. A live kernel used to make the loop report Running after every
+                # timeout, forever — but PTC never queues a cell, and a confirmed one has
+                # its log before any caller can learn its number, so this can only be a
+                # mistyped id or one from another session and no later moment makes it
+                # valid. The one exception is a cell the kernel acknowledged and has not
+                # started yet; the marker names that one, and it is genuinely pending.
+                if kernel_alive(self.key) and not self._pending_names(cell_id):
+                    return NotFound(cell_id)
             if not kernel_alive(self.key):
-                text, new_off = read_output_since(self.key, cell_id, offset)
-                dead = CellRecord(status="error", duration_ms=0, result_repr=None,
-                                  error={"ename": "KernelDied",
-                                         "evalue": "kernel process died before the cell finished",
-                                         "traceback": ""},
-                                  images=[], mutations=[])
-                return Completed(cell_id, dead, text)
+                return self._settle_dead(cell_id, offset)
             if time.monotonic() >= deadline:
                 text, new_off = read_output_since(self.key, cell_id, offset)
                 save_offset(self.key, cell_id, new_off)
