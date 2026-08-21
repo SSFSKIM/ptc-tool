@@ -38,6 +38,21 @@ def test_bash_result_timeout_background(ptc_home):
     kill_kernel("b1")
 
 
+def test_bash_timeout_preserves_pre_kill_output(ptc_home):
+    """The timeout path must not discard output produced before the kill:
+    asyncio.wait_for cancelling proc.communicate() mid-read must not drop
+    already-emitted stdout."""
+    ensure_kernel("b4", cwd=str(ptc_home))
+    out = _exec("b4", """
+        r = await bash("echo before; sleep 30", timeout=1)
+        print(r.timed_out, r.code, repr(r.stdout))
+    """)
+    assert isinstance(out, Completed)
+    assert "True None" in out.output
+    assert "before" in out.output
+    kill_kernel("b4")
+
+
 def test_bash_background_kill_reaps_process(ptc_home):
     """kill() must not leak the grandchild: the kernel reaper only kills kernels,
     not the processes they spawn, so a leaked `sleep` would outlive the test."""
