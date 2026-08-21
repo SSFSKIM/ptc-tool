@@ -7,33 +7,24 @@ any keyless test that imports this module) never pays for it.
 import json
 import os
 import time
-import uuid
 
-from .agents import AgentOpts, AgentResult
+from .agents import AgentOpts, AgentResult, child_ptc_env
 from .state import STATE
 
 
 def _child_env(o: AgentOpts) -> dict:
-    """The environment PTC forwards to a child EXPLICITLY.
+    """The environment PTC forwards to a Claude child EXPLICITLY.
 
     The SDK merges this over the kernel's own environment, which the kernel in turn
     inherited verbatim from the MCP adapter — credential-bearing CLAUDE_* variables
-    included (an sk-ant-oat OAuth bearer among them). That inheritance is what pays for
-    subscription auth, so it stays; what must never happen is PTC *enumerating* that
-    environment into a log, an audit record or a registry row. This dict is PTC's own
-    variables only — never a merged copy of os.environ (Trust model + T18 Decision Log).
-
-    Two rules here are load-bearing: PTC_SESSION is always overridden to a fresh child key
-    (a child inheriting the parent's key would attach to the parent's kernel), and
-    PTC_DEPTH is the parent's depth + 1.
+    included (an sk-ant-oat OAuth bearer among them). For a CLAUDE child that inheritance
+    is what pays for subscription auth, so it stays; what must never happen is PTC
+    *enumerating* that environment into a log, an audit record or a registry row. This
+    dict is PTC's own variables only — never a merged copy of os.environ (Trust model +
+    T18 Decision Log). The codex backend faces the opposite problem (another vendor's
+    binary has no business seeing those credentials) and builds its child env instead.
     """
-    parent_key = STATE.config.get("key") or "root"
-    return {
-        "PTC_SESSION": f"{parent_key}-a{uuid.uuid4().hex[:6]}",
-        "PTC_DEPTH": str(int(STATE.config.get("depth", 0)) + 1),
-        "PTC_MAX_DEPTH": str(STATE.config.get("max_depth", 1)),
-        "PTC_CWD": o.cwd or STATE.config.get("cwd") or os.getcwd(),
-    }
+    return child_ptc_env(o)
 
 
 def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,

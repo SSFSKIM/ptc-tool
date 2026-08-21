@@ -25,12 +25,17 @@ Markers in the turn's prompt text drive the wire:
   ``REQ:<method>``  emit that server→client request mid-turn and validate the reply
   ``SLOW``          never finish on its own; wait for `turn/interrupt`
   anything else     complete at once, echoing ``echo:<text>``
-Set ``FAKE_TRACE=<path>`` to append every received message as JSONL, so a test can assert
-on the exact bytes a client put on the wire.
+Pass ``--trace <path>`` to append every received message as JSONL, so a test can assert on
+the exact bytes a client put on the wire. It is an ARGV option rather than an environment
+variable because the backend builds its child's environment from an allowlist and forwards
+nothing else — a fake configured through the environment would be untraceable there, which
+is exactly the property the allowlist exists to have.
 """
 import json
-import os
 import sys
+
+#: Where `--trace` writes, set in main().
+TRACE_PATH = None
 
 #: The ten server→client request methods `ServerRequest` declares on 0.146.0.
 SERVER_REQUESTS = (
@@ -64,9 +69,8 @@ def send(obj):
 
 
 def trace(obj):
-    path = os.environ.get("FAKE_TRACE")
-    if path:
-        with open(path, "a") as fh:
+    if TRACE_PATH:
+        with open(TRACE_PATH, "a") as fh:
             fh.write(json.dumps(obj) + "\n")
 
 
@@ -80,6 +84,16 @@ def _enum_decision(value, plain, object_keys=()):
     if isinstance(value, dict) and object_keys:
         return len(value) == 1 and next(iter(value)) in object_keys
     return False
+
+
+def _bad_instructions(p):
+    """`ThreadStartParams`/`ThreadResumeParams` both declare `developerInstructions` and
+    `baseInstructions` as `["string","null"]`. Anything else is a type error."""
+    for field in ("developerInstructions", "baseInstructions"):
+        v = p.get(field)
+        if v is not None and not isinstance(v, str):
+            return f"{field} must be a string or null, got {type(v).__name__}"
+    return None
 
 
 def bad_reply(method, msg):
@@ -205,6 +219,8 @@ class Fake:
                 return err(rid, -32600, f"Invalid request: unknown variant `{sandbox}`, "
                                         "expected one of `read-only`, `workspace-write`, "
                                         "`danger-full-access`")
+            if (why := _bad_instructions(p)):
+                return err(rid, -32602, why)
             self.threads += 1
             tid = f"th-{self.threads}"
             return send({"id": rid, "result": {
@@ -216,6 +232,8 @@ class Fake:
         if m == "thread/resume":
             if not p.get("threadId"):
                 return err(rid, -32602, "threadId is required")
+            if (why := _bad_instructions(p)):
+                return err(rid, -32602, why)
             return send({"id": rid, "result": {
                 "thread": {"id": p["threadId"]}, "cwd": p.get("cwd"),
                 "approvalPolicy": p.get("approvalPolicy"),
@@ -277,6 +295,9 @@ def _request_params(method, turn):
 
 
 def main():
+    global TRACE_PATH
+    if "--trace" in sys.argv:
+        TRACE_PATH = sys.argv[sys.argv.index("--trace") + 1]
     fake = Fake()
     for line in sys.stdin:
         line = line.strip()

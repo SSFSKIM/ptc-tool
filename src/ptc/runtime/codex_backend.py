@@ -41,7 +41,7 @@ import shlex
 import time
 from collections import Counter
 
-from .agents import AgentOpts, AgentResult
+from .agents import AgentOpts, AgentResult, child_ptc_env
 from .state import STATE
 
 #: Handshake and per-turn budgets. A caller's own `timeout` is enforced one layer up by
@@ -121,6 +121,34 @@ def _argv() -> list[str]:
     return argv
 
 
+#: The codex child's environment is BUILT, not inherited — the one place this backend
+#: deliberately diverges from `claude_backend._child_env`, which lets the SDK merge PTC's
+#: variables over the kernel's own environment. The kernel inherits that environment
+#: verbatim from the MCP adapter, credential-bearing `CLAUDE_*` variables included (an
+#: `sk-ant-oat…` OAuth bearer among them — Trust model + T18). Handing those to another
+#: vendor's binary, and through it to every user MCP server that binary starts inside PTC's
+#: thread, is a cross-vendor credential leak; `os.environ` verbatim would also let a codex
+#: child that reaches PTC's own MCP server attach to the PARENT's kernel at the parent's
+#: depth. So only names codex genuinely needs cross the seam, and PTC's four variables are
+#: rewritten on the way. Note what is NOT here: `OPENAI_API_KEY` — PTC's codex path is
+#: subscription auth out of `~/.codex/auth.json`, and an API key would shadow it.
+_ENV_PASSTHROUGH = (
+    "PATH",                                     # the binary, git, every MCP server command
+    "HOME", "CODEX_HOME",                       # ~/.codex/auth.json — subscription auth
+    "USER", "LOGNAME", "SHELL", "TMPDIR",
+    "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",    # egress on a corporate network
+    "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+
+
+def _child_env(o: AgentOpts) -> dict:
+    env = {name: os.environ[name] for name in _ENV_PASSTHROUGH if name in os.environ}
+    env.update(child_ptc_env(o))
+    return env
+
+
 def _cwd(o: AgentOpts) -> str:
     return o.cwd or STATE.config.get("cwd") or os.getcwd()
 
@@ -132,7 +160,38 @@ def _thread_params(o: AgentOpts, resume: str | None = None) -> dict:
         p["threadId"] = resume
     if o.model:
         p["model"] = o.model
+    if o.system:
+        # `ThreadStartParams`/`ThreadResumeParams` declare BOTH `developerInstructions` and
+        # `baseInstructions`, and they are not interchangeable: `base_instructions` is
+        # "Base instructions override" (it replaces codex's own core prompt, taking the
+        # apply-patch and tool-use instructions with it), while `developer_instructions`
+        # is "injected as a separate message" (codex-rs/core/src/config/mod.rs:676-680).
+        # A caller-supplied system prompt is the second kind.
+        p["developerInstructions"] = o.system
     return p
+
+
+#: `AgentOpts` is one option set for both providers, so every field it accepts has to be
+#: either honoured here or refused here. These three have no codex analogue: the app-server
+#: exposes no per-turn tool allowlist and no turn cap, and the thread is pinned to
+#: `approvalPolicy: "never"` + `sandbox: "read-only"` regardless of `permission_mode` (a
+#: deliberate S4 binding — see the module docstring on the responder). Refusing is the same
+#: policy T22 applied to a misplaced `effort`: an option that is accepted and then dropped
+#: is a silent no-op no caller can see.
+_CLAUDE_ONLY = ("allowed_tools", "max_turns")
+_PINNED_PERMISSION_MODE = AgentOpts.__dataclass_fields__["permission_mode"].default
+
+
+def _reject_unsupported(o: AgentOpts) -> None:
+    bad = [name for name in _CLAUDE_ONLY if getattr(o, name) is not None]
+    if o.permission_mode != _PINNED_PERMISSION_MODE:
+        bad.append("permission_mode")
+    if bad:
+        raise TypeError(
+            f"provider='codex' does not support these agent options: {', '.join(bad)}. "
+            "`codex app-server` has no per-turn tool allowlist and no turn cap, and PTC "
+            "pins its codex threads to approvalPolicy='never' + sandbox='read-only'; "
+            "use provider='claude' when you need them.")
 
 
 def _turn_params(thread_id: str, text: str, o: AgentOpts) -> dict:
@@ -147,7 +206,8 @@ def _turn_params(thread_id: str, text: str, o: AgentOpts) -> dict:
 class CodexProc:
     """One `codex app-server` child, its reader, and one turn at a time."""
 
-    def __init__(self):
+    def __init__(self, o: AgentOpts):
+        self._o = o
         self._proc = None
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -167,7 +227,7 @@ class CodexProc:
         argv = _argv()
         self._proc = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, limit=_LINE_LIMIT)
+            stderr=asyncio.subprocess.PIPE, limit=_LINE_LIMIT, env=_child_env(self._o))
         self._reader_task = asyncio.ensure_future(self._read_stdout())
         self._stderr_task = asyncio.ensure_future(self._read_stderr())
         await self.request("initialize",
@@ -178,6 +238,12 @@ class CodexProc:
 
     async def close(self) -> None:
         self._closed = True
+        # Settle whatever is still waiting BEFORE the reader is cancelled: cancelling it
+        # removes the only thing that could ever answer, so a turn caught mid-flight would
+        # otherwise sit out the whole _TURN_S budget — holding its agents.py concurrency
+        # permit — with the server already gone. EOF has this covered on every other path;
+        # close() is the one that suppresses EOF.
+        self._fail("codex app-server was closed")
         proc, self._proc = self._proc, None
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
@@ -389,7 +455,8 @@ def _thread_id(result: dict) -> str:
 
 
 async def open_session(task: str | None, o: AgentOpts, *, resume: str | None = None) -> Session:
-    proc = CodexProc()
+    _reject_unsupported(o)
+    proc = CodexProc(o)
     try:
         await proc.start()
         method = "thread/resume" if resume else "thread/start"

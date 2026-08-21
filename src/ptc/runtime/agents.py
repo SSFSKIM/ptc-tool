@@ -12,6 +12,7 @@ Lifecycle contract every path here honors (plan review F6):
 """
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -55,6 +56,23 @@ class AgentResult:
     cost_usd: float | None
     num_turns: int | None
     duration_ms: int
+
+
+def child_ptc_env(o: AgentOpts) -> dict:
+    """PTC's own variables for a child agent process — the same four for every backend.
+
+    Two rules here are load-bearing and must not drift between backends: PTC_SESSION is
+    always overridden to a fresh child key (a child inheriting the parent's key would
+    attach to the parent's kernel), and PTC_DEPTH is the parent's depth + 1, which is what
+    makes the depth brake bite one level down.
+    """
+    parent_key = STATE.config.get("key") or "root"
+    return {
+        "PTC_SESSION": f"{parent_key}-a{uuid.uuid4().hex[:6]}",
+        "PTC_DEPTH": str(int(STATE.config.get("depth", 0)) + 1),
+        "PTC_MAX_DEPTH": str(STATE.config.get("max_depth", 1)),
+        "PTC_CWD": o.cwd or STATE.config.get("cwd") or os.getcwd(),
+    }
 
 
 #: Teardown steps still draining past their budget. Retained so a step that outlives the
