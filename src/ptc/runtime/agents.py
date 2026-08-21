@@ -5,8 +5,9 @@ Lifecycle contract every path here honors (plan review F6):
     collected mid-flight, taking its CLI subprocess with it in silence;
   * every call that reaches a backend runs under the shared semaphore, and a caller's
     `timeout` is a wall-clock deadline covering the queue wait too, not just the call;
-  * on timeout / cancel / interrupt: cancel the driver, tear the session down within a
-    SEPARATE teardown budget, and settle the handle exactly once;
+  * on timeout / cancel: cancel the driver, tear the session down within a SEPARATE
+    teardown budget, and settle the handle exactly once. On INTERRUPT the order inverts —
+    S1 proved an interrupted turn ends normally, so the drain is awaited, not pre-empted;
   * no path leaves a permit held or a CLI process tree alive.
 """
 import asyncio
@@ -22,6 +23,12 @@ from .state import STATE
 #: SDK task taking 0.6-5.7 s to unwind and an interrupt()ed turn 4.0-13.0 s to drain, so
 #: "await teardown" must be bounded but generous — never assumed instant.
 _TEARDOWN_S = 30.0
+
+#: How long an interrupted turn is given to end the way S1 says it ends: NORMALLY, with a
+#: ResultMessage carrying terminal_reason='aborted_streaming' (4.0-13.0 s measured). Within
+#: this budget the drain settles the handle through its own completion path; past it the
+#: drain is treated as wedged and the driver is cancelled instead.
+_INTERRUPT_DRAIN_S = 30.0
 
 _TERMINAL = ("done", "error", "interrupted")
 
@@ -90,6 +97,9 @@ class AgentHandle:
         self._session = None
         self._driver: asyncio.Task | None = None    # retained — never discarded (F6)
         self._status = "running"
+        #: interrupt() is in charge from here on: the driver must not claim the
+        #: "interrupted" transition out from under it if the drain has to be cancelled.
+        self._interrupting = False
         #: last session id the backend reported, kept across close() so a post-teardown
         #: registry row still names the session the caller can resume.
         self._session_id_seen: str | None = None
@@ -110,9 +120,13 @@ class AgentHandle:
     async def send(self, msg: str) -> AgentResult:
         if self._status == "running":
             await self.result()
-        if self._session is None:
+        # Bind the session BEFORE the lambda: _guarded evaluates it after the semaphore
+        # wait, and a close()/interrupt() landing in that window would otherwise turn the
+        # intended refusal into an AttributeError on None (M2).
+        session = self._session
+        if session is None:
             raise RuntimeError(f"agent {self.name!r} has no live session to send to")
-        r = await self._owner._guarded(lambda: self._session.send(msg), self._timeout)
+        r = await self._owner._guarded(lambda: session.send(msg), self._timeout)
         self._owner._registry_update(self, self._status)
         return r
 
@@ -120,32 +134,44 @@ class AgentHandle:
         return self._session.messages() if self._session else []
 
     def history(self):
-        from .transcript import history
         if not self.session_id:
             raise RuntimeError(f"agent {self.name!r} has no session id yet")
-        return history(self.session_id)
+        raise NotImplementedError(
+            "AgentHandle.history() ships in M3 with the transcript reader; "
+            f"use .messages() meanwhile (session id: {self.session_id})")
 
     async def interrupt(self) -> None:
-        """Cancel the driver, tear the session down, settle exactly once (F6).
+        """Interrupt the turn, let its drain END NORMALLY, settle exactly once (F6).
 
-        Order matters: the driver is cancelled BEFORE the session is interrupted, because
-        an interrupted turn ends with a normal ResultMessage (S1: terminal_reason
-        'aborted_streaming', no exception) — a still-running driver would otherwise settle
-        the handle 'done' underneath us and the registry would disagree with the status.
+        Order follows the S1 contract: an interrupted turn does NOT raise — it ends with a
+        normal ResultMessage carrying terminal_reason='aborted_streaming' after a 4-13 s
+        drain. So the session is interrupted FIRST and the driver is left running to
+        collect that result through its ordinary completion path; the caller then gets the
+        partial turn back from result() instead of an exception. Only if the drain
+        outlives _INTERRUPT_DRAIN_S is it treated as wedged and the driver cancelled — the
+        fallback, not the norm. Either way the handle settles once and ends 'interrupted'.
         """
         if self._status in _TERMINAL:
-            # Already settled (it may have finished during the drain): keep the terminal
-            # status and the terminal registry row, but still release the CLI.
+            # Already settled (it may have finished on its own): keep the terminal status
+            # and the terminal registry row, but still release the CLI.
             await self.close()
             return
-        self._status = "interrupted"
+        if self._interrupting:
+            return          # a first interrupt owns the drain; do not re-signal under it
+        self._interrupting = True
         driver = self._driver
-        if driver is not None and not driver.done():
-            driver.cancel()
         if self._session is not None:
             await _bounded(self._session.interrupt())
-        if driver is not None:
-            await _bounded(asyncio.gather(driver, return_exceptions=True))
+        if driver is not None and not driver.done():
+            await _bounded(asyncio.gather(driver, return_exceptions=True), _INTERRUPT_DRAIN_S)
+            if not driver.done():
+                # The drain outlived its budget: stop waiting for a normal end and take
+                # the CLI down the hard way.
+                driver.cancel()
+                await _bounded(asyncio.gather(driver, return_exceptions=True))
+        # The drain may have settled the handle with its aborted result; if it did not
+        # (cancelled, or no driver at all) the interrupt itself is the terminal event.
+        self._status = "interrupted"
         if not self._result_fut.done():
             self._settle_exception(RuntimeError(f"agent {self.name!r} was interrupted"))
         await self.close()
@@ -277,7 +303,7 @@ class _Agent:
             except asyncio.CancelledError:
                 # interrupt() owns the interrupted transition (status + registry + close);
                 # a cancel from anywhere else still leaves an honest terminal state.
-                if h._status not in _TERMINAL:
+                if h._status not in _TERMINAL and not h._interrupting:
                     h._status = "interrupted"
                     self._registry_update(h, "interrupted")
                     h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))
@@ -296,7 +322,11 @@ class _Agent:
         if o.provider != "claude":
             raise NotImplementedError("fork is claude-only; use provider='claude'")
         from ptc.discovery import read_meta
-        sid = read_meta(self._config["key"]).get("claude_session_id")
+        key = self._config.get("key")
+        if not key:
+            raise RuntimeError("this kernel has no session key in its config — "
+                               "fork needs one to look up meta.json")
+        sid = read_meta(key).get("claude_session_id")
         if not sid:
             raise RuntimeError("no claude_session_id known for this kernel "
                                "(alias-keyed session) — fork unavailable")
@@ -322,9 +352,18 @@ class _Agent:
         return sorted(rows.values(), key=lambda r: r.get("created_at", 0))
 
     def resume(self, session_id: str, **kw) -> AgentHandle:
+        # resume opens a real CLI session and can drive unbounded turns through send(),
+        # so it is subject to the same depth brake as run/spawn/fork.
+        self._check_depth()
         o = self._opts(kw)
         h = AgentHandle(self, f"resumed-{session_id[:8]}", o.provider, o.timeout)
+        # The resumed id IS this handle's session id from the start: a resumed session
+        # keeps its id, and nothing folds a ResultMessage until the first send(), so
+        # without this the registry row (the point of resume) would carry null.
+        h._session_id_seen = session_id
         self._handles[h.name] = h
+        audit.append("agent", name=h.name, task=f"resume {session_id}"[:120],
+                     provider=o.provider)
 
         async def open_():
             try:
@@ -338,7 +377,7 @@ class _Agent:
                     AgentResult("(resumed — use send())", session_id, None, None, None, 0))
                 self._registry_update(h, "done")
             except asyncio.CancelledError:
-                if h._status not in _TERMINAL:
+                if h._status not in _TERMINAL and not h._interrupting:
                     h._status = "interrupted"
                     self._registry_update(h, "interrupted")
                     h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))

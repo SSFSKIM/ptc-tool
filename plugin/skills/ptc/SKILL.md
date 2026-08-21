@@ -52,15 +52,21 @@ is a throw-away subshell (its `cd`/`export` do not persist) — use `%cd` and
     r = await agent.run("summarize CHANGELOG.md")   # one-shot child; r.text, r.session_id
     hs = [agent.spawn(t, name=f"w{i}") for i, t in enumerate(tasks)]   # returns immediately
     results = await agent.gather(*hs)               # fan-in — in a LATER cell is fine
+    one = await hs[0].result()                      # or await a single handle
     reply = await hs[0].send("now the risks")       # follow-up turn on the same session
+    r = await agent.fork("what did we decide?")     # child inherits THIS conversation
+    h = agent.resume(r.session_id)                  # reopen a past session; then h.send(...)
     agent.list()                                    # live + registry, survives restart
 
 Options: `model=`, `system=`, `allowed_tools=`, `cwd=`, `max_turns=`, `effort=`,
 `output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock),
 `permission_mode=` (children default to `bypassPermissions`). `provider="codex"` is coming
 in M2. Handles live in the namespace, so "spawn now, gather next turn" works; awaiting a
-handle blocks the CELL, not you. `h.interrupt()` cancels a child; `h.close()` ends a
-finished one (its CLI stays alive for follow-up `send()`s until you do).
+handle blocks the CELL, not you. `h.interrupt()` aborts a child's turn — it waits out the
+abort, so `h.result()` still gives you the partial turn — and `h.close()` ends a finished
+one (its CLI stays alive for follow-up `send()`s until you do). `fork` is a one-shot
+(claude only) and needs a known session id for this conversation; `agent.resume(sid)`
+returns a handle that is already `done` — a `send()` target, not a running turn.
 Concurrency is capped by `PTC_MAX_CONCURRENCY` (default 8) and recursion by `PTC_MAX_DEPTH`
 (default 1 — a child cannot spawn grandchildren).
 

@@ -14,41 +14,61 @@ from ptc.runtime.state import STATE
 
 
 class FakeSession:
-    def __init__(self, task, o, *, hang: bool = False, fail: Exception | None = None,
-                 send_hang: bool = False, close_hang: bool = False):
-        self.session_id = f"fake-{task[:8]}"
+    def __init__(self, task, o, *, sid: str | None = None, hang: bool = False,
+                 fail: Exception | None = None, send_hang: bool = False,
+                 close_hang: bool = False, ignore_interrupt: bool = False,
+                 drain_s: float = 0.05):
+        #: The real Session leaves this None until a ResultMessage is folded — a fake
+        #: that fills it in eagerly is kinder than reality exactly where resume()'s
+        #: registry row goes wrong (T20 review I3). A resumed session keeps the id it
+        #: resumed, so `sid` (the backend's `resume=`) wins when there is one.
+        self.session_id = None
+        self._sid = sid or f"fake-{task[:8]}"
         self._task = task
         self.sent: list[str] = []
+        self.send_entered: list[str] = []
         self.closed = False
         self.interrupted = False
         self._hang = hang
         self._fail = fail
         self._send_hang = send_hang
         self._close_hang = close_hang
+        self._ignore_interrupt = ignore_interrupt
+        self._drain_s = drain_s
         self._aborted = asyncio.Event()
 
     async def wait_result(self):
         if self._fail is not None:
             raise self._fail
         if self._hang:
-            # S1: an interrupted turn does not raise — it ends with a normal ResultMessage
-            # carrying terminal_reason='aborted_streaming'. A driver that is still running
-            # when the session is interrupted would therefore settle the handle "done".
+            # S1: an interrupted turn does not raise — it ends with a NORMAL
+            # ResultMessage carrying terminal_reason='aborted_streaming', after a drain
+            # measured at 4-13 s live. interrupt() must wait that drain out, so the fake
+            # makes it take real (if small) time rather than completing instantly.
             await self._aborted.wait()
+            await asyncio.sleep(self._drain_s)
+            self.session_id = self._sid
             return AgentResult("(aborted)", self.session_id, None, None, 1, 0)
         await asyncio.sleep(0.05)
+        self.session_id = self._sid
         return AgentResult(f"did:{self._task}", self.session_id, None, 0.0, 1, 50)
 
     async def send(self, msg):
+        self.send_entered.append(msg)      # entered — before anything can hang
         if self._send_hang:
             await asyncio.sleep(3600)
         self.sent.append(msg)
+        self.session_id = self._sid
         return AgentResult(f"reply:{msg}", self.session_id, None, 0.0, 1, 10)
 
     async def interrupt(self):
+        """The CLI acknowledges quickly; the DRAIN it triggers is what takes time, and
+        it lands in wait_result as a normal aborted result. `ignore_interrupt` models a
+        CLI that never honors it — the case the drain budget exists for."""
         self.interrupted = True
-        self._aborted.set()
-        await asyncio.sleep(0.01)          # S1: a real drain is slow, never instant
+        if not self._ignore_interrupt:
+            self._aborted.set()
+        await asyncio.sleep(0.01)
 
     async def close(self):
         if self._close_hang:
@@ -83,7 +103,7 @@ class FakeBackend:
     async def open_session(self, task, o, *, resume=None):
         if self.open_error is not None:
             raise self.open_error
-        s = FakeSession(task or "resumed", o, **self._session_kw)
+        s = FakeSession(task or "resumed", o, sid=resume, **self._session_kw)
         self.sessions.append(s)
         return s
 
@@ -224,7 +244,11 @@ def test_spawn_open_failure_settles_error(tmp_path):
     assert _row(tmp_path, "d1")["status"] == "error"
 
 
-def test_interrupt_settles_once_and_frees_permit(tmp_path):
+def test_interrupt_settles_via_the_drains_normal_completion(tmp_path):
+    """The S1 contract: an interrupted turn does NOT raise — it ends with a normal
+    ResultMessage (terminal_reason='aborted_streaming') after a 4-13 s drain. So
+    interrupt() signals the session and lets the driver's ordinary completion path settle
+    the handle with that partial result; pre-empting the drain would throw it away."""
     b = FakeBackend(hang=True)
     a = _agent(tmp_path, backend=b, max_concurrency=1)
 
@@ -235,13 +259,38 @@ def test_interrupt_settles_once_and_frees_permit(tmp_path):
         await asyncio.wait_for(h.interrupt(), 5)
         assert h.status == "interrupted"
         assert b.sessions[0].interrupted and b.sessions[0].closed
-        assert h._driver.done()
-        with pytest.raises(RuntimeError, match="interrupted"):
-            await asyncio.wait_for(h.result(), 2)
+        assert h._driver.done() and not h._driver.cancelled(), \
+            "the drain was pre-empted instead of awaited to its normal end"
+        r = await asyncio.wait_for(h.result(), 2)
+        assert r.text == "(aborted)", "the aborted turn's own result must reach the caller"
+        assert (await asyncio.wait_for(h.result(), 2)) is r     # settled exactly once
         # the interrupted turn's permit is back
         return await asyncio.wait_for(a.run("after"), 2)
     assert asyncio.run(flow()).text == "after"
-    assert _row(tmp_path, "i1")["status"] == "interrupted"
+    row = _row(tmp_path, "i1")
+    assert row["status"] == "interrupted" and row["session_id"] == "fake-forever"
+
+
+def test_interrupt_cancels_the_driver_when_the_drain_outlives_its_budget(tmp_path,
+                                                                        monkeypatch):
+    """A CLI that never honors the interrupt must not wedge the cell: past the drain
+    budget the driver is cancelled, and the handle still settles once with its permit
+    released — the fallback, not the normal path."""
+    monkeypatch.setattr(agents, "_INTERRUPT_DRAIN_S", 0.05)
+    b = FakeBackend(hang=True, ignore_interrupt=True)
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        h = a.spawn("never-aborts", name="i2")
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(h.interrupt(), 5)   # would hang forever if unbounded
+        assert h.status == "interrupted"
+        assert h._driver.done() and b.sessions[0].closed
+        with pytest.raises(RuntimeError, match="was interrupted"):
+            await asyncio.wait_for(h.result(), 2)
+        return await asyncio.wait_for(a.run("after"), 2)
+    assert asyncio.run(flow()).text == "after"
+    assert _row(tmp_path, "i2")["status"] == "interrupted"
 
 
 def test_interrupt_does_not_overwrite_a_finished_turn(tmp_path):
@@ -277,13 +326,26 @@ def test_teardown_is_bounded_when_close_hangs(tmp_path, monkeypatch):
 
 
 def test_send_timeout_releases_permit(tmp_path):
+    """send() is not exempt from the caller's deadline. The spawn's own timeout must be
+    comfortably longer than its turn, or the DRIVER's deadline wins the race and send()
+    is never entered at all — which is what this test used to prove (T20 review I2)."""
     b = FakeBackend(send_hang=True)
     a = _agent(tmp_path, backend=b, max_concurrency=1)
 
     async def flow():
-        h = a.spawn("s", name="s1", timeout=0.05)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(h.send("hi"), 2)
+        h = a.spawn("s", name="s1", timeout=0.3)       # turn takes 0.05s; send hangs
+        await asyncio.wait_for(h.result(), 2)
+        assert h.status == "done"
+
+        async def _send():
+            with pytest.raises(asyncio.TimeoutError):
+                await h.send("hi")                     # send's OWN deadline must fire
+        # The hang guard raises a DIFFERENT failure than the one under test: if send()
+        # never times out, the cancel lands inside pytest.raises as CancelledError, the
+        # block re-raises it, and this wait_for fails the test instead of passing it.
+        await asyncio.wait_for(_send(), 3)
+        assert b.sessions[0].send_entered == ["hi"], "send() was never entered"
+        assert b.sessions[0].sent == [], "the hung send should not have completed"
         return await asyncio.wait_for(a.run("after"), 2)
     assert asyncio.run(flow()).text == "after"
 
@@ -322,6 +384,48 @@ def test_fork_records_parent_session_id(tmp_path, monkeypatch):
     assert row["parent_session_id"] == "parent-sid-1"
     assert row["session_id"] == "parent-sid-1"      # fake echoes resume as the child sid
     assert row["status"] == "done"
+
+
+def test_resume_records_the_real_session_id_and_audits(tmp_path):
+    """The registry row is the whole point of resume — `agent.list()` after a restart is
+    what makes a session resumable at all — so it must carry the id, not null. The real
+    Session has no id until a turn folds, so resume() carries the one it was given."""
+    SID = "sid-abcdef-1234"
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.resume(SID)
+        r = await asyncio.wait_for(h.result(), 2)
+        assert h.status == "done" and r.session_id == SID
+        assert h.session_id == SID
+        follow = await asyncio.wait_for(h.send("more"), 2)   # a resumed session is a target
+        assert follow.text == "reply:more"
+        return h
+    h = asyncio.run(flow())
+    assert h.name == "resumed-sid-abcd"
+    row = _row(tmp_path, h.name)
+    assert row["session_id"] == SID and row["status"] == "done"
+    assert row["provider"] == "claude"
+    assert next(e for e in a.list() if e["name"] == h.name)["session_id"] == SID
+    entries = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert any(e["kind"] == "agent" and e["name"] == h.name and e["provider"] == "claude"
+               and SID in e["task"] for e in entries), entries
+
+
+def test_resume_refuses_at_max_depth(tmp_path):
+    """resume opens a real CLI session and can drive unbounded turns through send(), so
+    the depth brake applies to it exactly as it does to run/spawn/fork — and it must fire
+    before any session is opened."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b, depth=1)
+
+    async def flow():
+        with pytest.raises(RuntimeError, match="agent depth limit reached"):
+            a.resume("sid-deep")
+        await asyncio.sleep(0.05)      # a handle made anyway would open its session here
+    asyncio.run(flow())
+    assert b.sessions == [] and not (tmp_path / "agents.json").exists()
 
 
 def test_list_merges_live_handles_over_registry(tmp_path):

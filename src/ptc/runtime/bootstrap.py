@@ -5,6 +5,7 @@ Invoked by the host as a bootstrap cell:  import ptc.runtime.bootstrap as _b; _b
 import base64
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -192,6 +193,25 @@ def _is_idle(ttl: float) -> bool:
     return not _in_flight() and time.time() - STATE.last_activity > ttl
 
 
+def _reap_and_exit() -> None:
+    """Die, taking the kernel's spawned children with us.
+
+    `os._exit` skips `atexit` by design, so the SDK's own child reaper never runs on
+    this path and every open agent CLI would outlive the kernel as an orphan. The
+    kernel is a process-group leader (spawned `start_new_session=True`) and those CLIs
+    are spawned into its group, so killing the group reaps them and us in one atomic
+    step — which is also the exit, and it happens while the flock is still held (F5).
+    Guarded on leadership: a kernel that did not start its own group (an in-process
+    test, a hand-launched ipykernel) would otherwise kill its parent's processes too.
+    """
+    try:
+        if os.getpgid(0) == os.getpid():
+            os.killpg(os.getpgid(0), signal.SIGKILL)     # never returns
+    except OSError:
+        pass
+    os._exit(0)
+
+
 def _watchdog():
     from ptc.lock import key_lock
     hours = float(STATE.config.get("idle_hours", 24.0))
@@ -211,7 +231,7 @@ def _watchdog():
                 (STATE.kernel_dir / "ready").unlink(missing_ok=True)
                 # Exit WHILE holding the flock: process death releases it atomically,
                 # so a concurrent spawner can never observe a half-dead kernel (F5).
-                os._exit(0)
+                _reap_and_exit()
         except Exception:
             continue  # cleanup failed: keep ownership and retry next tick — never
                       # exit leaving partial state behind (F5)

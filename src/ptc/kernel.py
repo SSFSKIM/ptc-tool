@@ -49,11 +49,9 @@ def _clean_stale(kd: Path, key: str) -> None:
     o = read_owner(key)
     if o and owner_alive(o):
         # a live kernel with no `ready` (e.g. bootstrap failed) must be reaped
-        # before respawn, or every retry leaks a detached process (F4)
-        try:
-            os.kill(o.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        # before respawn, or every retry leaks a detached process (F4) — and its
+        # children with it, for the same reason kill_kernel takes the group
+        kill_process_tree(o.pid)
     for name in ("owner.json", "ready", "connection.json"):
         (kd / name).unlink(missing_ok=True)
     _rotate_cells(kd)
@@ -124,7 +122,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             run_bootstrap(key, cfg)
             (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
         except BaseException:
-            proc.kill()
+            kill_process_tree(proc.pid)
             for name in ("owner.json", "ready", "connection.json"):
                 try:
                     (kd / name).unlink(missing_ok=True)
@@ -134,16 +132,36 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
         return KernelInfo(key, proc.pid, conn, True, expired)
 
 
+def kill_process_tree(pid: int) -> None:
+    """SIGKILL the kernel AND everything it spawned into its process group.
+
+    A pid-only kill strands the kernel's children: agent backends spawn `claude` CLIs
+    with no session of their own, so they live in the kernel's group, and the SDK's
+    atexit reaper cannot run under SIGKILL. The kernel is spawned with
+    `start_new_session=True`, so its group contains exactly its own descendants —
+    background `bash()` children get their own session (shell.py kills those itself).
+    Guarded on leadership: if the pid does not lead its group, the group belongs to
+    somebody else and killing it would reach unrelated processes, so kill only the pid.
+    """
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
+            return
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def kill_kernel(key: str) -> bool:
     with key_lock(key):
         o = read_owner(key)
         if not o:
             return False
-        if owner_alive(o):
-            try:
-                os.kill(o.pid, signal.SIGKILL)
-            except OSError:
-                pass
+        if owner_alive(o):     # pid + start time: never killpg a recycled pid's group
+            kill_process_tree(o.pid)
         (kernel_dir(key) / "owner.json").unlink(missing_ok=True)
         (kernel_dir(key) / "ready").unlink(missing_ok=True)
         return True
