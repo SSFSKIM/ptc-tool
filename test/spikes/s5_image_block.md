@@ -47,30 +47,63 @@ env -u CLAUDE_CODE_SESSION_ID -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
   claude -p --plugin-dir <repo>/ptc-surface/ptc/plugin \
     --permission-mode bypassPermissions \
     --output-format stream-json --verbose \
-    "Call the mcp__plugin_ptc_ptc__exec tool (load its schema with ToolSearch first if
-     it is not loaded) with exactly this code: <cell under test>
-     Then reply with just: DONE" > s5-stream.json
+    "Call the mcp__plugin_ptc_ptc__exec tool (ToolSearch its schema first if it is not
+     loaded) with exactly this code: <cell under test, semicolon-joined on one line>
+     -- then say in one sentence what the tool result contained, and reply DONE" \
+  > s5-stream.json
 ```
 
 Read `s5-stream.json`: for every `user` message, inspect each `tool_result` block's
 `content` array. **The question is whether a block with `"type": "image"` and base64 `data`
 survives into the transcript the model sees**, or whether the host dropped/replaced it.
-Also record the `tool_use` names actually emitted (evidence of the deferred-tool path) and
-what the assistant *says* about the image.
+Decide it on the wire, in this order:
+
+1. the block's shape — `{"type":"image","source":{"type":"base64","media_type":"image/png","data":…}}`;
+2. its position — after the text block, matching `_content`'s order;
+3. `is_error` unset on the `tool_result`;
+4. **byte identity** — base64-decode `data`, sha256 it, and compare against
+   `~/.ptc/kernels/<session>/cells/2-0.png`. A length match is weaker; hash the bytes.
+
+Also record the `tool_use` names actually emitted (evidence of the deferred-tool path).
+
+The assistant's one-sentence answer is recorded, but it is **not** evidence that the model
+read pixels: the plot title and the data points are both in the code the model itself
+submitted, so its description is derivable from the tool input alone. A prompt that would
+actually test pixel reading has to ask for something only the rendering carries (line
+colour, y-axis tick values, gridline count) or plot data absent from the submitted code.
 
 ## 3. Interactive observation (secondary, best-effort)
 
 ```bash
-tmux new-session -d -s ptc-s5 -x 200 -y 50 \
-  "cd <repo>/ptc-surface/ptc && claude --plugin-dir ./plugin"
-tmux send-keys -t ptc-s5 '<the prompt>' Enter
-tmux capture-pane -p -t ptc-s5        # look for an image indicator in the transcript
-tmux kill-session -t ptc-s5
+tmux new-session -d -s ptc-s5 -x 180 -y 50 \
+  "cd <repo>/ptc-surface/ptc && env -u CLAUDE_CODE_SESSION_ID -u CLAUDECODE \
+   -u CLAUDE_CODE_ENTRYPOINT claude --plugin-dir ./plugin \
+   --permission-mode bypassPermissions"
+
+# Two startup dialogs stand between the launch and the REPL. Capture the pane, answer
+# each, and only then send the prompt:
+#   1. folder-trust ("Do you trust the files in this folder?") in an untrusted cwd;
+#   2. the bypass-permissions acceptance screen (--permission-mode bypassPermissions).
+tmux capture-pane -p -t ptc-s5        # confirm which dialog is showing before answering
+tmux send-keys -t ptc-s5 Enter        # per dialog, once its selection is correct
+
+# The prompt is multi-line and contains quotes; send-keys mangles it. Paste it:
+tmux load-buffer -t ptc-s5 <(printf '%s' "<the prompt>")
+tmux paste-buffer -t ptc-s5
+tmux send-keys -t ptc-s5 Enter
+
+tmux capture-pane -p -t ptc-s5        # collapsed view
+# then ctrl+O for the detailed transcript, and capture again:
+tmux send-keys -t ptc-s5 C-o
+tmux capture-pane -p -t ptc-s5
+tmux kill-session -t ptc-s5           # kill only the session created here
 ```
 
 A terminal cannot show pixels, so "visible inline" here means the transcript acknowledges an
 image block (e.g. a `[Image]` placeholder in the tool result) rather than only text. Record
-what was actually on the pane; do not infer rendering that was not seen.
+what was actually on the pane; do not infer rendering that was not seen. Observed on 2.1.238:
+the collapsed view shows only `Called plugin:ptc:ptc` with no image indicator at all, and the
+ctrl+O detail view shows the text block plus a second `⎿ [Image]` row.
 
 ## 4. Verdict
 
@@ -81,6 +114,12 @@ what was actually on the pane; do not infer rendering that was not seen.
 
 Either way append the observation to the spec's *Surprises & Discoveries* and note the
 Claude Code version actually run (`claude --version`).
+
+Recorded run (T12): **PROMOTE on Claude Code 2.1.238** — the spec bullet says 2.1.236, which
+is the version the design was written against; 2.1.238 is what shipped by the time the spike
+ran. Wire evidence: base64 `data` of 25 196 chars decoding to an 18 897-byte PNG,
+sha256 `f4deb1b01495f328098e8389cc652b7849c0cc2f876453d5c1c4da71fe927e46`, equal to
+`cells/2-0.png` in all three runs (keyless CLI, headless, interactive).
 
 ## 5. Cleanup
 
