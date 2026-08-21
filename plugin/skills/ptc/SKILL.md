@@ -70,10 +70,18 @@ returns a handle that is already `done` — a `send()` target, not a running tur
 Concurrency is capped by `PTC_MAX_CONCURRENCY` (default 8) and recursion by `PTC_MAX_DEPTH`
 (default 1 — a child cannot spawn grandchildren).
 
-## Sub-LM map-reduce (coming in M3)
+## Sub-LM map-reduce
 
-Not available yet. `llm(prompt, model="haiku", ...)` — a cheap one-shot sub-LM call with
-no tools — ships with M3.
+    reply = await llm("Classify this as spam or not: ...", model="haiku")
+    parsed = await llm("Extract the name and age.", json_schema={"type": "object", ...})
+    labels = await asyncio.gather(*[llm(f"Classify:\n{c}") for c in chunks])   # fan-out
+
+`llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=300)` — a one-shot,
+no-tools, single-turn call to a sub-model, useful for map-reduce classification/extraction
+over many chunks. It is NOT a cheap primitive: even isolated, a call still pays a
+~5 200-prompt-token floor for the CLI's own base system prompt, so it costs more than a
+raw API call would — use it for real semantic work, not as a string op. Shares the same
+concurrency cap as `agent`.
 
 ## Web (coming in M3)
 
@@ -88,7 +96,7 @@ Not available yet. `history()` (this session's full transcript, pre-compaction) 
 ## Pitfalls
 
 - Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`,
-  `agent`, `asyncio`. Do not call `llm`, `web_fetch`, `web_search`, `history`, or
+  `agent`, `llm`, `asyncio`. Do not call `web_fetch`, `web_search`, `history`, or
   `workflow` — they are not defined in the kernel namespace yet. Do not invent wrappers
   such as `call_skill(...)` or `run_subagent(...)` either.
 - The kernel is your notebook, not the project's runtime.

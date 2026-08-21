@@ -32,6 +32,18 @@ def kernel_venv() -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _reset_shared_semaphore():
+    """The agent/llm/web semaphore (T23) is bound to the `max_concurrency` in effect when
+    it was first created; many tests set that value on STATE.config directly rather than
+    through a helper, so a single autouse reset here is simpler and more robust than
+    threading a reset call through every test file that touches it."""
+    from ptc.runtime import agents
+    agents._reset_semaphore()
+    yield
+    agents._reset_semaphore()
+
+
+@pytest.fixture(autouse=True)
 def _reap_kernels(tmp_path):
     """Kill every kernel a test spawned under its own PTC_HOME, however it ended.
 

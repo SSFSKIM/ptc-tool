@@ -33,6 +33,40 @@ _INTERRUPT_DRAIN_S = 30.0
 
 _TERMINAL = ("done", "error", "interrupted")
 
+#: Spec: ONE semaphore across agent/llm/web_search, not one pool per caller (two 8-permit
+#: pools would let 16 SDK-spawning calls run at once against an 8 cap). Module-level and
+#: lazily created from STATE.config so every caller — `_Agent`, `llm()`, and `web.py` in
+#: M3 — shares the same bound without constructing an `_Agent` just to reach it.
+_SHARED_SEM: asyncio.Semaphore | None = None
+
+
+def shared_semaphore() -> asyncio.Semaphore:
+    global _SHARED_SEM
+    if _SHARED_SEM is None:
+        _SHARED_SEM = asyncio.Semaphore(int(STATE.config.get("max_concurrency", 8)))
+    return _SHARED_SEM
+
+
+def _reset_semaphore() -> None:
+    """Test-only: a semaphore is bound to the `max_concurrency` in effect when it was
+    first created, so a test that changes that value needs a fresh one. Production never
+    calls this — `max_concurrency` does not change mid-process."""
+    global _SHARED_SEM
+    _SHARED_SEM = None
+
+
+async def guarded(sem: asyncio.Semaphore, make_coro, timeout: float | None):
+    """One permit, one deadline, released on every exit path. The deadline covers the
+    wait for the permit as well, so a queued call cannot outlive its own timeout. Shared
+    by every semaphore consumer (`_Agent._guarded`, `llm()`, and `web.py` in M3) so this
+    contract lives in exactly one place."""
+    async def _work():
+        async with sem:
+            return await make_coro()
+    if timeout:
+        return await asyncio.wait_for(_work(), timeout)
+    return await _work()
+
 
 @dataclass
 class AgentOpts:
@@ -234,24 +268,16 @@ class _Agent:
     def __init__(self, config: dict, backends: dict):
         self._config = config
         self._backends = backends
-        self._sem: asyncio.Semaphore | None = None
         self._handles: dict[str, AgentHandle] = {}
 
     # -- plumbing -----------------------------------------------------------
-    def _semaphore(self) -> asyncio.Semaphore:
-        if self._sem is None:
-            self._sem = asyncio.Semaphore(int(self._config.get("max_concurrency", 8)))
-        return self._sem
+    #: The pool itself lives at module level (`shared_semaphore`) — one pool across
+    #: agent/llm/web_search, per spec. `_config` is always STATE.config by construction
+    #: (see `_make_agent`), so this and `shared_semaphore()` read the same bound.
+    _semaphore = staticmethod(shared_semaphore)
 
     async def _guarded(self, make_coro, timeout: float | None):
-        """One permit, one deadline, released on every exit path. The deadline covers the
-        wait for the permit as well, so a queued call cannot outlive its own timeout."""
-        async def _work():
-            async with self._semaphore():
-                return await make_coro()
-        if timeout:
-            return await asyncio.wait_for(_work(), timeout)
-        return await _work()
+        return await guarded(self._semaphore(), make_coro, timeout)
 
     def _check_depth(self) -> None:
         d, m = int(self._config.get("depth", 0)), int(self._config.get("max_depth", 1))
