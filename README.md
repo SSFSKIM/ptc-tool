@@ -46,10 +46,10 @@ or a registry row, and Codex children get an environment built from an allowlist
 than an inherited copy, so Claude-side credentials never cross into another vendor's
 binary.
 
-Billing: all kernel-originated model calls go through the `claude` CLI (your subscription
-when OAuth-logged-in). Do not put `ANTHROPIC_API_KEY` in the environment — it silently
-shadows OAuth and flips billing to the metered API. `codex` children authenticate the same
-way from `~/.codex/auth.json`; `OPENAI_API_KEY` is likewise not forwarded.
+Billing: all kernel-originated Claude model calls go through the `claude` CLI (your
+subscription when OAuth-logged-in). Do not put `ANTHROPIC_API_KEY` in the environment — it
+silently shadows OAuth and flips billing to the metered API. `codex` children authenticate
+the same way from `~/.codex/auth.json`; `OPENAI_API_KEY` is likewise not forwarded.
 
 ## Lifecycle
 
@@ -58,9 +58,9 @@ survives `--resume` until the idle TTL (default 24 h; `PTC_IDLE_HOURS`), a `rest
 the machine rebooting. A restart loses the Python namespace but not child agent sessions —
 those live in `agents.json` and stay resumable through `agent.list()` / `agent.resume()`.
 
-`ptc list | kill | restart | doctor` manage kernels from any shell (`ptc exec` / `wait` /
-`interrupt` run cells from one). With no `--session`, the CLI picks the newest live kernel
-and prints which one it picked.
+`ptc list | doctor` inspect this machine's kernels from any shell; `ptc exec | wait |
+interrupt | kill | restart` act on one kernel. Those five take `--session`; with none
+given the CLI picks the newest live kernel and prints which one it picked.
 
 ## Codex (documented, untested)
 
@@ -75,12 +75,13 @@ host session id, every result header says so (`[keying: adapter-local]`).
 | env | default | meaning |
 |---|---|---|
 | PTC_HOME | ~/.ptc | root |
+| PTC_SESSION | — | session key override; set on the kernel and its children |
 | PTC_YIELD_S | 300 | exec/wait yield timeout |
 | PTC_MAX_OUTPUT_CHARS | 12000 | result cap (server clamp 50000) |
 | PTC_IDLE_HOURS | 24 | kernel TTL |
 | PTC_MAX_CONCURRENCY | 8 | SDK-call semaphore |
 | PTC_MAX_DEPTH | 1 | agent recursion brake |
-| PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks/plugins |
+| PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks, plugins and plugin-provided skills (the default `--disable hooks --disable plugins` removes all three); credential stripping from the codex child's environment is unconditional and this knob does not affect it |
 
 POSIX only (macOS/Linux) — detached spawn, flock-based ownership and the launcher all
-assume it; Windows is future work. Python 3.12.
+assume it; Windows is future work. Python >=3.12.
