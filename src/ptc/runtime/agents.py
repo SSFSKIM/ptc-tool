@@ -265,6 +265,9 @@ class AgentHandle:
     def history(self):
         """The child's own transcript (T25's `Transcript`, same type `history()` returns).
 
+        Claude handles only — see the provider check below for why a codex handle is
+        refused rather than answered.
+
         The child writes its own JSONL under a cwd this handle never tracked (only
         `AgentOpts.cwd`, which is not retained past spawn), so nothing is passed as
         `cwd=` here. That does NOT mean resolution is by session id alone: `history()`
@@ -273,6 +276,17 @@ class AgentHandle:
         default). `transcript._resolve_path`'s glob is the fallback that covers a child
         given a different `cwd=` at spawn.
         """
+        if self.provider != "claude":
+            # A codex handle's session_id is a THREAD id whose turns live in a codex
+            # rollout ($CODEX_HOME/sessions/**.jsonl), a different store in a different
+            # format. Searching Claude's JSONL for it either fails or, worse, glob-matches
+            # an unrelated transcript. v1 reads the Claude store only; say so rather than
+            # answer with somebody else's conversation.
+            raise NotImplementedError(
+                f"history() reads Claude session transcripts; agent {self.name!r} runs on "
+                f"provider {self.provider!r}, whose turns are recorded as a codex rollout "
+                "under $CODEX_HOME/sessions — a store this build does not read. Use "
+                "messages() for the turns this handle saw.")
         if not self.session_id:
             raise RuntimeError(f"agent {self.name!r} has no session id yet")
         from .transcript import history as _history

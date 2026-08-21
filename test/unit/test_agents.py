@@ -198,6 +198,7 @@ def test_handle_history_delegates_to_transcript_by_session_id(tmp_path, monkeypa
     import json as _json
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     proj = tmp_path / ".claude" / "projects" / "somewhere"
     proj.mkdir(parents=True)
     rows = [{"type": "user", "message": {"role": "user", "content": "hi from child"}}]
@@ -215,6 +216,25 @@ def test_handle_history_delegates_to_transcript_by_session_id(tmp_path, monkeypa
     t = h.history()
     assert t.path == proj / "fake-alpha.jsonl"
     assert t.user() == ["hi from child"]
+
+
+def test_handle_history_refuses_a_codex_handle_instead_of_guessing(tmp_path):
+    """A codex handle's session_id is a THREAD id, and its turns live in a codex rollout
+    under $CODEX_HOME/sessions — a different store in a different format. Searching
+    Claude's JSONL for it either fails or, worse, glob-matches an unrelated transcript and
+    answers with somebody else's conversation. v1 reads the Claude store only, and says so.
+    """
+    a = _agent(tmp_path)
+
+    async def flow():
+        h = a.spawn("alpha", name="one", provider="codex")
+        await a.gather(h)
+        return h
+    h = asyncio.run(flow())
+
+    assert h.session_id, "the handle did bind a session id — this is not the id-less case"
+    with pytest.raises(NotImplementedError, match="codex rollout"):
+        h.history()
 
 
 def test_spawn_name_collision_and_timeout(tmp_path):
