@@ -150,6 +150,11 @@ class AgentHandle:
         partial turn back from result() instead of an exception. Only if the drain
         outlives _INTERRUPT_DRAIN_S is it treated as wedged and the driver cancelled — the
         fallback, not the norm. Either way the handle settles once and ends 'interrupted'.
+
+        A handle with NO session is the other shape: still queued on the semaphore, or
+        inside open_session/connect. Nothing was ever asked to abort, so there is no drain
+        to await — the driver is pre-empted at once, or the queued turn would later take
+        its permit and run a whole (billed) turn to completion under an 'interrupted' label.
         """
         if self._status in _TERMINAL:
             # Already settled (it may have finished on its own): keep the terminal status
@@ -159,23 +164,33 @@ class AgentHandle:
         if self._interrupting:
             return          # a first interrupt owns the drain; do not re-signal under it
         self._interrupting = True
-        driver = self._driver
-        if self._session is not None:
-            await _bounded(self._session.interrupt())
-        if driver is not None and not driver.done():
-            await _bounded(asyncio.gather(driver, return_exceptions=True), _INTERRUPT_DRAIN_S)
-            if not driver.done():
-                # The drain outlived its budget: stop waiting for a normal end and take
-                # the CLI down the hard way.
+        try:
+            driver = self._driver
+            session = self._session
+            if session is not None:
+                await _bounded(session.interrupt())
+                if driver is not None and not driver.done():
+                    await _bounded(asyncio.gather(driver, return_exceptions=True),
+                                   _INTERRUPT_DRAIN_S)
+            if driver is not None and not driver.done():
+                # Either there was no session to signal (nothing is draining) or the drain
+                # outlived its budget (it is wedged). Both mean: stop waiting for a normal
+                # end and take the turn down the hard way.
                 driver.cancel()
                 await _bounded(asyncio.gather(driver, return_exceptions=True))
-        # The drain may have settled the handle with its aborted result; if it did not
-        # (cancelled, or no driver at all) the interrupt itself is the terminal event.
-        self._status = "interrupted"
-        if not self._result_fut.done():
-            self._settle_exception(RuntimeError(f"agent {self.name!r} was interrupted"))
-        await self.close()
-        self._owner._registry_update(self, "interrupted")
+            # The drain may have settled the handle with its aborted result; if it did not
+            # (cancelled, or no driver at all) the interrupt itself is the terminal event.
+            self._status = "interrupted"
+            if not self._result_fut.done():
+                self._settle_exception(RuntimeError(f"agent {self.name!r} was interrupted"))
+            await self.close()
+            self._owner._registry_update(self, "interrupted")
+        except BaseException:
+            # This interrupt never finished (the caller cancelled it, most likely). Clear
+            # the latch so a retry re-enters: left set, every later interrupt() returns at
+            # it instantly, stranding a live driver on a handle that never settles.
+            self._interrupting = False
+            raise
 
     async def close(self) -> None:
         session, self._session = self._session, None

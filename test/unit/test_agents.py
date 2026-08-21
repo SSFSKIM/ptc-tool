@@ -293,6 +293,65 @@ def test_interrupt_cancels_the_driver_when_the_drain_outlives_its_budget(tmp_pat
     assert _row(tmp_path, "i2")["status"] == "interrupted"
 
 
+def test_interrupt_preempts_a_queued_turn_that_has_no_session(tmp_path):
+    """A handle still waiting for a permit has no session, so nothing was ever asked to
+    abort: there is no drain to await. interrupt() must pre-empt the driver rather than
+    sit out the drain budget — otherwise the queued turn later acquires its permit and
+    RUNS TO COMPLETION (a real CLI turn, really billed) and is then merely relabelled."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        sem = a._semaphore()
+        await sem.acquire()                    # the only permit: the spawn must queue
+        try:
+            h = a.spawn("queued", name="n1")
+            await asyncio.sleep(0.05)
+            assert h._session is None, "the queued turn should not have opened a session"
+            # The bound is the regression guard: with nothing to drain, waiting the drain
+            # budget out is the defect.
+            await asyncio.wait_for(h.interrupt(), 2)
+            assert h.status == "interrupted"
+            assert h._driver.done()
+            with pytest.raises(RuntimeError, match="was interrupted"):
+                await asyncio.wait_for(h.result(), 2)
+        finally:
+            sem.release()
+        await asyncio.sleep(0.2)               # a surviving driver would run its turn here
+        assert b.sessions == [], "the interrupted turn still opened (and billed) a session"
+        return await asyncio.wait_for(a.run("after"), 2)
+    assert asyncio.run(flow()).text == "after"
+    assert _row(tmp_path, "n1")["status"] == "interrupted"
+
+
+def test_interrupt_latch_resets_so_a_cancelled_interrupt_can_be_retried(tmp_path):
+    """A cancelled interrupt() must not strand the handle. The latch that keeps a second
+    concurrent interrupt from re-signalling under the first one's drain has to clear when
+    the first never finishes — otherwise every later interrupt() returns at the latch and
+    the driver stays alive with the handle unsettled, recoverable only via close()."""
+    b = FakeBackend(hang=True, drain_s=0.5)
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        h = a.spawn("forever", name="n2")
+        await asyncio.sleep(0.05)
+        first = asyncio.ensure_future(h.interrupt())
+        await asyncio.sleep(0.1)               # first is inside the drain wait
+        assert not first.done()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert h.status == "running", "the cancelled interrupt left the handle unsettled"
+        # The retry must actually re-enter and finish the job.
+        await asyncio.wait_for(h.interrupt(), 5)
+        assert h.status == "interrupted"
+        assert h._driver.done() and b.sessions[0].closed
+        assert (await asyncio.wait_for(h.result(), 2)).text == "(aborted)"
+        return await asyncio.wait_for(a.run("after"), 2)
+    assert asyncio.run(flow()).text == "after"
+    assert _row(tmp_path, "n2")["status"] == "interrupted"
+
+
 def test_interrupt_does_not_overwrite_a_finished_turn(tmp_path):
     """S1: an interrupted turn ends with a normal ResultMessage, so a late interrupt can
     race a completed drain. A terminal handle stays terminal — status and registry alike."""
