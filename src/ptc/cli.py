@@ -38,7 +38,10 @@ def main(argv=None) -> int:
     def com(name, **kw):
         sp = sub.add_parser(name, **kw)
         sp.add_argument("-s", "--session", default=None)
-        sp.add_argument("-t", "--timeout", type=float, default=300.0)
+        # No default: an omitted -t must fall through to PTC_YIELD_S (Config.from_env),
+        # which a hardcoded 300.0 substituted here would overwrite on every invocation.
+        sp.add_argument("-t", "--timeout", type=float, default=None,
+                        help="seconds to wait before yielding (default: PTC_YIELD_S, else 300)")
         sp.add_argument("--json", action="store_true")
         return sp
 
@@ -105,13 +108,18 @@ def main(argv=None) -> int:
         return 0
 
     cfg = Config.from_env()
-    cfg.yield_s = a.timeout
+    if a.timeout is not None:
+        cfg.yield_s = a.timeout
     if a.cmd == "exec":
         code = sys.stdin.read() if a.code == "-" else a.code
-        info = ensure_kernel(key, config=cfg)
-        outcome = KernelClient(key).exec_cell(code, timeout_s=a.timeout, config=cfg)
+        # The discovered cwd and Claude session id travel WITH the spawn: dropping them
+        # here left meta.json without the session id, and history()/agent.fork() read it
+        # back from there (the restart path above learned this first).
+        info = ensure_kernel(key, cwd=resolved.cwd,
+                             claude_session_id=resolved.claude_session_id, config=cfg)
+        outcome = KernelClient(key).exec_cell(code, timeout_s=cfg.yield_s, config=cfg)
     else:  # wait
-        outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=a.timeout, since=a.since)
+        outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=cfg.yield_s, since=a.since)
         info = None
     if a.json:
         print(json.dumps(to_dict(outcome, key)))

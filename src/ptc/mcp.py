@@ -54,10 +54,19 @@ def _content(rendered) -> list:
     return out
 
 
-def _cfg(timeout_s: float, max_output_chars: int) -> Config:
+def _cfg(timeout_s: float | None, max_output_chars: int | None) -> Config:
+    """The call's configuration: environment first, explicit arguments on top.
+
+    `None` means "the caller omitted this", which is not the same as asking for the
+    default. Substituting the defaults in the handler signatures instead made `_cfg`
+    overwrite the values loaded from PTC_YIELD_S and PTC_MAX_OUTPUT_CHARS on every normal
+    call, so those documented settings had no effect on the MCP path at all.
+    """
     cfg = Config.from_env()
-    cfg.yield_s = timeout_s
-    cfg.max_output_chars = min(int(max_output_chars), MAX_OUTPUT_CLAMP)
+    if timeout_s is not None:
+        cfg.yield_s = float(timeout_s)
+    if max_output_chars is not None:
+        cfg.max_output_chars = min(int(max_output_chars), MAX_OUTPUT_CLAMP)
     return cfg
 
 
@@ -76,13 +85,14 @@ def _cfg(timeout_s: float, max_output_chars: int) -> Config:
 
 
 async def exec_tool(code: str, session: str | None = None,
-                    timeout_s: float = 300, max_output_chars: int = 12_000) -> list:
+                    timeout_s: float | None = None,
+                    max_output_chars: int | None = None) -> list:
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
     info = await asyncio.to_thread(ensure_kernel, r.key, cwd=r.cwd,
                                    claude_session_id=r.claude_session_id, config=cfg)
     outcome = await asyncio.to_thread(KernelClient(r.key).exec_cell, code,
-                                      timeout_s=timeout_s, config=cfg)
+                                      timeout_s=cfg.yield_s, config=cfg)
     rendered = render(outcome, r.key, cfg, degraded=r.degraded)
     if info.expired_notice:
         rendered.text = (f"[previous kernel expired: {info.expired_notice.strip()} — fresh "
@@ -92,12 +102,13 @@ async def exec_tool(code: str, session: str | None = None,
 
 
 async def wait_tool(cell_id: int, session: str | None = None,
-                    timeout_s: float = 300, max_output_chars: int = 12_000,
+                    timeout_s: float | None = None,
+                    max_output_chars: int | None = None,
                     since: int = -1) -> list:
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
     outcome = await asyncio.to_thread(KernelClient(r.key).wait_cell, cell_id,
-                                      timeout_s=timeout_s, since=since)
+                                      timeout_s=cfg.yield_s, since=since)
     return _content(render(outcome, r.key, cfg, degraded=r.degraded))
 
 
@@ -132,7 +143,7 @@ async def interrupt_tool(session: str | None = None) -> list:
         return [TextContent(type="text", text=f"{ack} — no cell was running")]
     # the interrupted cell's own tail, through the same wait/render path a wait() call
     # takes (same cursor, so nothing is replayed and nothing is consumed twice)
-    cfg = _cfg(_INTERRUPT_SETTLE_S, 12_000)
+    cfg = _cfg(_INTERRUPT_SETTLE_S, None)
     rendered = render(outcome, r.key, cfg, degraded=r.degraded)
     rendered.text = f"{ack}\n{rendered.text}"
     return _content(rendered)
