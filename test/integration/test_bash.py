@@ -79,6 +79,60 @@ def test_bash_background_kill_reaps_process(ptc_home):
     kill_kernel("b3")
 
 
+def _wait_gone(pid: int, patience: float = 10.0) -> bool:
+    deadline = time.time() + patience
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_background_group_dies_with_the_kernel(ptc_home):
+    """A background bash child is its OWN session (that is what lets a timeout kill the
+    command's whole tree), which also puts it outside the kernel's process group — so the
+    group kill that reaps every other kernel child never reached it and a
+    `bash(..., background=True)` outlived kill/restart/TTL as an orphan."""
+    import json
+    ensure_kernel("b5", cwd=str(ptc_home))
+    out = _exec("b5", """
+        h = await bash("sleep 300", background=True)
+        print(h.pid)
+    """)
+    pid = int(out.output.strip())
+    try:
+        rows = json.loads((ptc_home / "kernels" / "b5" / "bash-pgids.json").read_text())
+        assert [r for r in rows if r["pid"] == pid], f"{pid} was never registered: {rows}"
+
+        kill_kernel("b5")
+
+        assert _wait_gone(pid), f"background group {pid} outlived the kernel that spawned it"
+        assert not (ptc_home / "kernels" / "b5" / "bash-pgids.json").exists()
+    finally:
+        try:
+            os.kill(pid, 9)          # never leave a stray sleep behind
+        except OSError:
+            pass
+
+
+def test_background_group_is_forgotten_when_it_ends(ptc_home):
+    """The registry must shrink as groups exit, or a reap eventually signals a pgid the
+    OS has handed to somebody else."""
+    import json
+    ensure_kernel("b6", cwd=str(ptc_home))
+    out = _exec("b6", """
+        h = await bash("true", background=True)
+        r = await h.wait()
+        print("code", r.code)
+    """)
+    assert "code 0" in out.output
+    rows = json.loads((ptc_home / "kernels" / "b6" / "bash-pgids.json").read_text())
+    assert rows == [], f"an exited group stayed in the registry: {rows}"
+    kill_kernel("b6")
+
+
 def test_percent_bash_magic_still_works(ptc_home):
     ensure_kernel("b2", cwd=str(ptc_home))
     out = _exec("b2", "%%bash\necho magic-$((1+1))")

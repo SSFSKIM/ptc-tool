@@ -184,9 +184,31 @@ class AgentHandle:
         session = self._session
         if session is None:
             raise RuntimeError(f"agent {self.name!r} has no live session to send to")
-        r = await self._owner._guarded(lambda: session.send(msg), self._timeout)
+        try:
+            r = await self._owner._guarded(lambda: session.send(msg), self._timeout)
+        except asyncio.CancelledError:
+            await self._poison("interrupted")
+            raise
+        except BaseException:                 # timeout, backend error, anything
+            await self._poison("error")
+            raise
         self._owner._registry_update(self, self._status)
         return r
+
+    async def _poison(self, status: str) -> None:
+        """A send() that did not return leaves the session unusable, whatever the reason.
+
+        Releasing the permit is not enough: the child's turn may still be running and its
+        stream is half-drained, so a later send() on the same handle would talk over a
+        live turn on a process this handle no longer understands. Mark the handle terminal
+        and close the session — the next send() then refuses with "no live session" (F5).
+        The status is set unconditionally: the handle this bites is normally 'done' (a
+        finished turn kept open as a send target), which a terminal-status guard would
+        preserve as if nothing had gone wrong.
+        """
+        self._status = status
+        self._owner._registry_update(self, status)
+        await self.close()
 
     def messages(self) -> list:
         return self._session.messages() if self._session else []

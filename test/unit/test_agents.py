@@ -449,6 +449,29 @@ def test_send_timeout_releases_permit(tmp_path):
     assert asyncio.run(flow()).text == "after"
 
 
+def test_send_timeout_poisons_the_session(tmp_path):
+    """A send() that timed out leaves a turn possibly still running and a half-drained
+    stream: the handle must go terminal and the session must close, or the next send()
+    reuses that process and talks over a live (billed) turn."""
+    b = FakeBackend(send_hang=True)
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        h = a.spawn("s", name="s1", timeout=0.3)
+        await asyncio.wait_for(h.result(), 2)
+        assert h.status == "done"
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(h.send("hi"), 3)
+
+        assert h.status == "error", "a failed send left the handle looking healthy"
+        assert b.sessions[0].closed, "the session survived a send that never returned"
+        assert _row(tmp_path, "s1")["status"] == "error"
+        with pytest.raises(RuntimeError, match="no live session"):
+            await asyncio.wait_for(h.send("again"), 2)
+    asyncio.run(flow())
+
+
 def test_send_after_interrupt_is_refused(tmp_path):
     b = FakeBackend(hang=True)
     a = _agent(tmp_path, backend=b)

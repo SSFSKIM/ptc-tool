@@ -79,6 +79,31 @@ def test_kill_kernel_reaps_the_kernels_children(ptc_home):
         _reap(pid)
 
 
+BG_BASH_CELL = """
+h = await bash("sleep 300", background=True)     # its OWN session, outside our group
+print("CHILD", h.pid)
+"""
+
+
+def test_watchdog_expiry_reaps_background_bash_groups(ptc_home, monkeypatch):
+    """The group kill cannot reach a background `bash()` child — it is its own session
+    leader by design. The expiring kernel has to reap those groups from the registry
+    first, or a TTL expiry leaves them running for the rest of the machine's uptime."""
+    monkeypatch.setenv("PTC_IDLE_HOURS", str(IDLE_HOURS))
+    info = ensure_kernel("cr3", cwd=str(ptc_home))
+    pid = _child_pid(KernelClient("cr3").exec_cell(
+        BG_BASH_CELL, timeout_s=60, config=Config.from_env()))
+    try:
+        assert _running(pid)
+        deadline = time.monotonic() + PATIENCE_S
+        while time.monotonic() < deadline and _kernel_running(info.pid):
+            time.sleep(0.2)
+        assert not _kernel_running(info.pid), "idle kernel never expired"
+        assert _wait_gone(pid), f"background group {pid} outlived the expired kernel"
+    finally:
+        _reap(pid)
+
+
 def test_watchdog_expiry_reaps_the_kernels_children(ptc_home, monkeypatch):
     """The watchdog's os._exit skips atexit by design, so the SDK's own reaper never
     runs on this path — the idle kernel has to take its children down itself."""

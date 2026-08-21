@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .discovery import write_meta
+from . import bgroups
+from .discovery import read_meta, write_meta
 from .lock import key_lock
 from .ownership import Owner, owner_alive, proc_start_time, read_owner, write_owner
 from .paths import Config, cells_dir, kernel_dir, kernels_root
@@ -52,6 +53,9 @@ def _clean_stale(kd: Path, key: str) -> None:
         # before respawn, or every retry leaks a detached process (F4) — and its
         # children with it, for the same reason kill_kernel takes the group
         kill_process_tree(o.pid)
+    # the dead kernel's background bash groups are in sessions of their own, so the group
+    # kill above never reached them (F4)
+    bgroups.reap(kd)
     for name in ("owner.json", "ready", "connection.json"):
         (kd / name).unlink(missing_ok=True)
     _rotate_cells(kd)
@@ -116,7 +120,12 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             epoch = str(int(time.time()))
             write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
                                    time.time(), secrets.token_hex(8), epoch))
-            write_meta(key, kernel_key=key, claude_session_id=claude_session_id,
+            # A caller that does not know the Claude session id (an env-keyed rung, a CLI
+            # restart) passes None — which must not ERASE the id a previous spawn under
+            # this key already learned: history() and fork() read it back from here.
+            write_meta(key, kernel_key=key,
+                       claude_session_id=claude_session_id or read_meta(key).get(
+                           "claude_session_id"),
                        cwd=work, depth=cfg.depth, epoch=epoch)
             from .client import run_bootstrap
             run_bootstrap(key, cfg)
@@ -158,10 +167,15 @@ def kill_process_tree(pid: int) -> None:
 def kill_kernel(key: str) -> bool:
     with key_lock(key):
         o = read_owner(key)
+        if o and owner_alive(o):   # pid + start time: never killpg a recycled pid's group
+            kill_process_tree(o.pid)
+        # Only now, with the kernel down and unable to start another one, reap the
+        # background bash groups it spawned: each is its own session, so the group kill
+        # above cannot reach them and they would outlive the kernel as orphans (F4).
+        # Also correct when there is no owner at all — those groups are orphans already.
+        bgroups.reap(kernel_dir(key))
         if not o:
             return False
-        if owner_alive(o):     # pid + start time: never killpg a recycled pid's group
-            kill_process_tree(o.pid)
         (kernel_dir(key) / "owner.json").unlink(missing_ok=True)
         (kernel_dir(key) / "ready").unlink(missing_ok=True)
         return True

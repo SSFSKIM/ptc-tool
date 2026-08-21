@@ -203,7 +203,17 @@ def _reap_and_exit() -> None:
     step — which is also the exit, and it happens while the flock is still held (F5).
     Guarded on leadership: a kernel that did not start its own group (an in-process
     test, a hand-launched ipykernel) would otherwise kill its parent's processes too.
+
+    Background `bash()` children are the exception the group kill cannot cover: each runs
+    in a session of its own, so they are reaped first, from the registry the shell keeps
+    (F4). That reap never raises — nothing may come between an expired kernel and its
+    exit, which happens while the flock is still held.
     """
+    try:
+        from ptc import bgroups
+        bgroups.reap(STATE.kernel_dir)
+    except Exception:
+        pass
     try:
         if os.getpgid(0) == os.getpid():
             os.killpg(os.getpgid(0), signal.SIGKILL)     # never returns

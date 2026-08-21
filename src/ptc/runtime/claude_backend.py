@@ -159,7 +159,18 @@ async def open_session(task: str | None, o: AgentOpts, *, resume: str | None = N
     from claude_agent_sdk import ClaudeSDKClient
     client = ClaudeSDKClient(options=_sdk_options(o, resume=resume))
     await client.connect()
-    s = Session(client, o, pending=bool(task))
-    if task:
-        await client.query(task)
+    # connect() has spawned a `claude` CLI. From here on the caller gets a Session or an
+    # exception, and on the exception path it gets no handle at all — so anything that
+    # fails after connect() must disconnect here or the CLI it spawned is a leak nobody
+    # holds a reference to (F6). Covers cancellation too: query() is awaited.
+    try:
+        s = Session(client, o, pending=bool(task))
+        if task:
+            await client.query(task)
+    except BaseException:
+        try:
+            await client.disconnect()
+        except Exception:                 # noqa: BLE001 — teardown never masks the fault
+            pass
+        raise
     return s

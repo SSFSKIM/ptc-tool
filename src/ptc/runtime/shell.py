@@ -2,9 +2,46 @@
 import asyncio
 import os
 import signal
+import time
 from dataclasses import dataclass
 
+from ptc import bgroups
+
 from . import audit
+from .state import STATE
+
+#: Live background groups this kernel started, keyed by pgid. Mirrored to
+#: `<kernel_dir>/bash-pgids.json` on every change so the host (kill/restart) and the
+#: watchdog (TTL exit) can reap groups they never spawned — see ptc/bgroups.py.
+_LIVE: dict[int, dict] = {}
+
+#: Exit watchers, retained: a task nobody holds can be collected mid-await, and the entry
+#: it was going to remove would then linger until the kernel dies.
+_WATCHERS: set = set()
+
+
+def _persist() -> None:
+    # Outside a bootstrapped kernel (a bare `from ptc.runtime import bash` in a test or a
+    # script) STATE.kernel_dir is still its placeholder, and there is no kernel for anyone
+    # to reap on behalf of — mirroring there would just litter the cwd.
+    if str(STATE.kernel_dir) in (".", ""):
+        return
+    bgroups.write(STATE.kernel_dir, list(_LIVE.values()))
+
+
+def _register(proc, cmd: str) -> int | None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:                       # already exited: nothing to reap later
+        return None
+    _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "cmd": cmd[:200], "started_at": time.time()}
+    _persist()
+    return pgid
+
+
+def _unregister(pgid: int | None) -> None:
+    if pgid is not None and _LIVE.pop(pgid, None) is not None:
+        _persist()
 
 
 @dataclass
@@ -44,6 +81,20 @@ class BashHandle:
         self._err: list[bytes] = []
         self._pump = asyncio.gather(_pump(proc.stdout, self._out),
                                      _pump(proc.stderr, self._err))
+        # A background group survives the kernel unless somebody records it: it is its own
+        # session, so no group kill on the kernel reaches it.
+        self._pgid = _register(proc, cmd)
+        watcher = asyncio.ensure_future(self._forget_when_done())
+        _WATCHERS.add(watcher)
+        watcher.add_done_callback(_WATCHERS.discard)
+
+    async def _forget_when_done(self) -> None:
+        """Drop the registry entry the moment the group ends, so a reap never signals a
+        pgid the OS has since handed to somebody else."""
+        try:
+            await self._proc.wait()
+        finally:
+            _unregister(self._pgid)
 
     @property
     def pid(self) -> int:
@@ -58,11 +109,14 @@ class BashHandle:
     async def wait(self) -> BashResult:
         await self._proc.wait()
         await self._pump
+        _unregister(self._pgid)     # the watcher would too; this makes it observable to
+                                    # whoever awaited, without a scheduling race
         return BashResult(self._proc.returncode, self.output(),
                            b"".join(self._err).decode(errors="replace"), False)
 
     def kill(self) -> None:
         _killpg_or_kill(self._proc)
+        _unregister(self._pgid)
 
 
 async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
