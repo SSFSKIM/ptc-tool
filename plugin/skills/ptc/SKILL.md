@@ -47,12 +47,22 @@ user should see and approve step by step.
 is a throw-away subshell (its `cd`/`export` do not persist) — use `%cd` and
 `os.environ["VAR"] = ...` for state that should carry to later cells.
 
-## Agents (coming in M2)
+## Agents
 
-Not available yet. Once shipped: `agent.run/spawn/gather/fork/send` for subagent
-orchestration (children run `bypassPermissions`; `provider="codex"` for a Codex worker;
-depth limited via `PTC_MAX_DEPTH`, default 1). Until then, use Claude Code's native Task
-tool for subagent fan-out.
+    r = await agent.run("summarize CHANGELOG.md")   # one-shot child; r.text, r.session_id
+    hs = [agent.spawn(t, name=f"w{i}") for i, t in enumerate(tasks)]   # returns immediately
+    results = await agent.gather(*hs)               # fan-in — in a LATER cell is fine
+    reply = await hs[0].send("now the risks")       # follow-up turn on the same session
+    agent.list()                                    # live + registry, survives restart
+
+Options: `model=`, `system=`, `allowed_tools=`, `cwd=`, `max_turns=`, `effort=`,
+`output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock),
+`permission_mode=` (children default to `bypassPermissions`). `provider="codex"` is coming
+in M2. Handles live in the namespace, so "spawn now, gather next turn" works; awaiting a
+handle blocks the CELL, not you. `h.interrupt()` cancels a child; `h.close()` ends a
+finished one (its CLI stays alive for follow-up `send()`s until you do).
+Concurrency is capped by `PTC_MAX_CONCURRENCY` (default 8) and recursion by `PTC_MAX_DEPTH`
+(default 1 — a child cannot spawn grandchildren).
 
 ## Sub-LM map-reduce (coming in M3)
 
@@ -71,10 +81,10 @@ Not available yet. `history()` (this session's full transcript, pre-compaction) 
 
 ## Pitfalls
 
-- Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`. Do not
-  call `agent`, `llm`, `web_fetch`, `web_search`, `history`, or `workflow` — none are
-  defined in the kernel namespace yet. Do not invent wrappers such as `call_skill(...)` or
-  `run_subagent(...)` either.
+- Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`,
+  `agent`, `asyncio`. Do not call `llm`, `web_fetch`, `web_search`, `history`, or
+  `workflow` — they are not defined in the kernel namespace yet. Do not invent wrappers
+  such as `call_skill(...)` or `run_subagent(...)` either.
 - The kernel is your notebook, not the project's runtime.
 - A kernel restart loses variables.
 

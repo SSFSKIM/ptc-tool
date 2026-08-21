@@ -1,0 +1,352 @@
+"""The agent namespace: run/spawn/fork/gather/send over pluggable backends.
+
+Lifecycle contract every path here honors (plan review F6):
+  * the driver task is RETAINED on the handle — a fire-and-forget task can be garbage
+    collected mid-flight, taking its CLI subprocess with it in silence;
+  * every call that reaches a backend runs under the shared semaphore, and a caller's
+    `timeout` is a wall-clock deadline covering the queue wait too, not just the call;
+  * on timeout / cancel / interrupt: cancel the driver, tear the session down within a
+    SEPARATE teardown budget, and settle the handle exactly once;
+  * no path leaves a permit held or a CLI process tree alive.
+"""
+import asyncio
+import json
+import time
+import uuid
+from dataclasses import dataclass
+
+from . import audit
+from .state import STATE
+
+#: Teardown gets its own budget, separate from any call deadline. S1 measured a cancelled
+#: SDK task taking 0.6-5.7 s to unwind and an interrupt()ed turn 4.0-13.0 s to drain, so
+#: "await teardown" must be bounded but generous — never assumed instant.
+_TEARDOWN_S = 30.0
+
+_TERMINAL = ("done", "error", "interrupted")
+
+
+@dataclass
+class AgentOpts:
+    provider: str = "claude"
+    model: str | None = None
+    system: str | None = None
+    allowed_tools: list | None = None
+    permission_mode: str = "bypassPermissions"
+    cwd: str | None = None
+    max_turns: int | None = None
+    effort: str | None = None
+    output_schema: dict | None = None
+    timeout: float | None = None
+
+
+@dataclass
+class AgentResult:
+    text: str
+    session_id: str | None
+    structured: dict | None
+    cost_usd: float | None
+    num_turns: int | None
+    duration_ms: int
+
+
+#: Teardown steps still draining past their budget. Retained so a step that outlives the
+#: caller's patience cannot be garbage collected half-done (F6).
+_DRAINING: set = set()
+
+
+async def _swallow(aw) -> None:
+    try:
+        await aw
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001 — teardown never raises
+        pass
+
+
+async def _bounded(aw, budget: float | None = None) -> None:
+    """Await one teardown step within the teardown budget; never raise out of teardown.
+
+    Past the budget we stop WAITING but let the step finish in the background: cancelling
+    a disconnect half-way is how a CLI process tree survives its client.
+    """
+    task = asyncio.ensure_future(_swallow(aw))
+    _DRAINING.add(task)
+    task.add_done_callback(_DRAINING.discard)
+    try:
+        # _swallow means the task itself never raises, so the budget is the only way out
+        # besides success. A CancelledError from OUR caller is deliberately NOT caught:
+        # swallowing it would make a wedged teardown look like a clean one to whoever is
+        # bounding us from outside.
+        await asyncio.wait_for(asyncio.shield(task), budget or _TEARDOWN_S)
+    except TimeoutError:
+        pass
+
+
+class AgentHandle:
+    def __init__(self, owner: "_Agent", name: str, provider: str, timeout: float | None):
+        self._owner = owner
+        self.name = name
+        self.provider = provider
+        self._timeout = timeout
+        self._session = None
+        self._driver: asyncio.Task | None = None    # retained — never discarded (F6)
+        self._status = "running"
+        #: last session id the backend reported, kept across close() so a post-teardown
+        #: registry row still names the session the caller can resume.
+        self._session_id_seen: str | None = None
+        self._result_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    @property
+    def session_id(self):
+        return getattr(self._session, "session_id", None) or self._session_id_seen
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    async def result(self) -> AgentResult:
+        # shield: a cancelled cell must not cancel the shared settlement future.
+        return await asyncio.shield(self._result_fut)
+
+    async def send(self, msg: str) -> AgentResult:
+        if self._status == "running":
+            await self.result()
+        if self._session is None:
+            raise RuntimeError(f"agent {self.name!r} has no live session to send to")
+        r = await self._owner._guarded(lambda: self._session.send(msg), self._timeout)
+        self._owner._registry_update(self, self._status)
+        return r
+
+    def messages(self) -> list:
+        return self._session.messages() if self._session else []
+
+    def history(self):
+        from .transcript import history
+        if not self.session_id:
+            raise RuntimeError(f"agent {self.name!r} has no session id yet")
+        return history(self.session_id)
+
+    async def interrupt(self) -> None:
+        """Cancel the driver, tear the session down, settle exactly once (F6).
+
+        Order matters: the driver is cancelled BEFORE the session is interrupted, because
+        an interrupted turn ends with a normal ResultMessage (S1: terminal_reason
+        'aborted_streaming', no exception) — a still-running driver would otherwise settle
+        the handle 'done' underneath us and the registry would disagree with the status.
+        """
+        if self._status in _TERMINAL:
+            # Already settled (it may have finished during the drain): keep the terminal
+            # status and the terminal registry row, but still release the CLI.
+            await self.close()
+            return
+        self._status = "interrupted"
+        driver = self._driver
+        if driver is not None and not driver.done():
+            driver.cancel()
+        if self._session is not None:
+            await _bounded(self._session.interrupt())
+        if driver is not None:
+            await _bounded(asyncio.gather(driver, return_exceptions=True))
+        if not self._result_fut.done():
+            self._settle_exception(RuntimeError(f"agent {self.name!r} was interrupted"))
+        await self.close()
+        self._owner._registry_update(self, "interrupted")
+
+    async def close(self) -> None:
+        session, self._session = self._session, None
+        if session is not None:
+            self._session_id_seen = getattr(session, "session_id", None) or self._session_id_seen
+            await _bounded(session.close())
+
+    # -- settlement ---------------------------------------------------------
+    def _settle_result(self, r: AgentResult) -> None:
+        if not self._result_fut.done():
+            self._result_fut.set_result(r)
+
+    def _settle_exception(self, exc: BaseException) -> None:
+        if self._result_fut.done():
+            return
+        self._result_fut.set_exception(exc)
+        # Mark retrieved: a handle nobody awaits would otherwise dump
+        # "Future exception was never retrieved" into the cell log at GC time.
+        self._result_fut.exception()
+
+
+class _Agent:
+    def __init__(self, config: dict, backends: dict):
+        self._config = config
+        self._backends = backends
+        self._sem: asyncio.Semaphore | None = None
+        self._handles: dict[str, AgentHandle] = {}
+
+    # -- plumbing -----------------------------------------------------------
+    def _semaphore(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(int(self._config.get("max_concurrency", 8)))
+        return self._sem
+
+    async def _guarded(self, make_coro, timeout: float | None):
+        """One permit, one deadline, released on every exit path. The deadline covers the
+        wait for the permit as well, so a queued call cannot outlive its own timeout."""
+        async def _work():
+            async with self._semaphore():
+                return await make_coro()
+        if timeout:
+            return await asyncio.wait_for(_work(), timeout)
+        return await _work()
+
+    def _check_depth(self) -> None:
+        d, m = int(self._config.get("depth", 0)), int(self._config.get("max_depth", 1))
+        if d >= m:
+            raise RuntimeError(
+                f"agent depth limit reached (PTC_DEPTH={d}, PTC_MAX_DEPTH={m}); "
+                "raise PTC_MAX_DEPTH to allow grandchildren")
+
+    def _opts(self, kw: dict) -> AgentOpts:
+        provider = kw.pop("provider", "claude")
+        if provider not in self._backends:
+            raise ValueError(f"unknown provider {provider!r}; use one of {sorted(self._backends)}")
+        bad = set(kw) - set(AgentOpts.__dataclass_fields__)
+        if bad:
+            raise TypeError(f"unsupported agent options: {sorted(bad)}")
+        return AgentOpts(provider=provider, **kw)
+
+    def _registry_path(self):
+        return STATE.kernel_dir / "agents.json"
+
+    def _registry_load(self) -> list:
+        try:
+            rows = json.loads(self._registry_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        return rows if isinstance(rows, list) else []
+
+    def _registry_write(self, name: str, provider: str, session_id, status: str,
+                        task_head: str = "", **extra) -> None:
+        """Upsert one row. Bookkeeping never breaks a run: an unwritable registry costs
+        visibility (agent.list across restarts), not the result the caller is awaiting."""
+        rows = self._registry_load()
+        row = next((r for r in rows if r.get("name") == name), None)
+        if row is None:
+            row = {"name": name, "created_at": time.time()}
+            rows.append(row)
+        row.update({"provider": provider, "session_id": session_id, "status": status,
+                    "last_turn_at": time.time(), **extra})
+        if task_head:
+            row["task_head"] = task_head[:120]
+        try:
+            path = self._registry_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows))
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    def _registry_update(self, h: AgentHandle, status: str, task_head: str = "", **extra) -> None:
+        self._registry_write(h.name, h.provider, h.session_id, status, task_head, **extra)
+
+    # -- public API ---------------------------------------------------------
+    async def run(self, task: str, **kw) -> AgentResult:
+        self._check_depth()
+        o = self._opts(kw)
+        audit.append("agent", name=f"run-{o.provider}", task=task[:120], provider=o.provider)
+        return await self._guarded(
+            lambda: self._backends[o.provider].run_once(task, o), o.timeout)
+
+    def spawn(self, task: str, *, name: str | None = None, **kw) -> AgentHandle:
+        self._check_depth()
+        o = self._opts(kw)
+        name = name or f"agent-{uuid.uuid4().hex[:6]}"
+        if name in self._handles and self._handles[name].status == "running":
+            raise ValueError(f"agent name already in use: {name!r}")
+        h = AgentHandle(self, name, o.provider, o.timeout)
+        self._handles[name] = h
+        audit.append("agent", name=name, task=task[:120], provider=o.provider)
+        self._registry_update(h, "running", task_head=task)
+
+        async def drive():
+            try:
+                async def _turn():
+                    h._session = await self._backends[o.provider].open_session(task, o)
+                    self._registry_update(h, "running", task_head=task)
+                    return await h._session.wait_result()
+                r = await self._guarded(_turn, o.timeout)
+                h._status = "done"
+                self._registry_update(h, "done")
+                h._settle_result(r)
+            except asyncio.CancelledError:
+                # interrupt() owns the interrupted transition (status + registry + close);
+                # a cancel from anywhere else still leaves an honest terminal state.
+                if h._status not in _TERMINAL:
+                    h._status = "interrupted"
+                    self._registry_update(h, "interrupted")
+                    h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))
+                raise
+            except Exception as e:  # noqa: BLE001 — surfaced through result()
+                h._status = "error"
+                self._registry_update(h, "error")
+                await h.close()            # tear down the CLI process tree (F6)
+                h._settle_exception(e)
+        h._driver = asyncio.ensure_future(drive())
+        return h
+
+    async def fork(self, task: str, **kw) -> AgentResult:
+        self._check_depth()
+        o = self._opts(kw)
+        if o.provider != "claude":
+            raise NotImplementedError("fork is claude-only; use provider='claude'")
+        from ptc.discovery import read_meta
+        sid = read_meta(self._config["key"]).get("claude_session_id")
+        if not sid:
+            raise RuntimeError("no claude_session_id known for this kernel "
+                               "(alias-keyed session) — fork unavailable")
+        audit.append("agent", name="fork", task=task[:120], provider="claude")
+        r = await self._guarded(
+            lambda: self._backends["claude"].run_once(task, o, resume=sid, fork=True),
+            o.timeout)
+        # S2: a forked child's own transcript carries no back-pointer to its parent, so
+        # this row is the only place the relation survives on disk.
+        self._registry_write(f"fork-{uuid.uuid4().hex[:6]}", "claude", r.session_id,
+                             "done", task_head=task, parent_session_id=sid)
+        return r
+
+    async def gather(self, *handles: AgentHandle) -> list:
+        return list(await asyncio.gather(*(h.result() for h in handles)))
+
+    def list(self) -> list:
+        rows = {r["name"]: dict(r) for r in self._registry_load() if r.get("name")}
+        for h in self._handles.values():
+            rows.setdefault(h.name, {"name": h.name})
+            rows[h.name].update({"provider": h.provider, "session_id": h.session_id,
+                                 "status": h.status, "live": True})
+        return sorted(rows.values(), key=lambda r: r.get("created_at", 0))
+
+    def resume(self, session_id: str, **kw) -> AgentHandle:
+        o = self._opts(kw)
+        h = AgentHandle(self, f"resumed-{session_id[:8]}", o.provider, o.timeout)
+        self._handles[h.name] = h
+
+        async def open_():
+            try:
+                async def _open():
+                    h._session = await self._backends[o.provider].open_session(
+                        None, o, resume=session_id)
+                    return h._session
+                await self._guarded(_open, o.timeout)
+                h._status = "done"       # nothing running; the session is a send() target
+                h._settle_result(
+                    AgentResult("(resumed — use send())", session_id, None, None, None, 0))
+                self._registry_update(h, "done")
+            except asyncio.CancelledError:
+                if h._status not in _TERMINAL:
+                    h._status = "interrupted"
+                    self._registry_update(h, "interrupted")
+                    h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))
+                raise
+            except Exception as e:  # noqa: BLE001 — surfaced through result()
+                h._status = "error"
+                self._registry_update(h, "error")
+                await h.close()
+                h._settle_exception(e)
+        h._driver = asyncio.ensure_future(open_())     # retained, like spawn's (F6)
+        return h

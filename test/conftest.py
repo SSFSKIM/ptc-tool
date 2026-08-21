@@ -21,7 +21,11 @@ def kernel_venv() -> Path:
     sha = hashlib.sha256((PKG / "pyproject.toml").read_bytes()).hexdigest()
     if not (py.exists() and marker.exists() and marker.read_text() == sha):
         uv = os.environ.get("UV", "uv")
-        subprocess.run([uv, "venv", str(CACHE_VENV), "--python", "3.12", "--seed"], check=True)
+        # --clear: the invalidation case (a pyproject change) always starts from an
+        # existing venv, and uv refuses to create over one — the same defect T11 fixed in
+        # the launcher and the provisioner, latent here until the first cache miss.
+        subprocess.run([uv, "venv", str(CACHE_VENV), "--python", "3.12", "--seed", "--clear"],
+                       check=True)
         subprocess.run([uv, "pip", "install", "--python", str(py), "-e", f"{PKG}[kernel]"], check=True)
         marker.write_text(sha)
     return CACHE_VENV
