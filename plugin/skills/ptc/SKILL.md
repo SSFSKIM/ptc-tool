@@ -1,0 +1,88 @@
+---
+name: ptc
+description: Persistent per-session IPython kernel for programmatic tool calling — bulk file analysis, data transforms with state that survives across turns and compaction, long-running loops with intermediate results kept in variables. Use when work needs many reads/steps whose intermediates belong in code, not conversation.
+---
+
+# ptc — the programmatic lane
+
+You have a persistent IPython kernel for this session (session id: `${CLAUDE_SESSION_ID}`).
+Run Python in it with the `mcp__plugin_ptc_ptc__exec` tool. If `mcp__plugin_ptc_ptc__exec`
+(or its siblings `wait`/`interrupt`/`restart`/`kernels`) is not yet visible, it is deferred —
+load it first with ToolSearch, e.g. `select:mcp__plugin_ptc_ptc__exec,mcp__plugin_ptc_ptc__wait`.
+Variables, imports, and functions persist across calls, turns, compaction, and `--resume`,
+until the kernel's idle TTL (default 24 h, `PTC_IDLE_HOURS`) or a restart. If results ever
+look like another session's namespace, pass `session="${CLAUDE_SESSION_ID}"` explicitly to
+`exec`.
+
+## When to use ptc — and when not
+
+Use the kernel when the work is programmatic: reading and filtering many files, computing
+over data, or iterating with state across steps. Use native tools instead for: a single
+known edit (native Edit), reading images/PDFs/notebooks (native Read), and anything the
+user should see and approve step by step.
+
+## Working discipline
+
+- Assign large results to named variables; print compact summaries. Output truncates
+  (~12k chars) with a path to the full log.
+- Never poll with `time.sleep` in a cell. If a cell yields `running`, call
+  `mcp__plugin_ptc_ptc__wait` with the cell id; call `mcp__plugin_ptc_ptc__interrupt` to
+  stop a runaway cell.
+- If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
+  queues silently.
+- Run a project's code in the project's own environment (its venv, its npm scripts) via
+  `bash(...)`; never install project dependencies into the kernel.
+
+## Files & shell
+
+    text = read("src/app.py")                    # offset=, limit=, numbered= available
+    write("notes/out.md", content)                # creates parent dirs
+    edit("src/app.py", old, new)                  # old must match EXACTLY once; use
+                                                   # replace_all=True for bulk; widen the
+                                                   # snippet if it errors on multiple matches
+    r = await bash("npm test", timeout=300)       # r.code, r.stdout, r.stderr, r.timed_out
+    h = await bash("slow cmd", background=True)   # h.poll(), await h.wait(), h.kill()
+
+`%%bash` cells also work: `%%bash` must be the FIRST line of the cell; each `%%bash` cell
+is a throw-away subshell (its `cd`/`export` do not persist) — use `%cd` and
+`os.environ["VAR"] = ...` for state that should carry to later cells.
+
+## Agents (coming in M2)
+
+Not available yet. Once shipped: `agent.run/spawn/gather/fork/send` for subagent
+orchestration (children run `bypassPermissions`; `provider="codex"` for a Codex worker;
+depth limited via `PTC_MAX_DEPTH`, default 1). Until then, use Claude Code's native Task
+tool for subagent fan-out.
+
+## Sub-LM map-reduce (coming in M3)
+
+Not available yet. `llm(prompt, model="haiku", ...)` — a cheap one-shot sub-LM call with
+no tools — ships with M3.
+
+## Web (coming in M3)
+
+Not available yet. `web_fetch`/`web_search` ship with M3. Use Claude Code's native
+WebFetch/WebSearch tools until then.
+
+## History (coming in M3)
+
+Not available yet. `history()` (this session's full transcript, pre-compaction) and
+`handle.history()` (a child's transcript) ship with M3.
+
+## Pitfalls
+
+- Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`. Do not
+  call `agent`, `llm`, `web_fetch`, `web_search`, `history`, or `workflow` — none are
+  defined in the kernel namespace yet. Do not invent wrappers such as `call_skill(...)` or
+  `run_subagent(...)` either.
+- The kernel is your notebook, not the project's runtime.
+- A kernel restart loses variables.
+
+## Worked example — bulk file scan
+
+    from pathlib import Path
+    files = {p: p.read_text(errors="replace") for p in Path("src").rglob("*.py")}
+    todo = {p: t for p, t in files.items() if "TODO" in t}
+    print(len(files), "files,", len(todo), "with TODOs")
+    for p, t in list(todo.items())[:5]:
+        print(p, "-", t.count("TODO"), "TODOs")
