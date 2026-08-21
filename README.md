@@ -1,0 +1,86 @@
+# ptc — Programmatic Tool Calling for Claude Code
+
+A persistent per-session IPython kernel exposed to Claude Code as an MCP server, with
+Claude-Code-equivalent tools pre-bound as Python functions: `read`, `write`, `edit`,
+`bash`, `agent` (Claude + Codex children), `llm`, `web_fetch`, `web_search`, `history`,
+`workflow`.
+
+The point is that intermediates stay in the kernel instead of in the model's context. One
+cell can read four hundred files, filter them deterministically, fan out to child agents,
+and print a summary — and only that summary reaches the conversation. Variables, imports
+and agent handles survive across tool calls, turns, compaction, and `claude --resume`.
+
+## Install
+
+    cd ptc/ && uv run ptc setup          # provision ~/.ptc/venv (one-time)
+    claude --plugin-dir ./plugin         # dev install
+
+On a warm `uv` cache the launcher can provision the venv inside Claude Code's 30 s MCP
+startup window on its own; running `ptc setup` once first is what makes a cold cache safe.
+
+Recommended settings (`~/.claude/settings.json`) for prompt-free use:
+
+    {"permissions": {"allow": ["mcp__plugin_ptc_ptc__exec",
+                               "mcp__plugin_ptc_ptc__wait",
+                               "mcp__plugin_ptc_ptc__interrupt",
+                               "mcp__plugin_ptc_ptc__restart",
+                               "mcp__plugin_ptc_ptc__kernels"]}}
+
+Those long names are not a typo. A plugin-provided MCP server's tools are named
+`mcp__plugin_<plugin>_<server>__<tool>`; only a **directly** registered server
+(`claude mcp add ptc -- <plugin>/bin/ptc-launch`) gets the short `mcp__ptc__*` form. Note
+also that plugin MCP tools arrive **deferred** — the model loads them through ToolSearch
+before the first call, which is why the skill prints the long name verbatim.
+
+## Trust model — read this
+
+Allowing `mcp__plugin_ptc_ptc__exec` IS the security decision: from then on, model-written
+Python runs with your OS permissions, outside Claude Code's per-tool permission prompts
+and sandbox, and Claude children spawned from the kernel default to `bypassPermissions`.
+The mutation footer and `~/.ptc/kernels/<session>/audit.jsonl` give visibility, not
+enforcement. Use a worktree or container for untrusted work.
+
+The kernel inherits the MCP adapter's environment verbatim, credential-bearing `CLAUDE_*`
+variables included. Nothing in PTC enumerates that environment into a log, an audit record
+or a registry row, and Codex children get an environment built from an allowlist rather
+than an inherited copy, so Claude-side credentials never cross into another vendor's
+binary.
+
+Billing: all kernel-originated model calls go through the `claude` CLI (your subscription
+when OAuth-logged-in). Do not put `ANTHROPIC_API_KEY` in the environment — it silently
+shadows OAuth and flips billing to the metered API. `codex` children authenticate the same
+way from `~/.codex/auth.json`; `OPENAI_API_KEY` is likewise not forwarded.
+
+## Lifecycle
+
+One detached kernel per Claude Code session, discovered via a SessionStart hook. State
+survives `--resume` until the idle TTL (default 24 h; `PTC_IDLE_HOURS`), a `restart`, or
+the machine rebooting. A restart loses the Python namespace but not child agent sessions —
+those live in `agents.json` and stay resumable through `agent.list()` / `agent.resume()`.
+
+`ptc list | kill | restart | doctor` manage kernels from any shell (`ptc exec` / `wait` /
+`interrupt` run cells from one). With no `--session`, the CLI picks the newest live kernel
+and prints which one it picked.
+
+## Codex (documented, untested)
+
+    codex mcp add ptc -- /abs/path/to/ptc/plugin/bin/ptc-launch
+
+This works because the adapter is plain stdio MCP, but no acceptance test exercises it.
+Session keying degrades to explicit `session=` / `PTC_SESSION`; when PTC cannot key off a
+host session id, every result header says so (`[keying: adapter-local]`).
+
+## Configuration
+
+| env | default | meaning |
+|---|---|---|
+| PTC_HOME | ~/.ptc | root |
+| PTC_YIELD_S | 300 | exec/wait yield timeout |
+| PTC_MAX_OUTPUT_CHARS | 12000 | result cap (server clamp 50000) |
+| PTC_IDLE_HOURS | 24 | kernel TTL |
+| PTC_MAX_CONCURRENCY | 8 | SDK-call semaphore |
+| PTC_MAX_DEPTH | 1 | agent recursion brake |
+| PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks/plugins |
+
+POSIX only (macOS/Linux) — detached spawn, flock-based ownership and the launcher all
+assume it; Windows is future work. Python 3.12.

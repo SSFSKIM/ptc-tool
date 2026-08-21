@@ -205,7 +205,12 @@ def test_parse_blocks_reads_the_real_s6_links_payload():
 
 def test_parse_blocks_prose_fallback_when_no_links_payload():
     """No `Links:` payload — the contract still returns list[SearchResult], best-effort,
-    with the source block retained on `.raw` (the spec's S6 fallback, verbatim)."""
+    with the source block retained on `.raw` (the spec's S6 fallback, verbatim).
+
+    This fixture is synthetic and knowingly so: the prose branch has never fired against
+    real data — every live WebSearch response observed (S6 and A7) carried a well-formed
+    `Links:` line. The test pins the shape of a path we have no field evidence for, which
+    is the reason to keep it, not a reason to trust it."""
     class T:
         content = [{"type": "text", "text": 'Found "Doc B" (https://b.example/page) and more'}]
     out = _parse_blocks([T()])

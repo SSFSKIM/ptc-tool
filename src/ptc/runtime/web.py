@@ -141,6 +141,12 @@ def _results_from_text(text: str) -> list[SearchResult]:
     genuine zero-result search must return zero hits, not fall through and scrape the
     model's write-up for urls it merely mentions — that write-up is exactly the prose
     this function exists to discard, not a source of results.
+
+    Honest status of the fallback branch: it has never fired against real data. Every
+    WebSearch response observed live (S6 and A7 alike) carried a well-formed `Links:`
+    line, so the prose scrape is pinned only by a synthetic fixture in
+    `test/unit/test_web.py` — keep it as insurance against a shape change, do not treat
+    it as a path with field evidence behind it.
     """
     m = _LINKS_RE.search(text)
     if m:

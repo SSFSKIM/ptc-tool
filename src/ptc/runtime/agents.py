@@ -194,8 +194,12 @@ class AgentHandle:
         """The child's own transcript (T25's `Transcript`, same type `history()` returns).
 
         The child writes its own JSONL under a cwd this handle never tracked (only
-        `AgentOpts.cwd`, which is not retained past spawn), so this resolves by session
-        id alone — `transcript._resolve_path`'s glob fallback covers exactly that case.
+        `AgentOpts.cwd`, which is not retained past spawn), so nothing is passed as
+        `cwd=` here. That does NOT mean resolution is by session id alone: `history()`
+        still reads the KERNEL's `meta.json` first and tries the direct path under that
+        cwd, which hits whenever the child ran in the kernel's own directory (the
+        default). `transcript._resolve_path`'s glob is the fallback that covers a child
+        given a different `cwd=` at spawn.
         """
         if not self.session_id:
             raise RuntimeError(f"agent {self.name!r} has no session id yet")

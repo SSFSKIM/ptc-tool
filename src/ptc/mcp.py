@@ -19,10 +19,11 @@ functions, agent handles) persists across calls, turns, compaction, and --resume
 until the kernel's idle TTL. Assign large results to variables and print compact
 summaries; output truncates with a full-log path. Pre-bound: read, write, edit,
 bash, agent, llm, web_fetch, web_search, history, workflow, asyncio (all Python;
-async ones are awaited at top level).
-If a cell yields `running`, use wait(cell_id); if the
-kernel is busy, wait or interrupt — nothing queues. Pass session="<id>" explicitly
-if results ever look like a different session's namespace.
+async ones are awaited at top level). Tools: exec, wait, interrupt, restart, kernels.
+If a cell yields `running`, use wait(cell_id); if the kernel is busy, wait or
+interrupt — nothing queues. Pass session="<id>" explicitly if results ever look like
+a different session's namespace, or if this client does not set a session id of its
+own (the header then reads `keying: adapter-local`).
 """
 
 server = MCPServer("ptc", instructions=INSTRUCTIONS)

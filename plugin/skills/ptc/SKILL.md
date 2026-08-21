@@ -1,6 +1,6 @@
 ---
 name: ptc
-description: Persistent per-session IPython kernel for programmatic tool calling — bulk file analysis, data transforms with state that survives across turns and compaction, long-running loops with intermediate results kept in variables. Use when work needs many reads/steps whose intermediates belong in code, not conversation.
+description: Persistent per-session IPython kernel for programmatic tool calling — bulk file analysis, data transforms with state that survives across turns and compaction, long-running loops, parallel fan-out to child agents (Claude or Codex) and sub-model map-reduce, web fetch/search, and lossless recall of this session's own transcript. Use when work needs many reads, steps, or delegated agents whose intermediates belong in code, not conversation.
 ---
 
 # ptc — the programmatic lane
@@ -57,11 +57,22 @@ is a throw-away subshell (its `cd`/`export` do not persist) — use `%cd` and
     r = await agent.fork("what did we decide?")     # child inherits THIS conversation
     h = agent.resume(r.session_id)                  # reopen a past session; then h.send(...)
     agent.list()                                    # live + registry, survives restart
+    r = await agent.run("review this diff", provider="codex")   # a Codex worker instead
 
-Options: `model=`, `system=`, `allowed_tools=`, `cwd=`, `max_turns=`, `effort=`,
-`output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock),
-`permission_mode=` (children default to `bypassPermissions`). `provider="codex"` is coming
-in M2. Handles live in the namespace, so "spawn now, gather next turn" works; awaiting a
+Options that work on BOTH providers: `model=`, `system=`, `cwd=`, `effort=`,
+`output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock). Claude-only:
+`allowed_tools=`, `max_turns=`, and any `permission_mode=` other than the default —
+passing one with `provider="codex"` raises `TypeError` rather than being silently dropped,
+because `codex app-server` has no per-turn tool allowlist and no turn cap and PTC pins its
+codex threads to `approvalPolicy="never"` + `sandbox="read-only"`. `system=` rides as
+`developerInstructions` on codex. `agent.fork` is claude-only (`NotImplementedError`
+otherwise). Claude children default to `permission_mode="bypassPermissions"` — delegate
+only work you would run yourself. Codex children are spawned `--disable hooks --disable
+plugins`, so your own `~/.codex` hooks and plugins stay out of PTC's thread (set
+`PTC_CODEX_INHERIT=1` to opt back in), and their environment is built from an allowlist,
+so no Claude credentials cross into another vendor's binary.
+
+Handles live in the namespace, so "spawn now, gather next turn" works; awaiting a
 handle blocks the CELL, not you. `h.interrupt()` aborts a child's turn — it waits out the
 abort, so `h.result()` still gives you the partial turn — and `h.close()` ends a finished
 one (its CLI stays alive for follow-up `send()`s until you do). `fork` is a one-shot
@@ -94,7 +105,7 @@ and returns the WHOLE thing as markdown in `.text` — filter it in Python rathe
 asking for a summary. `prompt=` additionally fills `.summary` via `llm()`; the full text
 stays either way.
 
-`web_search(query, *, allowed_domains=None, blocked_domains=None, max_results=10,
+`web_search(query_text, *, allowed_domains=None, blocked_domains=None, max_results=10,
 timeout=300)` returns the search tool's own hits, not a model write-up. Each
 `SearchResult` carries `.title`, `.url`, `.raw`; `.snippet` is empty because the tool
 returns title and url only — call `web_fetch` on a url when you need the content.
@@ -110,9 +121,11 @@ searching.
     t.user(); t.assistant(); t.tool_calls("Bash"); t.search(r"regex")
     child_t = hs[0].history()            # a child's transcript (any spawned/resumed handle)
 
-`history(session=None)` defaults to this kernel's own Claude session id (from `meta.json`);
-pass `session=` explicitly for any other session id. Raises `RuntimeError` if no session id
-is known (an alias-keyed kernel) or `FileNotFoundError` if no transcript is found on disk.
+`history(session=None, cwd=None)` defaults to this kernel's own Claude session id (from
+`meta.json`); pass `session=` explicitly for any other session id, and `cwd=` only if that
+session ran somewhere this kernel's `meta.json` does not name. Raises `RuntimeError` if no
+session id is known (an alias-keyed kernel) or `FileNotFoundError` if no transcript is
+found on disk. Also available: `t.text()`, `t.path`, `t.messages` (the raw JSONL rows).
 
 ## Workflow helpers
 
@@ -151,9 +164,12 @@ it, so it is a deliberate one-shot, never a loop body.
   `llm`, `web_fetch`, `web_search`, `history`, `workflow`, `asyncio`. Do not invent
   wrappers such as `call_skill(...)` or `run_subagent(...)`.
 - The kernel is your notebook, not the project's runtime.
-- A kernel restart loses variables.
+- A kernel restart loses variables and handles, but not agent sessions: the on-disk
+  registry survives, so `agent.list()` then `agent.resume(sid)` reopens a child.
 
-## Worked example — bulk file scan
+## Worked examples
+
+Bulk file scan — the shape most work takes here:
 
     from pathlib import Path
     files = {p: p.read_text(errors="replace") for p in Path("src").rglob("*.py")}
@@ -161,3 +177,17 @@ it, so it is a deliberate one-shot, never a loop body.
     print(len(files), "files,", len(todo), "with TODOs")
     for p, t in list(todo.items())[:5]:
         print(p, "-", t.count("TODO"), "TODOs")
+
+Spawn three, gather in a later cell — the fan-in the model never has to wait on:
+
+    picks = list(todo)[:3]
+    hs = [agent.spawn(f"summarize the TODOs in {p}", name=f"sum{i}")
+          for i, p in enumerate(picks)]      # names must be unique in this kernel
+    # ... a later cell, another turn, even after --resume ...
+    for p, r in zip(picks, await agent.gather(*hs)):   # results in handle order
+        print(p, "→", r.text[:200])
+
+Fork to recall this conversation (a deliberate one-shot, never a loop body):
+
+    r = await agent.fork("List every file we agreed to refactor, one per line.")
+    targets = [ln.strip() for ln in r.text.splitlines() if ln.strip()]

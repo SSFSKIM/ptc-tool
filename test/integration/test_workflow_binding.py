@@ -33,8 +33,10 @@ def test_workflow_is_bound_and_runs_in_the_kernel(ptc_home):
     assert "PARALLEL [0, 1, 'ValueError', 3]" in out.output, out.output
     assert "PIPELINE ['A', 'B']" in out.output, out.output
 
-    # `phase` audits for the record; the mutation footer renders only real mutations, so
-    # the cell's rendered text must not have grown a footer line out of the phase.
+    # `phase` audits for the record. This test only proves the record was written — it
+    # never renders a cell, so it cannot show what the footer does with it. That the
+    # footer ignores kind `phase` is pinned by
+    # test/unit/test_wf.py::test_phase_writes_an_audit_entry_the_footer_ignores.
     audit = kernel_dir("wf1") / "audit.jsonl"
     kinds = [json.loads(ln)["kind"] for ln in audit.read_text().splitlines() if ln.strip()]
     assert "phase" in kinds, kinds
