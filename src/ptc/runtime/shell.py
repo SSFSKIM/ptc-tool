@@ -11,7 +11,8 @@ from ptc.ownership import proc_start_time
 from . import audit
 from .state import STATE
 
-#: Live background groups this kernel started, keyed by pgid. Mirrored to
+#: Live `bash()` process groups this kernel started, keyed by pgid: every background handle
+#: until its group ends, and every foreground command for the duration of its call. Mirrored to
 #: `<kernel_dir>/bash-pgids.json` on every change so the host (kill/restart) and the
 #: watchdog (TTL exit) can reap groups they never spawned — see ptc/bgroups.py.
 _LIVE: dict[int, dict] = {}
@@ -19,6 +20,12 @@ _LIVE: dict[int, dict] = {}
 #: Exit watchers, retained: a task nobody holds can be collected mid-await, and the entry
 #: it was going to remove would then linger until the kernel dies.
 _WATCHERS: set = set()
+
+#: How long `BashHandle.kill()` waits for a SIGKILLed group to empty before deciding whether
+#: its row can go. `killpg` returning means the signal was POSTED, not that the members are
+#: gone; the descendants of an exited shell are orphans reaped by init, so this is a
+#: milliseconds-scale wait in practice and a bound for the case where it is not.
+_KILL_SETTLE_S = 1.0
 
 
 def _persist() -> None:
@@ -176,8 +183,34 @@ class BashHandle:
                            b"".join(self._err).decode(errors="replace"), False)
 
     def kill(self) -> None:
-        _killpg_or_kill(self._proc)
-        _unregister(self._pgid)
+        """SIGKILL the RECORDED group, and retire its row only once that group is empty.
+
+        Recomputing the group from the leader's pid is wrong for exactly the case `_retire`
+        exists for. A daemonizing command's shell has already exited leaving descendants in
+        the group, so `os.getpgid(<reaped pid>)` raises, the `proc.kill()` fallback reaches
+        nobody — and the unconditional unregister then threw away the one pgid anything
+        could still have reaped those descendants by. `h.kill()` in that state leaked the
+        child permanently.
+        """
+        if self._pgid is None:              # never registered: the leader was already gone
+            _killpg_or_kill(self._proc)
+            return
+        try:
+            os.killpg(self._pgid, signal.SIGKILL)
+        except OSError:
+            pass                            # already empty (ESRCH) or not ours (EPERM)
+        if self._proc.returncode is None:
+            # The leader is still ours to reap, so the only member `_group_alive` could see
+            # right now is its own zombie. `_forget_when_done` is awaiting that wait() and
+            # retires the row the moment the group really ends.
+            _retire(self._pgid)
+            return
+        # The leader was reaped already, so nothing else will ever look at this row again:
+        # this call owns it. Give the signalled group a bounded moment to empty first.
+        deadline = time.monotonic() + _KILL_SETTLE_S
+        while _group_alive(self._pgid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        _retire(self._pgid)
 
 
 async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
@@ -200,6 +233,12 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
     if background:
         return BashHandle(proc, cmd)
 
+    # A foreground command is its own session too, so the kernel's own group kill misses it
+    # — and while it was absent from the registry, `ptc kill`/`restart` and the TTL watchdog
+    # missed it as well: bgroups.reap is the only channel to a HOST that never saw this pid.
+    # A kill landing mid-`bash()` therefore left the command and its descendants running
+    # after the kernel was gone. The row lives exactly as long as the call.
+    pgid = _register(proc, cmd)
     out: list[bytes] = []
     err: list[bytes] = []
     readers = asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err))
@@ -215,9 +254,18 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
                            b"".join(err).decode(errors="replace"), True)
     except BaseException:
         # Cancellation — a cell interrupt, a task torn down — or any other failure. It
-        # bypasses the timeout handler above, and a foreground command is the one child
-        # nothing else can reap: it is its own session (so the kernel's group kill misses
-        # it) and it is not in the bgroups registry (so kill/restart/TTL miss it too).
-        # Kill the group here, settle the readers, and let the original propagate.
+        # bypasses the timeout handler above, so kill the group here, settle the readers,
+        # and let the original propagate.
         await _reap_foreground(proc, readers)
         raise
+    finally:
+        # Only the normal path has waited on the leader, and only there can `_group_alive`
+        # answer honestly: an ended group drops its row, while a foreground daemonizer's
+        # surviving descendants keep it (the same pgid the reapers need, `_retire`). Both
+        # kill paths above SIGKILLed the whole group, so there is nothing left to keep a row
+        # for — and the leader is an unreaped zombie there, which is still a group member
+        # and would make `_group_alive` answer "alive" for good.
+        if proc.returncode is not None:
+            _retire(pgid)
+        else:
+            _unregister(pgid)

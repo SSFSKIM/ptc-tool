@@ -104,6 +104,46 @@ def test_watchdog_expiry_reaps_background_bash_groups(ptc_home, monkeypatch):
         _reap(pid)
 
 
+FG_BASH_CELL = """
+import asyncio
+_fg = asyncio.ensure_future(
+    bash("sleep 300 & echo $! > {pidfile}; wait", timeout=600))
+print("SUBMITTED")
+"""
+
+
+def _wait_file(path, patience: float = PATIENCE_S) -> int:
+    deadline = time.monotonic() + patience
+    while time.monotonic() < deadline:
+        try:
+            text = path.read_text().strip()
+            if text:
+                return int(text)
+        except OSError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never got the payload pid")
+
+
+def test_kill_kernel_reaps_an_in_flight_foreground_bash(ptc_home, tmp_path):
+    """A FOREGROUND `bash()` is its own session too, so the kernel's group kill misses it
+    just as it misses a background one. Until foreground groups were registered, a `ptc
+    kill` (or restart, or a TTL expiry) landing while a command was running left that
+    command and its descendants alive for the rest of the machine's uptime."""
+    pidfile = tmp_path / "fg.pid"
+    ensure_kernel("cr4", cwd=str(ptc_home))
+    out = KernelClient("cr4").exec_cell(FG_BASH_CELL.format(pidfile=pidfile),
+                                        timeout_s=60, config=Config.from_env())
+    assert isinstance(out, Completed), out
+    pid = _wait_file(pidfile)
+    try:
+        assert _running(pid), "the payload never started"
+        assert kill_kernel("cr4")
+        assert _wait_gone(pid), f"payload {pid} outlived the kernel that was running it"
+    finally:
+        _reap(pid)
+
+
 def test_watchdog_expiry_reaps_the_kernels_children(ptc_home, monkeypatch):
     """The watchdog's os._exit skips atexit by design, so the SDK's own reaper never
     runs on this path — the idle kernel has to take its children down itself."""
