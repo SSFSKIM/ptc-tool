@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 
 from ptc import bgroups
+from ptc.ownership import proc_start_time
 
 from . import audit
 from .state import STATE
@@ -34,7 +35,11 @@ def _register(proc, cmd: str) -> int | None:
         pgid = os.getpgid(proc.pid)
     except OSError:                       # already exited: nothing to reap later
         return None
-    _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "cmd": cmd[:200], "started_at": time.time()}
+    # The leader's start time is recorded WITH the pgid: a pgid alone is reusable, and a
+    # reaper that trusts a stale row can SIGKILL whatever same-user group inherited the
+    # number (ptc/bgroups.py `_recycled`). Same identity pair as ownership.py's.
+    _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "leader_start": proc_start_time(pgid),
+                   "cmd": cmd[:200], "started_at": time.time()}
     _persist()
     return pgid
 

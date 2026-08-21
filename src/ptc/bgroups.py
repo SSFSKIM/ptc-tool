@@ -19,6 +19,9 @@ import os
 import signal
 from pathlib import Path
 
+from .ownership import proc_start_time
+from .paths import private_write_text, secure_dir
+
 FILENAME = "bash-pgids.json"
 
 
@@ -31,10 +34,8 @@ def write(kernel_dir, rows: list) -> None:
     mid-write leaves the previous list rather than a truncated one)."""
     p = path_for(kernel_dir)
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(rows))
-        tmp.replace(p)
+        secure_dir(p.parent)
+        private_write_text(p, json.dumps(rows))
     except OSError:
         pass
 
@@ -47,6 +48,24 @@ def read(kernel_dir) -> list:
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
+def _recycled(row: dict) -> bool:
+    """True when the recorded pgid is now led by a DIFFERENT process than the one that
+    was registered — the OS handed that pid out again and signalling the group would kill
+    unrelated same-user work.
+
+    A leader that no longer exists is NOT this case: a pid cannot be reused while it is
+    still a live group's id, so an absent leader means the group is either gone (ESRCH,
+    harmless) or holds only the orphaned children this reap exists for — a background
+    `bash` whose shell exited leaving its own children behind. Rows written before
+    identities were recorded carry no `leader_start` and keep the pre-identity behavior.
+    """
+    recorded = row.get("leader_start")
+    if not recorded:
+        return False
+    current = proc_start_time(row["pgid"])
+    return current is not None and current != recorded
+
+
 def reap(kernel_dir) -> list:
     """SIGKILL every recorded group, then drop the file. Returns the pgids signalled."""
     killed = []
@@ -54,6 +73,8 @@ def reap(kernel_dir) -> list:
         pgid = row.get("pgid")
         if not isinstance(pgid, int) or pgid <= 1:
             continue
+        if _recycled(row):
+            continue                      # somebody else's group now: drop it, unsignalled
         try:
             # never the reaper's own group: a stale entry whose pgid has been recycled
             # onto the caller (a CLI, a test runner, the kernel itself mid-cleanup) would
