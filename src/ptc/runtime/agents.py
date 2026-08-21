@@ -187,6 +187,8 @@ class AgentHandle:
         #: last session id the backend reported, kept across close() so a post-teardown
         #: registry row still names the session the caller can resume.
         self._session_id_seen: str | None = None
+        #: the turn's messages, kept across close() for the same reason — see close().
+        self._messages_seen: list = []
         #: One turn at a time on one CLI session: two follow-up sends interleaved on the
         #: same stream would each drain part of the other's messages.
         self._turn_lock = asyncio.Lock()
@@ -260,7 +262,7 @@ class AgentHandle:
         await self.close()
 
     def messages(self) -> list:
-        return self._session.messages() if self._session else []
+        return self._session.messages() if self._session else list(self._messages_seen)
 
     def history(self):
         """The child's own transcript (T25's `Transcript`, same type `history()` returns).
@@ -348,6 +350,11 @@ class AgentHandle:
         session, self._session = self._session, None
         if session is not None:
             self._session_id_seen = getattr(session, "session_id", None) or self._session_id_seen
+            # The session owns the accumulated messages and this assignment drops the last
+            # reference to it, so a caller that closes a completed handle to reap its CLI
+            # found messages() empty from then on. For a codex handle that is the only
+            # transcript view there is — history() refuses that provider by design.
+            self._messages_seen = list(session.messages())
             await _bounded(session.close())
 
     # -- settlement ---------------------------------------------------------
@@ -398,6 +405,36 @@ class _Agent:
             raise TypeError(f"unsupported agent options: {sorted(bad)}")
         return AgentOpts(provider=provider, **kw)
 
+    def _claim_name(self, name: str) -> None:
+        """Refuse a handle name whose previous holder is still live.
+
+        "done" is not free: a finished handle deliberately keeps its CLI session open as a
+        send() target, so overwriting the entry and the registry row would strand that
+        process with no owner and no cleanup path. Shared by spawn() and resume() — a
+        resumed session is a live CLI exactly like a spawned one.
+        """
+        prior = self._handles.get(name)
+        if prior is not None and (prior.status == "running" or prior._session is not None):
+            raise ValueError(
+                f"agent name already in use: {name!r} (status={prior.status}, its session "
+                "is still live) — await that handle's close() before reusing the name")
+
+    def _resumed_name(self, session_id: str) -> str:
+        """`resumed-<first 8 of the session id>`, lengthened when that prefix is already
+        taken by a DIFFERENT session.
+
+        Two ids sharing eight characters are not the same session, and letting them share
+        one handle name overwrote `_handles` and the registry row of a session whose CLI
+        was still live — unlistable and unmanageable from then on. A name held by THIS
+        session is the other case, a genuine double-resume, and `_claim_name` decides it.
+        """
+        for n in (8, 16, len(session_id)):
+            name = f"resumed-{session_id[:n]}"
+            prior = self._handles.get(name)
+            if prior is None or prior.session_id == session_id:
+                return name
+        return f"resumed-{session_id}-{uuid.uuid4().hex[:6]}"
+
     def _registry_path(self):
         return STATE.kernel_dir / "agents.json"
 
@@ -443,14 +480,7 @@ class _Agent:
         self._check_depth()
         o = self._opts(kw)
         name = name or f"agent-{uuid.uuid4().hex[:6]}"
-        prior = self._handles.get(name)
-        if prior is not None and (prior.status == "running" or prior._session is not None):
-            # "done" is not free: a finished handle deliberately keeps its CLI session
-            # open as a send() target, so overwriting the entry and the registry row would
-            # strand that process with no owner and no cleanup path.
-            raise ValueError(
-                f"agent name already in use: {name!r} (status={prior.status}, its session "
-                "is still live) — await that handle's close() before reusing the name")
+        self._claim_name(name)
         h = AgentHandle(self, name, o.provider, o.timeout)
         self._handles[name] = h
         audit.append("agent", name=name, task=task[:120], provider=o.provider)
@@ -522,7 +552,9 @@ class _Agent:
         # so it is subject to the same depth brake as run/spawn/fork.
         self._check_depth()
         o = self._opts(kw)
-        h = AgentHandle(self, f"resumed-{session_id[:8]}", o.provider, o.timeout)
+        name = self._resumed_name(session_id)
+        self._claim_name(name)
+        h = AgentHandle(self, name, o.provider, o.timeout)
         # The resumed id IS this handle's session id from the start: a resumed session
         # keeps its id, and nothing folds a ResultMessage until the first send(), so
         # without this the registry row (the point of resume) would carry null.

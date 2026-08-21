@@ -727,3 +727,70 @@ def test_spawn_refuses_a_name_whose_session_is_still_live(tmp_path):
         assert (await asyncio.wait_for(h2.result(), 5)).text == "did:beta"
 
     asyncio.run(flow())
+
+
+def test_close_keeps_the_messages_the_handle_saw(tmp_path):
+    """Closing a finished handle reaps its CLI; it must not also erase the turn.
+
+    The session object owns the accumulated messages and close() drops the only reference
+    to it, so `h.messages()` came back empty from then on — and for a codex handle that is
+    the ONLY transcript view there is, since history() refuses that provider by design.
+    """
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.spawn("task-x", name="m1")
+        await asyncio.wait_for(h.result(), 2)
+        before = h.messages()
+        await h.close()
+        return before, h.messages()
+
+    before, after = asyncio.run(flow())
+    assert before, "the fake session records one message per turn"
+    assert after == before, "close() discarded the handle's messages"
+
+
+def test_resume_refuses_a_second_live_handle_for_the_same_session(tmp_path):
+    """Resuming the same session twice overwrote `_handles` and the registry row while
+    the first CLI was still live, leaving that process unlistable. It is the same
+    collision spawn() refuses, and it gets the same answer — until the first is closed."""
+    SID = "sid-dupe-0001"
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h = a.resume(SID)
+        await asyncio.wait_for(h.result(), 2)
+        with pytest.raises(ValueError, match="already in use"):
+            a.resume(SID)
+        assert a._handles[h.name] is h
+        assert len(b.sessions) == 1, "a refused resume must not open a second CLI session"
+        await h.close()
+        h2 = a.resume(SID)          # the first CLI is gone: the name is free again
+        await asyncio.wait_for(h2.result(), 2)
+        return h, h2
+
+    h, h2 = asyncio.run(flow())
+    assert h2.name == h.name and a._handles[h.name] is h2
+
+
+def test_two_sessions_sharing_an_eight_char_prefix_get_distinct_handles(tmp_path):
+    """`resumed-<first 8 of the id>` is not unique: two different sessions sharing that
+    prefix collided on one name, one row and one `_handles` entry."""
+    A, B = "abcd1234-aaaa", "abcd1234-bbbb"
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)
+
+    async def flow():
+        h1, h2 = a.resume(A), a.resume(B)
+        await asyncio.wait_for(h1.result(), 2)
+        await asyncio.wait_for(h2.result(), 2)
+        return h1, h2
+
+    h1, h2 = asyncio.run(flow())
+    assert h1.name != h2.name
+    assert a._handles[h1.name] is h1 and a._handles[h2.name] is h2
+    rows = {r["name"]: r for r in _rows(tmp_path)}
+    assert rows[h1.name]["session_id"] == A and rows[h2.name]["session_id"] == B
+    assert {h1.name, h2.name} <= {e["name"] for e in a.list()}
