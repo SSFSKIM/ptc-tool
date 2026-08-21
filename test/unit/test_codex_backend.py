@@ -137,6 +137,25 @@ def test_structured_output_is_the_final_text_only_when_it_really_is_json(fake):
     assert codex_backend._structured('{"ok": 1}', opts()) is None  # no schema, no parsing
 
 
+def test_a_commentary_preamble_does_not_swallow_the_final_json(fake):
+    """A turn that narrates before answering emits TWO agentMessages of the same type; only
+    the second carries `phase: "final_answer"`. Joining them and parsing the result reported
+    the turn's valid, schema-constrained JSON as `structured=None`."""
+    r = asyncio.run(codex_backend.run_once("COMMENT JSON", opts(output_schema={"type": "object"})))
+
+    assert r.structured == {"ok": 1}, "the final answer's JSON was lost to the preamble"
+    # .text is unnarrowed: a caller reading prose still sees everything the turn said
+    assert "let me look into that" in r.text and '{"ok": 1}' in r.text
+
+
+def test_a_turn_with_no_phase_at_all_keeps_the_legacy_parse(fake):
+    """codex-rs documents `phase: None` as "phase unknown" for providers that do not emit
+    it, and says to keep compatibility behavior — which is the whole joined text."""
+    assert codex_backend._structured('{"ok": 1}', opts(output_schema={"type": "object"})) == {"ok": 1}
+    r = asyncio.run(codex_backend.run_once("JSON", opts(output_schema={"type": "object"})))
+    assert r.structured == {"ok": 1}
+
+
 def test_a_line_past_asyncios_default_limit_still_arrives(fake):
     """Regression: the first live run died on asyncio's 64 KiB StreamReader limit."""
     r = asyncio.run(codex_backend.run_once("HUGE", opts()))

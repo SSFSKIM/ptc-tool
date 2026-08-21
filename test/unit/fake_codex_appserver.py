@@ -24,7 +24,13 @@ Strictness this fake enforces, each matching an observed behaviour of codex-cli 
 Markers in the turn's prompt text drive the wire:
   ``REQ:<method>``  emit that server→client request mid-turn and validate the reply
   ``SLOW``          never finish on its own; wait for `turn/interrupt`
+  ``COMMENT``       emit a mid-turn ``phase: "commentary"`` message before the answer
+  ``JSON``          answer with a JSON document instead of the echo
   anything else     complete at once, echoing ``echo:<text>``
+
+Every `agentMessage` carries `phase` as the real server does — commentary and final answer
+are the same item type and only that field tells them apart, which is precisely what a
+client parsing schema-constrained output has to key on.
 Pass ``--trace <path>`` to append every received message as JSONL, so a test can assert on
 the exact bytes a client put on the wire. It is an ARGV option rather than an environment
 variable because the backend builds its child's environment from an allowlist and forwards
@@ -36,6 +42,9 @@ import sys
 
 #: Where `--trace` writes, set in main().
 TRACE_PATH = None
+
+#: What the ``JSON`` marker answers with — a document a schema-constrained turn would send.
+_FINAL_JSON = '{"ok": 1}'
 
 #: The ten server→client request methods `ServerRequest` declares on 0.146.0.
 SERVER_REQUESTS = (
@@ -168,13 +177,24 @@ class Fake:
                   "params": {"threadId": t["threadId"], "turnId": t["id"], "completedAtMs": 0,
                              "item": {"type": "userMessage", "id": "u1",
                                       "content": [{"type": "text", "text": t["text"]}]}}})
+            if "COMMENT" in text:
+                # A mid-turn preamble: same item type as the answer, distinguished ONLY by
+                # `phase` ("commentary" vs "final_answer", the MessagePhase wire values).
+                # The real server emits these routinely before a schema-constrained answer.
+                send({"method": "item/completed",
+                      "params": {"threadId": t["threadId"], "turnId": t["id"],
+                                 "completedAtMs": 0,
+                                 "item": {"type": "agentMessage", "id": "m0",
+                                          "phase": "commentary",
+                                          "text": "let me look into that"}}})
             send({"method": "item/agentMessage/delta",
                   "params": {"threadId": t["threadId"], "turnId": t["id"], "itemId": "m1",
                              "delta": "echo:"}})
+            final = _FINAL_JSON if "JSON" in t["text"] else f"echo:{text}"
             send({"method": "item/completed",
                   "params": {"threadId": t["threadId"], "turnId": t["id"], "completedAtMs": 0,
                              "item": {"type": "agentMessage", "id": "m1",
-                                      "phase": "final_answer", "text": f"echo:{text}"}}})
+                                      "phase": "final_answer", "text": final}}})
         send({"method": "thread/tokenUsage/updated",
               "params": {"threadId": t["threadId"], "turnId": t["id"],
                          "tokenUsage": {"last": _usage(), "total": _usage(),

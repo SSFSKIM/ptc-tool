@@ -344,6 +344,13 @@ class CodexProc:
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and item.get("text"):
                 self._turn["texts"].append(item["text"])
+                # `phase` is how the app-server separates mid-turn commentary from the
+                # turn's terminal answer (`MessagePhase` in codex-rs, wire values
+                # "commentary"/"final_answer"). A schema-constrained turn puts its JSON in
+                # the final one only, so joining a preamble onto it is what turned valid
+                # structured output into `structured=None`.
+                if item.get("phase") == "final_answer":
+                    self._turn["final_text"] = item["text"]
         elif method == "thread/tokenUsage/updated":
             self._turn["usage"] = (params.get("tokenUsage") or {}).get("total")
         elif method == "turn/completed":
@@ -369,8 +376,9 @@ class CodexProc:
 
     def _reset_turn(self) -> None:
         self._done.clear()
-        self._turn = {"texts": [], "notifications": Counter(), "server_requests": [],
-                      "usage": None, "status": None, "error": None, "duration_ms": None}
+        self._turn = {"texts": [], "final_text": None, "notifications": Counter(),
+                      "server_requests": [], "usage": None, "status": None,
+                      "error": None, "duration_ms": None}
 
     async def turn(self, thread_id: str, text: str, o: AgentOpts,
                    timeout: float = _TURN_S) -> dict:
@@ -382,6 +390,10 @@ class CodexProc:
             raise RuntimeError(self._exit_reason)
         out = dict(self._turn)
         out["text"] = "\n".join(t for t in out["texts"] if t)
+        # No message claimed the final phase: codex-rs documents `phase: None` as "phase
+        # unknown" for providers that do not emit it, and says to keep the legacy
+        # behavior there — which is the whole joined text.
+        out["final_text"] = out["final_text"] or out["text"]
         if out["status"] == "failed":
             raise RuntimeError(f"codex turn failed: {out['error']}")
         return out
@@ -416,7 +428,10 @@ class Session:
                                "duration_ms": out["duration_ms"], "usage": out["usage"],
                                "server_requests": out["server_requests"],
                                "notifications": dict(out["notifications"])})
-        return AgentResult(out["text"], self.session_id, _structured(out["text"], self._o),
+        # `.text` stays everything the turn said; only the parse narrows to the final
+        # answer, so a caller reading prose loses nothing to a caller reading JSON.
+        return AgentResult(out["text"], self.session_id,
+                           _structured(out["final_text"], self._o),
                            None, None, int((time.time() - t0) * 1000))
 
     async def wait_result(self) -> AgentResult:
