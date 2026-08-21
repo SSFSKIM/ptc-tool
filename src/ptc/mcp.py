@@ -1,5 +1,4 @@
 """The ptc MCP server (stdio). Tools: exec, wait, interrupt, restart, kernels."""
-import os
 from pathlib import Path
 
 # Installed mcp SDK is 2.0.0: FastMCP (mcp.server.fastmcp) was replaced by MCPServer
@@ -9,8 +8,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ImageContent, TextContent
 
 from .client import KernelClient
+from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
-from .paths import MAX_OUTPUT_CLAMP, Config, safe_key
+from .paths import MAX_OUTPUT_CLAMP, Config
 from .shape import render
 
 INSTRUCTIONS = """\
@@ -25,29 +25,6 @@ if results ever look like a different session's namespace.
 """
 
 server = MCPServer("ptc", instructions=INSTRUCTIONS)
-
-
-def _resolve(explicit: str | None):
-    """T8 stub — replaced by discovery.resolve in T13. Same return contract."""
-    from dataclasses import dataclass
-
-    @dataclass
-    class Resolved:
-        key: str
-        source: str
-        claude_session_id: str | None
-        cwd: str | None
-        degraded: bool
-
-    if explicit:
-        return Resolved(safe_key(explicit), "explicit", explicit, None, False)
-    env_s = os.environ.get("PTC_SESSION")
-    if env_s:
-        return Resolved(safe_key(env_s), "env", env_s, None, False)
-    cc = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if cc:
-        return Resolved(safe_key(cc), "cc-env", cc, None, False)
-    return Resolved(f"adapter-{os.getpid()}", "adapter-local", None, None, True)
 
 
 _MAX_IMAGE_BYTES = 1_500_000

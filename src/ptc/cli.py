@@ -5,25 +5,26 @@ import os
 import sys
 
 from .client import KernelClient
+from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
-from .paths import Config, safe_key
+from .paths import Config
 from .shape import render, to_dict
 from .venv import ensure_venv
 
 
 def _pick_session(explicit: str | None) -> tuple[str, str | None]:
-    """Returns (key, notice)."""
-    if explicit:
-        return safe_key(explicit), None
-    for var in ("PTC_SESSION", "CLAUDE_CODE_SESSION_ID"):
-        v = os.environ.get(var)
-        if v:
-            return safe_key(v), None
-    live = [r for r in list_kernels() if r["alive"]]
+    """Returns (key, notice). Runs the full discovery chain (explicit -> hook-runfile ->
+    env rungs); only when that lands on the degraded adapter-local fallback does the CLI
+    add its own extra rung — reuse the newest live kernel, since a human at a terminal
+    (unlike the MCP adapter) usually means the session they were just using."""
+    r = _resolve(explicit, ppid=None)
+    if not r.degraded:
+        return r.key, None
+    live = [k for k in list_kernels() if k["alive"]]
     if live:
-        newest = max(live, key=lambda r: r["spawned_at"] or 0)
+        newest = max(live, key=lambda k: k["spawned_at"] or 0)
         return newest["key"], f"[no session given — using newest live kernel: {newest['key']}]"
-    return f"cli-{os.getpid()}", "[no session given and no live kernel — using a fresh local key]"
+    return r.key, "[no session given and no live kernel — using a fresh local key]"
 
 
 def main(argv=None) -> int:
