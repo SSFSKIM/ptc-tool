@@ -77,6 +77,39 @@ def test_spawn_failure_leaks_no_process(ptc_home, monkeypatch):
     assert result.returncode != 0, f"kernel process(es) leaked: {result.stdout!r}"
 
 
+def test_spawn_without_a_recordable_identity_fails_and_leaks_no_process(ptc_home, monkeypatch):
+    """A kernel nobody can identify must not become a ready kernel.
+
+    `ps` failing here (transiently, or on a host without it) left owner.json with a null
+    start time, and identity is pid + start time: `owner_alive` can never call that owner
+    live, so attach and kill_kernel could not recognize the process while `_clean_stale`
+    deleted its metadata WITHOUT killing it and spawned another kernel beside it. The
+    spawn fails instead, and reaps the process it just started.
+    """
+    calls = []
+
+    def _no_identity(pid):
+        calls.append(pid)
+        return None
+
+    monkeypatch.setattr(kernel, "proc_start_time", _no_identity)
+    kd = ptc_home / "kernels" / "noident"
+    conn = kd / "connection.json"
+
+    with pytest.raises(RuntimeError, match="start time"):
+        ensure_kernel("noident")
+
+    assert len(calls) == 2, f"a transient ps failure is retried exactly once: {calls}"
+    for name in ("owner.json", "ready", "connection.json"):
+        assert not (kd / name).exists(), f"{name} survived a failed spawn"
+    assert read_owner("noident") is None
+
+    deadline = time.monotonic() + 10.0
+    while _pids_for(conn) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert _pids_for(conn) == [], "the unidentifiable kernel was left running"
+
+
 def _pids_for(conn) -> list[int]:
     """Every live process launched against this connection file."""
     r = subprocess.run(["pgrep", "-f", str(conn)], capture_output=True, text=True)

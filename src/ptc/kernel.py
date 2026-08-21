@@ -154,7 +154,20 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             # for a usable kernel — kernel_alive() and the reuse check above both require
             # `ready`, while _clean_stale and kill_kernel key off the owner alone and so
             # reap it.
-            write_owner(key, Owner(proc.pid, proc_start_time(proc.pid),
+            # Identity is pid + start time, and a pid alone is not identity: without the
+            # start time `owner_alive` can never call this owner live, so attach and
+            # kill_kernel cannot recognize the process while `_clean_stale` deletes its
+            # metadata without killing it and spawns another kernel beside it — an
+            # unreapable orphan still holding this key's ports. `ps` failing is normally
+            # transient, so it is retried once; a spawn that still cannot record who it
+            # started fails here and takes that process down with it (the handler below).
+            start = proc_start_time(proc.pid) or proc_start_time(proc.pid)
+            if start is None:
+                raise RuntimeError(
+                    f"could not read the start time of the kernel just spawned for {key} "
+                    f"(pid {proc.pid}): without that identity nothing could attach to it "
+                    "or reap it, so the spawn is aborted")
+            write_owner(key, Owner(proc.pid, start,
                                    time.time(), secrets.token_hex(8), epoch))
             _wait_ports(conn)
             os.chmod(conn, 0o600)
