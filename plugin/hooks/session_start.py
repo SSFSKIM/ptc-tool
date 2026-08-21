@@ -33,6 +33,11 @@ def find_claude_ancestor() -> int | None:
     One `ps` per hop: the (grandparent, name-of-parent) pair fetched to name this hop's
     candidate is exactly the pair the next hop needs, so it is carried forward, not
     re-queried. Bounded to 12 hops and stopped at init (ppid <= 1).
+
+    The package-side twin of this walk lives at src/ptc/discovery.py (resolve()'s
+    process-tree loop). The two cannot share a module: this hook runs stdlib-only under
+    system Python, before ~/.ptc/venv exists, so it cannot `import ptc`. Keep the two
+    walks' "claude" substring-on-comm-basename predicate in sync if either one changes.
     """
     info = parent_of(os.getpid())
     for _ in range(12):

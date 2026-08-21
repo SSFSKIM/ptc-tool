@@ -100,6 +100,27 @@ def test_explicit_non_uuidish_has_no_claude_session_id(monkeypatch, tmp_path):
     assert r.source == "explicit" and r.claude_session_id is None
 
 
+def test_hook_runfile_wins_over_both_env_rungs_when_all_present(monkeypatch, tmp_path):
+    """Race all three non-explicit rungs at once: a valid runfile via ppid AND both env
+    vars populated. hook-runfile must win — this would fail under any reordering that
+    checked env before (or instead of) completing the walk."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_runfile(tmp_path, 777)
+    r = resolve(ppid=777, env={"PTC_SESSION": "childkey-1", "CLAUDE_CODE_SESSION_ID": "abc-123"},
+                proc_name=lambda pid: "claude")
+    assert r.source == "hook-runfile"
+    assert r.key == "11111111-2222-3333-4444-555555555555"
+
+
+def test_env_ptc_session_wins_over_env_claude_session_when_both_present(monkeypatch, tmp_path):
+    """No runfile, but both env vars populated in the same call: env-ptc-session must win
+    — this would fail under a swap of the PTC_SESSION/CLAUDE_CODE_SESSION_ID checks."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    r = resolve(ppid=999999, env={"PTC_SESSION": "childkey-1", "CLAUDE_CODE_SESSION_ID": "abc-123"},
+                proc_name=lambda pid: "", proc_parent=lambda pid: None)
+    assert r.source == "env-ptc-session" and r.key == "childkey-1"
+
+
 def test_resolve_defaults_env_to_os_environ(monkeypatch, tmp_path):
     """env=None falls back to the real process environment (documented default)."""
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
