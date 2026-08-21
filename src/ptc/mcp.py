@@ -18,8 +18,8 @@ ptc is a persistent IPython kernel for this session. Namespace (variables, impor
 functions, agent handles) persists across calls, turns, compaction, and --resume,
 until the kernel's idle TTL. Assign large results to variables and print compact
 summaries; output truncates with a full-log path. Pre-bound: read, write, edit,
-bash, agent, llm, asyncio (all Python; async ones are awaited at top level);
-web_fetch, web_search, history and workflow are coming — use the native tools for
+bash, agent, llm, web_fetch, web_search, asyncio (all Python; async ones are
+awaited at top level); history and workflow are coming — use the native tools for
 those for now. If a cell yields `running`, use wait(cell_id); if the
 kernel is busy, wait or interrupt — nothing queues. Pass session="<id>" explicitly
 if results ever look like a different session's namespace.

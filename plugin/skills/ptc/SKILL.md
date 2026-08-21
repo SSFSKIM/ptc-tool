@@ -83,10 +83,23 @@ over many chunks. It is NOT a cheap primitive: even isolated, a call still pays 
 raw API call would — use it for real semantic work, not as a string op. Shares the same
 concurrency cap as `agent`.
 
-## Web (coming in M3)
+## Web
 
-Not available yet. `web_fetch`/`web_search` ship with M3. Use Claude Code's native
-WebFetch/WebSearch tools until then.
+    page = await web_fetch("https://example.com/docs")      # .url .status .title .text
+    hits = await web_search("anthropic claude release notes")  # [SearchResult(title, url)]
+    pages = await asyncio.gather(*[web_fetch(h.url) for h in hits[:5]])
+
+`web_fetch(url, *, prompt=None, timeout=30)` GETs the page (redirects followed, 10 MB cap)
+and returns the WHOLE thing as markdown in `.text` — filter it in Python rather than
+asking for a summary. `prompt=` additionally fills `.summary` via `llm()`; the full text
+stays either way.
+
+`web_search(query, *, allowed_domains=None, blocked_domains=None, max_results=10,
+timeout=300)` returns the search tool's own hits, not a model write-up. Each
+`SearchResult` carries `.title`, `.url`, `.raw`; `.snippet` is empty because the tool
+returns title and url only — call `web_fetch` on a url when you need the content. It runs
+a scoped sub-agent, so it shares the `agent`/`llm` concurrency cap and is not free; one
+search then fan-out `web_fetch` beats repeated searching.
 
 ## History (coming in M3)
 
@@ -96,7 +109,7 @@ Not available yet. `history()` (this session's full transcript, pre-compaction) 
 ## Pitfalls
 
 - Only these names are bound in the kernel today: `read`, `write`, `edit`, `bash`,
-  `agent`, `llm`, `asyncio`. Do not call `web_fetch`, `web_search`, `history`, or
+  `agent`, `llm`, `web_fetch`, `web_search`, `asyncio`. Do not call `history` or
   `workflow` — they are not defined in the kernel namespace yet. Do not invent wrappers
   such as `call_skill(...)` or `run_subagent(...)` either.
 - The kernel is your notebook, not the project's runtime.

@@ -35,15 +35,15 @@ _TERMINAL = ("done", "error", "interrupted")
 
 #: Spec: ONE semaphore across agent/llm/web_search, not one pool per caller (two 8-permit
 #: pools would let 16 SDK-spawning calls run at once against an 8 cap). Module-level and
-#: lazily created from STATE.config so every caller — `_Agent`, `llm()`, and `web.py` in
-#: M3 — shares the same bound without constructing an `_Agent` just to reach it.
+#: lazily created from STATE.config so every caller — `_Agent`, `llm()`, and `web.py` —
+#: shares the same bound without constructing an `_Agent` just to reach it.
 _SHARED_SEM: asyncio.Semaphore | None = None
 
 
 def shared_semaphore(config: dict | None = None) -> asyncio.Semaphore:
     """The one semaphore shared by every SDK-spawning caller. `config` sizes it on first
     creation (defaults to `STATE.config` for callers with no config of their own — `llm()`,
-    `web.py` in M3); `_Agent` passes its own `self._config` explicitly (see `_Agent._semaphore`)
+    `web.py`); `_Agent` passes its own `self._config` explicitly (see `_Agent._semaphore`)
     so it reads its own config rather than reaching past it into global state."""
     global _SHARED_SEM
     if _SHARED_SEM is None:
@@ -63,7 +63,7 @@ def _reset_semaphore() -> None:
 async def guarded(sem: asyncio.Semaphore, make_coro, timeout: float | None):
     """One permit, one deadline, released on every exit path. The deadline covers the
     wait for the permit as well, so a queued call cannot outlive its own timeout. Shared
-    by every semaphore consumer (`_Agent._guarded`, `llm()`, and `web.py` in M3) so this
+    by every semaphore consumer (`_Agent._guarded`, `llm()`, and `web_search()`) so this
     contract lives in exactly one place."""
     async def _work():
         async with sem:
