@@ -157,3 +157,52 @@ def test_a_marker_that_cannot_be_written_aborts_the_submission(monkeypatch, tmp_
         KernelClient("p8").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
 
     assert kc.marker_at_send is None, "the request was sent with no marker behind it"
+
+
+# --- r5 finding 1: a stale submitter never marks the REPLACEMENT epoch ----------------
+
+class _RestartingKC:
+    """A kernel client that is replaced mid-flight: the request goes out, the key is
+    restarted under a new incarnation, and only then does the submitter come back to
+    refresh its marker — the shape of restart() landing inside an exec's wire window."""
+
+    def __init__(self, restart):
+        self._restart = restart
+
+    def execute(self, *a, **kw):
+        self._restart()
+        raise _Killed()
+
+    def stop_channels(self):
+        pass
+
+
+def test_a_stale_submitter_never_marks_the_replacement_epoch(monkeypatch, tmp_path):
+    """The old adapter's marker refresh re-read the CURRENT owner and wrote into the NEW
+    kernel's cells/ under the new epoch. Nothing can discharge a marker naming no cell
+    (`_pending_discharged`), so the replacement was permanently busy the moment it was
+    ready. The old request died with the old kernel — the restart already settled it.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p9", epoch="e1")
+
+    def restart():
+        # what restart_kernel leaves behind: the old cells/ — marker and all — is
+        # archived, and a new incarnation takes the key
+        (kd / "cells").rename(kd / "cells-prev-1")
+        (kd / "cells").mkdir()
+        write_owner("p9", Owner(os.getpid(), proc_start_time(os.getpid()), time.time(),
+                                "nonce-2", "e2"))
+        (kd / "ready").write_text("e2")
+
+    monkeypatch.setattr(KernelClient, "_connect",
+                        lambda self, **kw: _RestartingKC(restart))
+
+    with pytest.raises(_Killed):
+        KernelClient("p9").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
+
+    assert (kd / "cells-prev-1" / "pending.json").exists(), \
+        "the marker for the old kernel must still be the one that was archived with it"
+    assert not (kd / "cells" / "pending.json").exists(), \
+        "the stale submitter planted a marker in the replacement's cells/"
+    assert KernelClient("p9").is_busy() is None, "the fresh kernel was born busy"

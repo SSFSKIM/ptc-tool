@@ -143,30 +143,53 @@ class KernelClient:
         cur = current_cell(self.key)
         return cur is not None and cur > cid
 
-    def _mark_pending(self, msg_id: str | None, cell_id: int | None, *,
-                      best_effort: bool = True) -> None:
-        """Record a request that is (or is about to be) on the wire but unconfirmed.
+    def _owner_identity(self) -> tuple | None:
+        """Which kernel INCARNATION owns this key right now.
 
-        `best_effort` is the difference between the two callers. Written BEFORE the send
-        the marker IS the admission guard, so one that cannot be written aborts the
-        submission rather than letting it proceed unguarded. Written from the failure
-        handler afterwards it is a refresh of a marker that already exists, and must not
-        mask the fault that sent us there.
-
-        The epoch is stamped in so a later kernel can tell the marker is not about IT (see
-        `_pending_discharged`).
+        The epoch is a whole-second timestamp, so two restarts inside one second share
+        one; the nonce is drawn per spawn. The pair is what tells two incarnations apart.
         """
+        o = read_owner(self.key)
+        return (o.epoch, o.nonce) if o else None
+
+    def _mark_pending(self, msg_id: str | None, cell_id: int | None,
+                      owner: tuple | None) -> None:
+        """Record a request that is about to go on the wire, for the incarnation `owner`.
+
+        This one is written BEFORE the send and IS the admission guard, so it raises: a
+        marker that cannot be written aborts the submission rather than letting it proceed
+        unguarded. The epoch is stamped in so a later kernel can tell the marker is not
+        about IT (see `_pending_discharged`).
+        """
+        secure_dir(kernel_dir(self.key) / "cells")
+        private_write_text(
+            kernel_dir(self.key) / "cells" / "pending.json",
+            json.dumps({"msg_id": msg_id, "cell_id": cell_id,
+                        "submitted_at": time.time(),
+                        "epoch": owner[0] if owner else None}))
+
+    def _refresh_pending(self, msg_id: str | None, cell_id: int | None,
+                         owner: tuple | None) -> None:
+        """Update the marker with what the failed send learned — but only while the kernel
+        we submitted TO still owns this key.
+
+        A restart during an in-flight exec replaces the kernel underneath the submitter:
+        cells/ is archived, marker and all, and that archiving IS the settlement for
+        everything the old kernel was holding. Writing here afterwards plants a marker in
+        the REPLACEMENT's cells/ under the replacement's epoch, for a request the
+        replacement never took — and one whose cell id was never learned can then never be
+        discharged, so the fresh kernel is permanently busy from the moment it is ready.
+        The old request died with the old kernel; the restart already answered for it.
+
+        Never raises: this runs from a failure handler and must not mask the fault that
+        sent us there.
+        """
+        if self._owner_identity() != owner:
+            return
         try:
-            o = read_owner(self.key)
-            secure_dir(kernel_dir(self.key) / "cells")
-            private_write_text(
-                kernel_dir(self.key) / "cells" / "pending.json",
-                json.dumps({"msg_id": msg_id, "cell_id": cell_id,
-                            "submitted_at": time.time(),
-                            "epoch": o.epoch if o else None}))
+            self._mark_pending(msg_id, cell_id, owner)
         except OSError:
-            if not best_effort:
-                raise
+            pass
 
     def exec_cell(self, code: str, timeout_s: float, config: Config) -> Completed | Running | Busy:
         """Atomic admission (F2): the submit lock is held from the busy check until the
@@ -192,7 +215,12 @@ class KernelClient:
                 # silently queues a second cell on top of it. Nothing has been sent yet, so
                 # a marker that cannot be written aborts the submission (OSError out of
                 # here) rather than sending unguarded.
-                self._mark_pending(None, None, best_effort=False)
+                # The incarnation is captured HERE, with the marker, and every later write
+                # is checked against it: a restart can replace the kernel while this
+                # request is in flight, and a marker written into the replacement's
+                # cells/ is one the replacement can never discharge (_refresh_pending).
+                owner = self._owner_identity()
+                self._mark_pending(None, None, owner)
                 # sent-unacknowledged window: the request is on the wire and only the
                 # marker records it. EVERY exit from here until current.json names our
                 # cell must fail closed — a lost acknowledgement, a wedged kernel, a
@@ -217,9 +245,13 @@ class KernelClient:
                     # by the kernel's death or by restart(). It is never REMOVED here: an
                     # exception out of execute() does not prove the request stayed off the
                     # wire, and only proof discharges the marker (`_pending_discharged`).
-                    self._mark_pending(msg_id, cell_id)
+                    self._refresh_pending(msg_id, cell_id, owner)
                     raise
-                (kernel_dir(self.key) / "cells" / "pending.json").unlink(missing_ok=True)
+                # Same rule clearing it: the marker this submission owns went into the
+                # archive with its own cells/ if the kernel was replaced, and the file
+                # standing here now would belong to the replacement's submitter.
+                if self._owner_identity() == owner:
+                    (kernel_dir(self.key) / "cells" / "pending.json").unlink(missing_ok=True)
             finally:
                 kc.stop_channels()
         finally:
