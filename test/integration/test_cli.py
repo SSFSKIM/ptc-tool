@@ -28,6 +28,32 @@ def test_cli_exec_shares_kernel_and_json(ptc_home):
     assert r5.returncode == 0
 
 
+def test_cli_restart_preserves_meta(ptc_home, tmp_path):
+    """A CLI restart must respawn the kernel where it lived, under the Claude session id
+    it was keyed to. Passing neither respawned it in whatever directory the CLI happened
+    to run from and blanked meta.json's claude_session_id — the field history() and
+    fork() read, so both broke after any `ptc restart`."""
+    from ptc.kernel import ensure_kernel, kill_kernel
+
+    project = tmp_path / "project"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    ensure_kernel("cli3", cwd=str(project), claude_session_id="sess-abc-123")
+    meta_path = ptc_home / "kernels" / "cli3" / "meta.json"
+    assert json.loads(meta_path.read_text())["claude_session_id"] == "sess-abc-123"
+
+    r = subprocess.run([sys.executable, "-m", "ptc.cli", "restart", "-s", "cli3"],
+                       capture_output=True, text=True, cwd=str(elsewhere),
+                       env={**os.environ, "PTC_HOME": str(ptc_home)}, timeout=180)
+    assert r.returncode == 0, r.stderr
+
+    meta = json.loads(meta_path.read_text())
+    assert meta["claude_session_id"] == "sess-abc-123", "the session id was blanked"
+    assert meta["cwd"] == str(project), "the kernel was respawned in the CLI's own cwd"
+    kill_kernel("cli3")
+
+
 def test_cli_newest_kernel_fallback_prints_notice(ptc_home):
     _cli("exec", "1", env_extra={"PTC_SESSION": "cli2"})
     r = _cli("exec", "2", env_extra={})   # no session env at all

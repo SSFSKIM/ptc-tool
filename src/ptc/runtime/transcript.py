@@ -29,19 +29,27 @@ class Transcript:
     path: Path
     messages: list = field(default_factory=list)
 
+    @staticmethod
+    def _row_text(row: dict) -> str:
+        """One row's plain text — "" for a row that carries none (a tool result, an
+        image block). Shared by the per-role projections and by text()."""
+        msg = row.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(b.get("text", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text")
+        return ""
+
     def _texts(self, role: str) -> list:
         out = []
         for row in self.messages:
             if row.get("type") != role:
                 continue
-            content = row.get("message", {}).get("content")
-            if isinstance(content, str):
-                out.append(content)
-            elif isinstance(content, list):
-                t = "".join(b.get("text", "") for b in content
-                            if isinstance(b, dict) and b.get("type") == "text")
-                if t:
-                    out.append(t)
+            t = self._row_text(row)
+            if t:
+                out.append(t)
         return out
 
     def user(self) -> list:
@@ -67,7 +75,20 @@ class Transcript:
         return [row for row in self.messages if rx.search(json.dumps(row))]
 
     def text(self) -> str:
-        return "\n".join(self.user() + self.assistant())
+        """The conversation as text, in the order the JSONL recorded it.
+
+        Projecting all user turns and then all assistant turns (what this did before)
+        reads as a plausible conversation while saying who answered what wrongly — the
+        one thing a lossless-recall lever must not do.
+        """
+        out = []
+        for row in self.messages:
+            if row.get("type") not in ("user", "assistant"):
+                continue
+            t = self._row_text(row)
+            if t:
+                out.append(t)
+        return "\n".join(out)
 
 
 def history(session: str | None = None, cwd: str | None = None) -> Transcript:

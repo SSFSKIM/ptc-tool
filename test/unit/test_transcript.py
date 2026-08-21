@@ -39,6 +39,32 @@ def test_history_resolves_and_projects(tmp_path, monkeypatch):
     assert "an answer" in h.text()
 
 
+def test_text_preserves_chronology(tmp_path, monkeypatch):
+    """text() is the whole conversation as text, so it must read in the order it happened.
+
+    Concatenating every user turn and then every assistant turn produced a plausible-
+    looking transcript that attributed the wrong answer to the wrong question — the one
+    failure a lossless-recall lever cannot have.
+    """
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "q1"}},
+        {"type": "assistant", "message": {"role": "assistant",
+                                          "content": [{"type": "text", "text": "a1"}]}},
+        {"type": "user", "message": {"role": "user", "content": "q2"}},
+        {"type": "assistant", "message": {"role": "assistant",
+                                          "content": [{"type": "text", "text": "a2"}]}},
+    ]
+    d = tmp_path / ".claude" / "projects" / "-two-turn"
+    d.mkdir(parents=True)
+    (d / "s-2t.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    t = transcript.history("s-2t", cwd="/two/turn")
+
+    assert t.text() == "q1\na1\nq2\na2"
+    assert t.user() == ["q1", "q2"] and t.assistant() == ["a1", "a2"]
+
+
 def test_history_glob_fallback(tmp_path, monkeypatch):
     _fake_home(tmp_path, monkeypatch, cwd="/other/place")
     h = transcript.history("s-42", cwd="/wrong/cwd")     # munge misses; glob finds

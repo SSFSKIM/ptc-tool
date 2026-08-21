@@ -1,5 +1,8 @@
 from pathlib import Path
-from ptc.paths import Config, MAX_OUTPUT_CLAMP, kernel_dir, ptc_home, safe_key
+
+import pytest
+
+from ptc.paths import Config, MAX_OUTPUT_CLAMP, kernel_dir, kernels_root, ptc_home, safe_key
 
 
 def test_ptc_home_env_override(monkeypatch, tmp_path):
@@ -31,3 +34,23 @@ def test_config_bad_values_fall_back():
 def test_safe_key():
     assert safe_key("96abe6e2-80aa") == "96abe6e2-80aa"
     assert safe_key("a/b c!") == "a-b-c-"
+
+
+def test_safe_key_neutralizes_dot_segments(monkeypatch, tmp_path):
+    """"." and ".." survived sanitization as themselves, so kernel_dir() resolved to the
+    kernels root or its PARENT — every lifecycle write (owner.json, cells/, the group
+    kill on restart) then landed outside the key's own namespace."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    for raw in (".", "..", "", "...", "./", "../"):
+        key = safe_key(raw)
+        assert key not in ("", ".", "..")
+        d = kernel_dir(key)
+        assert d.parent == kernels_root(), (raw, key, d)
+        assert safe_key(key) == key, "safe_key must be idempotent"
+
+
+def test_kernel_dir_rejects_a_key_that_is_not_a_name(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    for bad in ("", ".", "..", "../escape", "a/b"):
+        with pytest.raises(ValueError, match="unsafe kernel key"):
+            kernel_dir(bad)

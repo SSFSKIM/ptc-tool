@@ -60,7 +60,9 @@ those live in `agents.json` and stay resumable through `agent.list()` / `agent.r
 
 `ptc list | doctor` inspect this machine's kernels from any shell; `ptc exec | wait |
 interrupt | kill | restart` act on one kernel. Those five take `--session`; with none
-given the CLI picks the newest live kernel and prints which one it picked.
+given the CLI picks the newest live kernel and prints which one it picked. `ptc kill
+--all` ends every kernel whose ownership still checks out, and `ptc doctor` only reports
+— it prints what `ptc setup` would provision rather than provisioning anything itself.
 
 ## Codex (documented, untested)
 

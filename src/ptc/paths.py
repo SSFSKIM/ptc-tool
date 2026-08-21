@@ -24,7 +24,16 @@ def kernels_root() -> Path:
 
 
 def kernel_dir(key: str) -> Path:
-    return kernels_root() / key
+    """The one directory a key owns. A key is a NAME, never a path expression: `.` and
+    `..` would resolve to the kernels root or its parent, and every lifecycle write that
+    follows (owner.json, cells/, the recursive kill on restart) would land outside the
+    namespace. safe_key() neutralizes those segments; this is the assertion that it did.
+    """
+    root = kernels_root()
+    d = root / key
+    if key in ("", ".", "..") or d.parent != root:
+        raise ValueError(f"unsafe kernel key {key!r}: not a single name under {root}")
+    return d
 
 
 def cells_dir(key: str) -> Path:
@@ -32,7 +41,12 @@ def cells_dir(key: str) -> Path:
 
 
 def safe_key(raw: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "-", raw)[:128]
+    key = re.sub(r"[^A-Za-z0-9._-]", "-", raw)[:128]
+    # Separators are already mapped away, but an all-dots (or empty) result is still a
+    # path segment rather than a name — "." is the kernels root itself and ".." its
+    # parent. Prefix it into a literal name; the mapping is idempotent, so a key that
+    # already went through here comes back unchanged.
+    return "key-" + key if key.strip(".") == "" else key
 
 
 @dataclass
