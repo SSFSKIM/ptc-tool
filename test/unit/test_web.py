@@ -226,6 +226,19 @@ def test_parse_blocks_dedupes_by_url():
     assert len(out) == 3
 
 
+def test_parse_blocks_empty_links_is_zero_results_not_a_prose_scrape():
+    """A genuine `Links: []` (a niche or over-constrained query) must return NO results —
+    not fall through to the prose fallback and hand back urls the model merely mentioned
+    while explaining the empty search. That prose is exactly what the promoted path exists
+    to discard; treating it as a source of hits would fabricate results for a search that
+    found nothing."""
+    class T:
+        content = ('Web search results for query: "x"\n\nLinks: []\n\n'
+                   "I could not find results, but see https://made-up.example/doc "
+                   "for background.")
+    assert _parse_blocks([T()]) == []
+
+
 # -- selection and domain filtering ---------------------------------------
 
 class _Use:
@@ -247,6 +260,16 @@ def test_select_prefers_correlated_websearch_results():
 def test_select_falls_back_to_everything_when_nothing_correlates():
     seen = [("t1", _Res("t1", "a")), ("t2", _Res("t2", "b"))]
     assert [b.content for b in _select(seen, {})] == ["a", "b"]
+
+
+def test_select_returns_nothing_when_correlation_names_a_different_tool():
+    """Correlation succeeding and naming a non-WebSearch tool is a real answer — no
+    WebSearch ran — and must not widen to scrape that other tool's output for urls. The
+    over-collect fallback is reserved for when correlation was impossible altogether
+    (`tool_names` empty), not for when it worked and said "not this one"."""
+    seen = [("t1", _Res("t1", "ran ls: see https://evil.example/x"))]
+    names = {"t1": "Bash"}
+    assert _select(seen, names) == []
 
 
 @pytest.mark.parametrize("url,allowed,blocked,ok", [

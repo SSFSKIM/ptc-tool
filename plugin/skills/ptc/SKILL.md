@@ -97,9 +97,12 @@ stays either way.
 `web_search(query, *, allowed_domains=None, blocked_domains=None, max_results=10,
 timeout=300)` returns the search tool's own hits, not a model write-up. Each
 `SearchResult` carries `.title`, `.url`, `.raw`; `.snippet` is empty because the tool
-returns title and url only — call `web_fetch` on a url when you need the content. It runs
-a scoped sub-agent, so it shares the `agent`/`llm` concurrency cap and is not free; one
-search then fan-out `web_fetch` beats repeated searching.
+returns title and url only — call `web_fetch` on a url when you need the content.
+`max_results` only truncates: the model decides how many hits come back (observed: 8),
+PTC just slices to at most `max_results` of them — asking for more than the tool found
+does not make it search harder. It runs a scoped sub-agent, so it shares the `agent`/`llm`
+concurrency cap and is not free; one search then fan-out `web_fetch` beats repeated
+searching.
 
 ## History (coming in M3)
 

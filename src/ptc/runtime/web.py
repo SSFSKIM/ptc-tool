@@ -135,7 +135,13 @@ async def web_fetch(url: str, *, prompt: str | None = None,
 
 def _results_from_text(text: str) -> list[SearchResult]:
     """One tool_result's text → hits. S6's `Links:` JSON first; prose regex only if it
-    is absent, so the model's narrative URLs never dilute a good structured answer."""
+    is absent, so the model's narrative URLs never dilute a good structured answer.
+
+    A well-formed `Links:` payload always wins, even an EMPTY one (`Links: []`): a
+    genuine zero-result search must return zero hits, not fall through and scrape the
+    model's write-up for urls it merely mentions — that write-up is exactly the prose
+    this function exists to discard, not a source of results.
+    """
     m = _LINKS_RE.search(text)
     if m:
         try:
@@ -143,11 +149,9 @@ def _results_from_text(text: str) -> list[SearchResult]:
         except json.JSONDecodeError:
             items = None
         if isinstance(items, list):
-            hits = [SearchResult(str(d.get("title") or "").strip(), d["url"],
+            return [SearchResult(str(d.get("title") or "").strip(), d["url"],
                                  str(d.get("snippet") or ""), raw=d)
                     for d in items if isinstance(d, dict) and d.get("url")]
-            if hits:
-                return hits
     return [SearchResult((mm.group(1) or mm.group(2) or "").strip(), mm.group(3), raw=text)
             for mm in _PROSE_LINK_RE.finditer(text)]
 
@@ -183,13 +187,16 @@ def _select(seen: list, tool_names: dict) -> list:
     """Of every tool_result block in the stream, the ones that came from a web search.
 
     Prefer results correlated to an actual WebSearch `tool_use` id; fall back to every
-    tool result only when NO correlation was possible, so a change in how tool_use ids
-    are reported degrades into over-collecting rather than into silently returning
-    nothing. Over-collecting is visible (odd urls); returning nothing looks like "the
-    web had no answer".
+    tool result only when NO correlation was possible at all, so a change in how
+    tool_use ids are reported degrades into over-collecting rather than into silently
+    returning nothing. Over-collecting is visible (odd urls); returning nothing looks
+    like "the web had no answer". But when correlation DID work and every known id names
+    a different tool, that is a real answer — no WebSearch ran — and must not widen to
+    scrape whatever else the stream happened to carry: another tool's output can never
+    be presented as search results.
     """
     picked = [b for tid, b in seen if tool_names.get(tid) in _WEB_TOOL_NAMES]
-    return picked or [b for _, b in seen]
+    return picked or ([] if tool_names else [b for _, b in seen])
 
 
 def _domain_ok(url: str, allowed: list | None, blocked: list | None) -> bool:
@@ -217,6 +224,11 @@ async def web_search(query_text: str, *, allowed_domains: list | None = None,
     Always returns `list[SearchResult]`: on the S6-pinned shape the fields are mapped from
     the tool's JSON; if that payload is ever missing, the same list comes back from a
     best-effort prose scrape with `.raw` holding the source block.
+
+    `max_results` is truncation-only: the model decides how many hits the search tool
+    turns up (S6/A7 observed 8), and PTC just slices the list down to at most
+    `max_results` of them. A caller asking for more than the tool returned silently
+    gets fewer — there is no way to make the tool search harder or return more hits.
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
     audit.append("web_search", query=query_text[:200])
