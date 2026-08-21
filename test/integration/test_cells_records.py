@@ -44,3 +44,25 @@ def test_error_cell_records_error(ptc_home):
     assert "ZeroDivisionError" in out.output      # IPython traceback went to the log
     assert current_cell("c2") == out.cell_id       # current.json points at last cell (done)
     kill_kernel("c2")
+
+
+def test_a_result_whose_repr_raises_still_settles_the_cell(ptc_home):
+    """`repr()` is user code. When it raised, the terminal record was never written, so
+    current.json went on naming a cell that would never get one — and every later
+    submission reported the kernel busy until somebody restarted it."""
+    ensure_kernel("c9", cwd=str(ptc_home))
+    kc = KernelClient("c9")
+    out = kc.exec_cell(
+        "class Hostile:\n"
+        "    def __repr__(self): raise ValueError('no repr for you')\n"
+        "Hostile()",
+        timeout_s=60, config=Config.from_env())
+    assert isinstance(out, Completed), out
+
+    rec = read_record("c9", out.cell_id)
+    assert rec is not None, "the cell never got a terminal record"
+    assert "repr raised ValueError: no repr for you" in (rec.result_repr or "")
+
+    nxt = kc.exec_cell("print('admitted')", timeout_s=60, config=Config.from_env())
+    assert isinstance(nxt, Completed) and "admitted" in nxt.output
+    kill_kernel("c9")

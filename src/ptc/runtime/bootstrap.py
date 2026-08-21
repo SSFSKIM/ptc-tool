@@ -70,6 +70,25 @@ def _write_json_atomic(path: Path, obj) -> None:
     private_write_text(path, json.dumps(obj), tmp=path.with_suffix(path.suffix + ".tmp"))
 
 
+def _safe(fmt, fallback: str) -> str:
+    """Run a formatting step that executes USER code, and never let it end the cell.
+
+    `repr()`, `str()` and traceback rendering all call into objects the cell defined, and
+    any of them can raise. The terminal record is the only thing that ends a cell: if
+    formatting escapes this callback, current.json goes on naming a cell that will never
+    get a record and every later submission reports the kernel busy until it is restarted.
+    So a formatting failure becomes text, and the record is always written.
+    """
+    try:
+        out = fmt()
+    except BaseException as e:              # noqa: BLE001 — a bad __repr__ is not our bug
+        try:
+            return f"<{fallback} raised {type(e).__name__}: {str(e)[:200]}>"
+        except BaseException:               # noqa: BLE001 — and neither is a bad __str__
+            return f"<{fallback} raised>"
+    return out if isinstance(out, str) else f"<{fallback} returned {type(out).__name__}>"
+
+
 def _cell_no(ip, info) -> int:
     """IPython increments execution_count BEFORE pre_run_cell fires when history is
     stored, so the starting cell's number is count-1 in the store_history case (plan
@@ -104,11 +123,13 @@ def _post_run_cell(result):
         status, error = "interrupted", {"ename": "KeyboardInterrupt", "evalue": "", "traceback": ""}
     else:
         status = "error"
-        error = {"ename": type(err).__name__, "evalue": str(err)[:2000],
-                 "traceback": "".join(traceback.format_exception(err))[-8000:]}
+        error = {"ename": _safe(lambda: type(err).__name__, "ename"),
+                 "evalue": _safe(lambda: str(err), "str")[:2000],
+                 "traceback": _safe(lambda: "".join(traceback.format_exception(err)),
+                                    "traceback")[-8000:]}
     rr = None
     if getattr(result, "result", None) is not None:
-        rr = repr(result.result)[:_MAX_REPR]
+        rr = _safe(lambda: repr(result.result), "repr")[:_MAX_REPR]
     record = {"status": status, "duration_ms": dur, "result_repr": rr, "error": error,
               "images": list(STATE.cell_images), "mutations": list(STATE.cell_mutations)}
     _write_json_atomic(cells() / f"{n}.json", record)
