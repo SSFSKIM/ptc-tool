@@ -19,7 +19,7 @@ from .cells import (
 )
 from .kernel import kernel_alive
 from .lock import submit_lock
-from .ownership import read_owner
+from .ownership import UnknownOwner, read_owner, settled_owner_state
 from .paths import Config, kernel_dir, private_write_text, secure_dir
 from .venv import venv_python  # noqa: F401  (imported for kernel spawn parity)
 
@@ -118,6 +118,34 @@ class KernelClient:
                 return int(msg["content"]["execution_count"])
         raise TimeoutError("kernel never acknowledged the cell (no execute_input)")
 
+    def _kernel_known_dead(self) -> bool:
+        """PROOF that nothing can still be running under this key — never a guess.
+
+        `kernel_alive()` collapses an identity it could not read to "not alive", which is
+        the right pessimism for a row in `ptc list` and the wrong one here: every caller
+        below DISCHARGES something on this verdict — the admission marker, a running
+        cell's settlement — so one transient `ps`/libproc failure against a LIVE kernel
+        threw away the guard that keeps a second cell off an in-flight one, or settled a
+        running cell as KernelDied. The question is therefore inverted: unknown reads as
+        "still there", and the caller stays busy or keeps polling until the identity can
+        be read again (poll loops ask afresh 0.2 s later; `wait_cell`'s deadline still
+        returns an honest Running).
+
+        Costs what `kernel_alive` cost in the reachable case — `settled_owner_state`
+        retries only the read that came back unknown — so the 0.2 s poll loops are
+        unchanged except in the failure they exist to survive. The absent `ready` file and
+        the absent `owner.json` are proof of their own: no identity read is involved.
+        """
+        o = read_owner(self.key)
+        if o is None:
+            return True
+        try:
+            if not settled_owner_state(o):
+                return True
+        except UnknownOwner:
+            return False
+        return not (kernel_dir(self.key) / "ready").exists()
+
     def _settle_dead(self, cell_id: int, offset: int) -> Completed:
         """No kernel is answering: settle the cell from whatever it left behind.
 
@@ -179,11 +207,14 @@ class KernelClient:
                 arch = self._archived(cell_id, 0)
                 if arch is not None:
                     return arch
-            if not kernel_alive(self.key):
+            if self._kernel_known_dead():
                 # The cell took the kernel down with it — os._exit, a segfault, an OOM
                 # kill. Polling for a record nothing can write any more burns the whole
                 # yield budget (300 s by default) and then calls the cell Running, which
                 # is false twice over. wait_cell has answered this correctly since F3.
+                # PROOF of death, not `kernel_alive`'s absence of proof of life: settling
+                # a running cell as KernelDied because one identity read failed is a
+                # terminal answer invented out of nothing (`_kernel_known_dead`).
                 return self._settle_dead(cell_id, 0)
             time.sleep(0.2)
         out, off = read_output_since(self.key, cell_id, 0)
@@ -199,7 +230,8 @@ class KernelClient:
     # inside it).
     def is_busy(self) -> Busy | None:
         cur = current_cell(self.key)
-        if cur is not None and read_record(self.key, cur) is None and kernel_alive(self.key):
+        if cur is not None and read_record(self.key, cur) is None \
+                and not self._kernel_known_dead():
             return Busy(cur, reason="running")
         pend = kernel_dir(self.key) / "cells" / "pending.json"
         try:
@@ -227,7 +259,7 @@ class KernelClient:
         guarantee this whole path exists to keep: nothing is ever silently queued.
 
         Three things do discharge it, and only these three:
-          * the kernel that took the request is gone, or came back as a different
+          * the kernel that took the request is PROVABLY gone, or came back as a different
             INCARNATION — whatever it accepted died with it. Incarnation is the epoch and
             the nonce together (`_owner_identity`): the epoch is a whole-second timestamp,
             so a restart inside one second leaves the marker of the kernel it replaced
@@ -239,8 +271,13 @@ class KernelClient:
             one can only have started after ours left the queue.
         With none of them the verdict stays busy. The escape hatch for a request whose id
         was never learned is restart(), which archives cells/ and the marker with it.
+
+        "Provably gone" is the whole of the first one. This opened with `kernel_alive()`,
+        whose unknown reads as dead, and the caller UNLINKS the marker on a discharge — so
+        a single unreadable identity on a live kernel admitted a second cell on top of the
+        one it was still running (`_kernel_known_dead`).
         """
-        if not kernel_alive(self.key):
+        if self._kernel_known_dead():
             return True
         o = read_owner(self.key)
         if o is not None:
@@ -495,9 +532,16 @@ class KernelClient:
                 # mistyped id or one from another session and no later moment makes it
                 # valid. The one exception is a cell the kernel acknowledged and has not
                 # started yet; the marker names that one, and it is genuinely pending.
+                #
+                # `kernel_alive` and not `_kernel_known_dead` on purpose, and it is the one
+                # place in this file where that is so: NotFound is as terminal for the
+                # caller as KernelDied, and it is claimed only on POSITIVE evidence of a
+                # live kernel. An unreadable identity collapses to "not alive" here, which
+                # declines to make the claim and keeps polling — the conservative
+                # direction, the same one the branch below now takes deliberately.
                 if kernel_alive(self.key) and not self._pending_names(cell_id):
                     return NotFound(cell_id)
-            if not kernel_alive(self.key):
+            if self._kernel_known_dead():
                 return self._settle_dead(cell_id, offset)
             if time.monotonic() >= deadline:
                 text, new_off = read_output_since(self.key, cell_id, offset)

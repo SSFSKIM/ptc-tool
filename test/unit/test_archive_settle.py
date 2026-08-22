@@ -279,3 +279,46 @@ def test_a_huge_archived_log_is_read_in_bounded_slices(monkeypatch, tmp_path):
 
     second = kc._archived(1, default_offset("a5", 1))
     assert second.output.split("\n[cell ")[0] == tail
+
+
+# --- r12 finding 1: a cell is never settled dead on an identity nobody could read ------
+
+def _unreadable_identity(monkeypatch):
+    """A transient `ps`/libproc failure against a LIVE kernel: the pid answers signal 0
+    and its birth identity does not come back, which `kernel_alive` collapsed to dead."""
+    from ptc import ownership
+    monkeypatch.setattr(ownership, "proc_start_time", lambda *a, **kw: None)
+
+
+def test_follow_keeps_waiting_when_the_kernels_identity_cannot_be_read(monkeypatch,
+                                                                       tmp_path):
+    """One failed identity read turned a cell that is still running into KernelDied —
+    a fabricated verdict, and a terminal one. Unknown means keep polling; the yield
+    budget still ends in an honest Running."""
+    from ptc.client import Running
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("u1")
+    (kd / "cells" / "3.log").write_text("working\n")
+    _unreadable_identity(monkeypatch)
+
+    out = KernelClient("u1")._follow(3, timeout_s=0.5)
+
+    assert isinstance(out, Running), f"a running cell was settled dead: {out}"
+    assert "working" in out.output
+
+
+def test_wait_keeps_waiting_when_the_kernels_identity_cannot_be_read(monkeypatch,
+                                                                     tmp_path):
+    """`wait_cell` took the same branch from the other door."""
+    from ptc.client import Running
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("u2")
+    (kd / "cells" / "3.log").write_text("working\n")
+    _unreadable_identity(monkeypatch)
+
+    out = KernelClient("u2").wait_cell(3, timeout_s=0.5)
+
+    assert isinstance(out, Running), f"a running cell was settled dead: {out}"
+    assert "working" in out.output

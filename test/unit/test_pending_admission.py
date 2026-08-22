@@ -353,3 +353,40 @@ def test_the_marker_records_the_nonce_it_was_stamped_with(monkeypatch, tmp_path)
 
     data = json.loads((kd / "cells" / "pending.json").read_text())
     assert data["epoch"] == "e1" and data["nonce"] == "nonce-1", data
+
+
+# --- r12 finding 1: an UNKNOWN identity discharges nothing -----------------------------
+
+def _unreadable_identity(monkeypatch):
+    """What a transient `ps`/libproc failure looks like to `owner_state`: the pid is ours
+    and answers signal 0, and its birth identity cannot be read — the third answer, which
+    `owner_alive` (and so `kernel_alive`) collapses to "not alive"."""
+    from ptc import ownership
+    monkeypatch.setattr(ownership, "proc_start_time", lambda *a, **kw: None)
+
+
+def test_an_unreadable_identity_never_discharges_the_marker(monkeypatch, tmp_path):
+    """`_pending_discharged` opened with `not kernel_alive(...)`, and its caller UNLINKS
+    the marker on that verdict — so one failed identity read against a LIVE kernel threw
+    away the admission guard and let a second cell be submitted on top of an in-flight
+    one. Unknown is not death: the marker holds until the kernel can be identified."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p16")
+    _mark(kd, 4)
+    _unreadable_identity(monkeypatch)
+
+    assert KernelClient("p16").is_busy() == Busy(4, reason="pending-unconfirmed")
+    assert (kd / "cells" / "pending.json").exists(), \
+        "the marker was discharged on an identity nobody could read"
+
+
+def test_an_unreadable_identity_keeps_a_running_cell_busy(monkeypatch, tmp_path):
+    """The same collapse one branch earlier: current.json names a cell with no terminal
+    record — the kernel is running it — and an unreadable identity made `is_busy` fall
+    straight through to "not busy". Admission fails closed on unknown."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p17")
+    (kd / "cells" / "current.json").write_text(json.dumps({"cell_id": 7}))
+    _unreadable_identity(monkeypatch)
+
+    assert KernelClient("p17").is_busy() == Busy(7, reason="running")
