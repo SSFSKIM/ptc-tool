@@ -10,6 +10,8 @@ from .cells import (
     CellRecord,
     current_cell,
     default_offset,
+    offset_name,
+    offset_path,
     read_output_since,
     read_record,
     read_since,
@@ -419,7 +421,7 @@ class KernelClient:
             log = d / f"{cell_id}.log"
             if not log.exists():
                 continue
-            text, new_off = read_since(log, offset)
+            text, new_off = read_since(log, self._archived_start(d, cell_id, offset))
             save_offset(self.key, cell_id, new_off)
             try:
                 rec = json.loads((d / f"{cell_id}.json").read_text())
@@ -433,6 +435,31 @@ class KernelClient:
             note = f"\n[cell {cell_id} belongs to a previous kernel epoch — archived at {d}]"
             return Completed(cell_id, record, text + note, log_path=log)
         return None
+
+    def _archived_start(self, d: Path, cell_id: int, offset: int) -> int:
+        """Where an archived read really starts for THIS caller.
+
+        A restart renames `cells/` — every caller's cursor sidecar inside it — and puts a
+        fresh empty `cells/` in its place, so `default_offset` answers 0 for a long-lived
+        adapter that has already been served this cell. The archived read then replayed the
+        whole log, which is the per-caller cursor contract broken by the one event that
+        moves the cursor out from under it. The rotation kept the sidecar; it just moved it,
+        so the archive is asked for it under the same name.
+
+        Consulted only when this caller has NO live sidecar: a live cursor and an explicit
+        `since=` both still win, and the archived answer is a fallback rather than an
+        override. An archived 0 is indistinguishable from a genuine start-at-zero here, and
+        that is fine — both mean "from the top", which is what start-at-zero asks for.
+
+        Ambiguity recorded rather than fixed: once the new epoch hands out this cell id
+        again, the live and archived cursors share a key. The live path wins by design.
+        """
+        if offset or offset_path(self.key, cell_id).exists():
+            return offset
+        try:
+            return int((d / "offsets" / offset_name(cell_id)).read_text())
+        except (OSError, ValueError):
+            return offset
 
     def _pending_names(self, cell_id: int) -> bool:
         """Is this the cell the sent-but-unconfirmed marker names?

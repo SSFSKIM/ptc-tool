@@ -94,17 +94,28 @@ def cursor_owner() -> str:
     return _CURSOR_OWNER[1]
 
 
-def _offset_path(key: str, cell_id: int):
-    return cells_dir(key) / "offsets" / f"{cell_id}.{cursor_owner()}.offset"
+def offset_name(cell_id: int) -> str:
+    """This caller's cursor sidecar, by name.
+
+    Public because the sidecar outlives the directory it was written in: a restart renames
+    `cells/` — `offsets/` and all — into `cells-prev-*`, so an ARCHIVED epoch carries its
+    own copy of this file, and `client._archived` has to look this caller's cursor up
+    there under the same name (r11).
+    """
+    return f"{cell_id}.{cursor_owner()}.offset"
+
+
+def offset_path(key: str, cell_id: int):
+    return cells_dir(key) / "offsets" / offset_name(cell_id)
 
 
 def default_offset(key: str, cell_id: int) -> int:
     try:
-        return int(_offset_path(key, cell_id).read_text())
+        return int(offset_path(key, cell_id).read_text())
     except (OSError, ValueError):
         return 0
 
 
 def save_offset(key: str, cell_id: int, offset: int) -> None:
     secure_dir(cells_dir(key) / "offsets")
-    _offset_path(key, cell_id).write_text(str(offset))
+    offset_path(key, cell_id).write_text(str(offset))

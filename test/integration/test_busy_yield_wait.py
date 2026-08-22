@@ -160,7 +160,15 @@ def test_wait_on_archived_epoch_cell(ptc_home):
     restart_kernel("y3")
     w = KernelClient("y3").wait_cell(old_id, timeout_s=5)
     assert isinstance(w, Completed)
-    assert "previous kernel epoch" in w.output and "old-epoch" in w.output
+    assert "previous kernel epoch" in w.output
+    # ...and NOT the log line the yield above already handed THIS caller. A restart renames
+    # `cells/` with its `offsets/` inside it, so this cursor did not vanish, it moved — and
+    # the archived read looks it up where it went (r11 finding 4). Until then every epoch
+    # rotation reset every long-lived adapter to 0 and replayed what it had already served,
+    # which is the one thing the per-caller cursor exists to prevent.
+    assert "old-epoch" not in w.output
+    # the archived log itself is intact, and an explicit cursor still outranks all of it
+    assert "old-epoch" in KernelClient("y3").wait_cell(old_id, timeout_s=5, since=0).output
     # the archive honors the cursor too: settling it advanced the sidecar, so a repeat
     # wait re-states which epoch the cell belongs to without replaying its log
     again = KernelClient("y3").wait_cell(old_id, timeout_s=5)

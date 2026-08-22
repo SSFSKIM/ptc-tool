@@ -93,6 +93,35 @@ def test_a_forked_child_does_not_inherit_its_parents_cursor(monkeypatch, tmp_pat
     assert "the whole output" in seen, "the forked child inherited the parent's cursor"
 
 
+def test_an_epoch_rotation_does_not_replay_what_this_caller_already_read(monkeypatch,
+                                                                        tmp_path):
+    """A restart renames `cells/` — every caller's cursor sidecar inside it — and puts a
+    fresh empty `cells/` in its place, so `default_offset` answered 0 for a long-lived
+    adapter that had already been served this cell. `wait(cell_id, since=-1)` then replayed
+    the whole cell out of the archive: the per-caller cursor contract, broken by the one
+    event that moves the cursor out from under it.
+
+    The archive keeps its own `offsets/` beside its logs, under the same per-caller
+    filename, and that is what the archived read consults when this caller has no LIVE
+    cursor. A live cursor still wins — the live path always does.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _seed("c6", 8, "already delivered\n")
+
+    kc = KernelClient("c6")
+    assert "already delivered" in kc.wait_cell(8, timeout_s=10).output
+
+    from ptc.kernel import _rotate_cells
+    from ptc.paths import kernel_dir
+    _rotate_cells(kernel_dir("c6"))
+    secure_dir(cells_dir("c6") / "offsets")
+
+    out = kc.wait_cell(8, timeout_s=10)
+    assert isinstance(out, Completed) and "previous kernel epoch" in out.output
+    assert "already delivered" not in out.output, \
+        "the epoch rotation replayed output this caller had already been served"
+
+
 def test_an_explicit_cursor_is_still_the_cross_process_contract(monkeypatch, tmp_path):
     """`since=` is what one process hands another (every `Running` render prints it), and
     it must keep meaning the same offset regardless of which caller carries it."""
