@@ -13,9 +13,32 @@ MAX_OUTPUT_CLAMP = 50_000
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
+#: (raw PTC_HOME, resolved absolute path) — see ptc_home().
+_HOME: tuple[str, Path] | None = None
+
 
 def ptc_home() -> Path:
-    return Path(os.environ.get("PTC_HOME") or (Path.home() / ".ptc"))
+    """PTC_HOME, always absolute and `~`-expanded.
+
+    A relative PTC_HOME resolves against the working directory of whoever reads it, and
+    PTC's processes do not share one: the adapter reads it beside itself, `ensure_kernel`
+    hands the same relative string to a kernel it starts in the session's `cwd`, and an
+    `agent(..., cwd=…)` child gets a third answer — three processes provisioning and reading
+    three different registries under one name, none of them able to see the others' kernels.
+    Anchoring it here anchors every path in this module, and the absolute form is what
+    `ensure_kernel` exports to the kernel and its children (`PTC_HOME=kernels_root().parent`).
+
+    Resolved ONCE per value: a process that moves after it has provisioned state must not
+    start reading a second home, so the answer is cached against the raw setting and only
+    recomputed when the setting itself changes.
+    """
+    raw = os.environ.get("PTC_HOME")
+    if not raw:
+        return Path.home() / ".ptc"       # already absolute; left as the user's own path
+    global _HOME
+    if _HOME is None or _HOME[0] != raw:
+        _HOME = (raw, Path(raw).expanduser().resolve())
+    return _HOME[1]
 
 
 def venv_dir() -> Path:

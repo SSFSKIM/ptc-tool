@@ -22,6 +22,33 @@ def test_ptc_home_env_override(monkeypatch, tmp_path):
     assert kernel_dir("abc") == tmp_path / "home" / "kernels" / "abc"
 
 
+def test_a_relative_ptc_home_is_anchored_once(monkeypatch, tmp_path):
+    """A relative PTC_HOME resolved against whatever working directory each reader happened
+    to have: the adapter provisioned one home, the kernel it started in the session's cwd
+    read another, an `agent(..., cwd=…)` child a third — three registries under one name,
+    none of them seeing the others' kernels. It is anchored once, and what a spawned kernel
+    inherits (`PTC_HOME=kernels_root().parent`) is absolute, so every process agrees."""
+    import ptc.paths as paths
+
+    (tmp_path / "adapter").mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.setattr(paths, "_HOME", None)
+    monkeypatch.setenv("PTC_HOME", "state")
+    monkeypatch.chdir(tmp_path / "adapter")
+    home = ptc_home()
+    assert home.is_absolute() and home == tmp_path / "adapter" / "state"
+    assert kernel_dir("abc") == home / "kernels" / "abc"
+    assert Path(str(kernels_root().parent)).is_absolute(), "the kernel would inherit a relative home"
+
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    assert ptc_home() == home, "one process, one home — it moved with the working directory"
+
+
+def test_ptc_home_expands_a_user_path(monkeypatch):
+    monkeypatch.setenv("PTC_HOME", "~/.ptc-elsewhere")
+    assert ptc_home() == Path.home().resolve() / ".ptc-elsewhere"
+
+
 def test_config_defaults():
     cfg = Config.from_env(env={})
     assert (cfg.yield_s, cfg.max_output_chars, cfg.idle_hours) == (300.0, 12_000, 24.0)
