@@ -688,9 +688,21 @@ class KernelClient:
 
     def _exec_raw(self, code: str, timeout_s: float) -> Completed | Running:
         """Bootstrap-only path: no submit lock, no current.json wait (the hooks are
-        installed by the very cell this runs). Follows the shell execute_reply."""
+        installed by the very cell this runs). Follows the shell execute_reply.
+
+        Synchronized before it sends, and here that is not belt-and-braces: it is the only
+        protection this path has. Every other submission survives a missed `execute_input`
+        because the kernel-side pre_run_cell publishes the same number to current.json, but
+        THAT HOOK IS INSTALLED BY THIS CELL — during bootstrap the file cannot advance, so
+        `_await_cell_id`'s disk witness is structurally dead and the racy SUB channel is the
+        only one that can name the cell. Losing that race timed the wait out and the caller
+        killed a healthy fresh kernel. `wait_for_ready` is a kernel_info round trip, which
+        needs no hooks; failing it is an ordinary spawn failure (`run_bootstrap`'s caller
+        tears the kernel down), and nothing has been sent when it does.
+        """
         kc = self._connect()
         try:
+            kc.wait_for_ready(timeout=_READY_S)
             # The key lock is `ensure_kernel`'s for the whole of this call and cells/ was
             # rotated moments ago, so the baseline is the same fact it is on the submission
             # path: whatever current.json named before this request, under exclusion.

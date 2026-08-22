@@ -457,3 +457,50 @@ def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_p
     assert kc.ready_waits == 1, "the submission never waited for the subscription handshake"
     assert not (kd / "cells" / "pending.json").exists(), "an undischargeable marker was left"
     assert KernelClient("p20").is_busy() is None, "the key stayed busy for good"
+
+
+# --- r15 finding 1: the bootstrap client has no disk witness, so it must synchronize ----
+
+class _UnsynchronizedKC:
+    """A bootstrap connection whose iopub has not finished subscribing.
+
+    `execute` records the order the client did things in and then stops the call dead:
+    what is under test is whether the handshake happened BEFORE the send, not what the
+    kernel would have answered afterwards.
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def wait_for_ready(self, timeout=None):
+        self.calls.append("ready")
+
+    def execute(self, code, **kw):
+        self.calls.append("execute")
+        raise _Killed()
+
+    def stop_channels(self):
+        pass
+
+
+def test_the_bootstrap_client_synchronizes_before_it_sends(monkeypatch, tmp_path):
+    """The bootstrap path is the one place where the disk witness cannot exist.
+
+    Every other submission survives a missed `execute_input` because the kernel-side
+    pre_run_cell publishes the same number to current.json — but that hook is installed BY
+    the bootstrap cell, so during bootstrap current.json can never advance and only the
+    racy SUB channel can name the cell. A `_connect()` that sends immediately therefore
+    loses the subscription race outright: `_await_cell_id` waits out its whole budget and
+    raises, and the caller kills a perfectly healthy fresh kernel. The handshake is the
+    only protection this path has, so it happens before anything goes on the wire.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _live_kernel("b1")
+    kc = _UnsynchronizedKC()
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: kc)
+
+    with pytest.raises(_Killed):
+        KernelClient("b1")._exec_raw("import ptc.runtime.bootstrap", timeout_s=1.0)
+
+    assert kc.calls == ["ready", "execute"], \
+        f"the bootstrap cell went out on an unsynchronized connection: {kc.calls}"
