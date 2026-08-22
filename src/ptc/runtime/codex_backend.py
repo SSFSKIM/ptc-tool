@@ -129,6 +129,13 @@ _RESPONDERS = {
     "item/tool/requestUserInput": lambda p: {"answers": {}},
     "item/tool/call": lambda p: {"contentItems": [{"type": "inputText", "text": _UNATTENDED}],
                                  "success": False},
+    # `features.current_time_reminder` with `clock_source = "external"` makes the server ask
+    # its CLIENT what time it is, once per reminder interval, and abort the turn when the
+    # answer does not come. PTC inherits the user's `~/.codex/config.toml`, so the setting
+    # arrives from outside and cannot be refused into a working turn: the honest answer is
+    # this machine's clock, which is also the clock the child's own `system` source would
+    # have read. `currentTimeAt` is whole Unix seconds (`CurrentTimeReadResponse`).
+    "currentTime/read": lambda p: {"currentTimeAt": int(time.time())},
 }
 
 

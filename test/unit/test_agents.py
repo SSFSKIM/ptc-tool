@@ -796,6 +796,52 @@ def test_two_sessions_sharing_an_eight_char_prefix_get_distinct_handles(tmp_path
     assert {h1.name, h2.name} <= {e["name"] for e in a.list()}
 
 
+def test_a_persisted_row_survives_a_resume_that_shares_its_prefix(tmp_path):
+    """A restart empties `_handles` and leaves `agents.json` standing on purpose — that
+    file IS the list of sessions still resumable. Keyed on live handles alone, the first
+    resume after a restart whose id shared eight characters with a persisted row took that
+    row's name, and the upsert overwrote its session_id: the only reference to the older
+    session was gone, and nothing could ever resume it again."""
+    OLD, NEW = "abcd1234-old", "abcd1234-new"
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"name": "resumed-abcd1234", "provider": "claude", "session_id": OLD,
+          "status": "done", "created_at": 1.0}]))
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b)            # a fresh kernel: no live handles at all
+    assert a._handles == {}
+
+    async def flow():
+        h = a.resume(NEW)
+        await asyncio.wait_for(h.result(), 2)
+        return h
+
+    h = asyncio.run(flow())
+    assert h.name != "resumed-abcd1234"
+    rows = {r["name"]: r for r in _rows(tmp_path)}
+    assert rows["resumed-abcd1234"]["session_id"] == OLD, "the persisted row was overwritten"
+    assert rows[h.name]["session_id"] == NEW
+    assert {OLD, NEW} <= {e["session_id"] for e in a.list()}
+
+
+def test_resuming_the_id_a_persisted_row_already_names_keeps_its_name(tmp_path):
+    """The row is not an obstacle to resuming the session it was kept for: same id, same
+    name, one row — which is what `agent.list()` after a restart is supposed to give."""
+    SID = "abcd1234-old"
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"name": "resumed-abcd1234", "provider": "claude", "session_id": SID,
+          "status": "done", "created_at": 1.0}]))
+    a = _agent(tmp_path, backend=FakeBackend())
+
+    async def flow():
+        h = a.resume(SID)
+        await asyncio.wait_for(h.result(), 2)
+        return h
+
+    h = asyncio.run(flow())
+    assert h.name == "resumed-abcd1234"
+    assert len(_rows(tmp_path)) == 1
+
+
 # --- r6 finding 7: zero is a deadline, not the absence of one -------------------------
 
 def test_a_zero_timeout_times_out_instead_of_running_unbounded(tmp_path):

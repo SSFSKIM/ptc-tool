@@ -3,8 +3,8 @@
 The point of the strict fake is that these tests fail the same way the real server fails.
 So several of them are guard tests on the FAKE itself (a fake that accepts anything proves
 nothing about the client), and one deliberately sabotages the responder table to show that
-a blanket `{"decision": "accept"}` — the shape eight of the ten server→client methods
-reject — is caught here rather than live.
+a blanket `{"decision": "accept"}` — the shape most of the server→client methods reject
+— is caught here rather than live.
 """
 import asyncio
 import json
@@ -291,6 +291,19 @@ def test_blanket_accept_is_caught_by_the_fake(fake, monkeypatch):
                          for m in codex_backend._RESPONDERS})
     with pytest.raises(RuntimeError, match="bad ReviewDecision"):
         asyncio.run(codex_backend.run_once("REQ:execCommandApproval", opts()))
+
+
+def test_the_external_clock_request_is_answered_not_refused(fake):
+    """`features.current_time_reminder` with `clock_source = "external"` makes app-server
+    ask its CLIENT the time, and a turn whose ask is answered with -32601 aborts before the
+    model is ever reached. The setting arrives in the user's inherited `~/.codex` config, so
+    it is not PTC's to refuse: it answers with this machine's clock, which is the same clock
+    the child's own `system` source would have read."""
+    r = asyncio.run(codex_backend.run_once("REQ:currentTime/read", opts()))
+    assert r.text.startswith("echo:")
+    reply = next(m for m in read_trace(fake) if "method" not in m and m.get("id", 0) > 900)
+    assert "error" not in reply, "the turn aborts on a JSON-RPC error here"
+    assert abs(reply["result"]["currentTimeAt"] - time.time()) < 120
 
 
 def test_permission_escalation_is_denied_not_echoed(fake):

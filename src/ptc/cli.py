@@ -186,7 +186,13 @@ def _run(argv=None) -> int:
         outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=cfg.yield_s, since=a.since)
         info = None
     if a.json:
-        print(json.dumps(to_dict(outcome, key)))
+        d = to_dict(outcome, key)
+        if info is not None:
+            # The text and MCP paths both announce a kernel the idle TTL replaced; the
+            # machine form dropped it and emitted an ordinary successful cell, so a script
+            # went on assuming the variables and imports of a namespace that is gone.
+            d["expired"] = info.expired_notice.strip() if info.expired_notice else None
+        print(json.dumps(d))
     else:
         if info is not None and info.expired_notice:
             print(f"[previous kernel expired: {info.expired_notice.strip()}]")

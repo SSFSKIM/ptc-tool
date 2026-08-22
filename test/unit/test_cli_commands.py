@@ -257,14 +257,14 @@ def test_restart_json_still_respawns_where_the_kernel_lived(monkeypatch, capsys)
 
 # --- r6 finding 9: a refused exec is not a successful exec ----------------------------
 
-def _exec_returning(monkeypatch, outcome):
+def _exec_returning(monkeypatch, outcome, expired=None):
     from ptc import client
 
     monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None,
                                                          type("R", (), {"cwd": None,
                                                                         "claude_session_id": None})()))
     monkeypatch.setattr(cli, "ensure_kernel",
-                        lambda k, **kw: KernelInfo(k, 1, Path("/c.json"), False, None))
+                        lambda k, **kw: KernelInfo(k, 1, Path("/c.json"), False, expired))
     monkeypatch.setattr(client.KernelClient, "exec_cell", lambda self, *a, **kw: outcome)
 
 
@@ -299,3 +299,31 @@ def test_the_busy_exit_code_is_documented_in_help():
     with contextlib.redirect_stdout(out), pytest.raises(SystemExit):
         cli.main(["--help"])
     assert f"{cli.EXIT_BUSY} the kernel was busy" in " ".join(out.getvalue().split())
+
+
+# --- r9 finding 6: the machine form must report the namespace it lost ------------------
+
+def _ok_cell():
+    from ptc.cells import CellRecord
+    from ptc.client import Completed
+
+    return Completed(7, CellRecord("ok", 1, None, None, [], []), "ok\n")
+
+
+def test_exec_json_reports_a_kernel_the_ttl_replaced(monkeypatch, capsys):
+    """After the idle TTL expires a kernel, the text and MCP paths both say so and the
+    --json branch dropped it, emitting an ordinary successful cell result. A machine client
+    then went on assuming variables and imports that no longer exist."""
+    _exec_returning(monkeypatch, _ok_cell(), expired="expired after 24.00 h idle\n")
+
+    assert cli.main(["exec", "-s", "k9", "1+1", "--json"]) == 0
+    assert _json_out(capsys)["expired"] == "expired after 24.00 h idle"
+
+
+def test_exec_json_says_so_when_the_namespace_was_NOT_replaced(monkeypatch, capsys):
+    """The field is present either way: absent-or-null is not a distinction a caller
+    reading `d.get("expired")` can make, and the common case must be legible too."""
+    _exec_returning(monkeypatch, _ok_cell())
+
+    assert cli.main(["exec", "-s", "k9", "1+1", "--json"]) == 0
+    assert _json_out(capsys)["expired"] is None

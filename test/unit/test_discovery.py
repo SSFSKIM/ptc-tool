@@ -9,6 +9,7 @@ import json
 import os
 
 from ptc.discovery import resolve
+from ptc.paths import safe_key
 
 
 def _write_runfile(home, pid, sid="11111111-2222-3333-4444-555555555555", cwd="/proj"):
@@ -92,6 +93,20 @@ def test_explicit_uuidish_sets_claude_session_id(monkeypatch, tmp_path):
     sid = "11111111-2222-3333-4444-555555555555"
     r = resolve(explicit=sid, env={})
     assert r.source == "explicit" and r.claude_session_id == sid
+
+
+def test_a_hex_alias_is_a_kernel_key_not_a_session_id(monkeypatch, tmp_path):
+    """"Eight or more hex-or-hyphen characters" is the shape of plenty of ordinary aliases.
+    Attaching under one wrote it into meta.json as a Claude session id, and `history()` and
+    `agent.fork()` then resumed or searched for a session that never existed instead of
+    reporting the limitation an alias-keyed kernel documents."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    for alias in ("deadbeef", "cafe-1234", "abcdef0123456789",
+                  "11111111-2222-3333-4444-55555555555",     # a digit short
+                  "11111111-2222-3333-4444-5555555555555"):  # a digit long
+        r = resolve(explicit=alias, env={})
+        assert r.claude_session_id is None, alias
+        assert r.key == safe_key(alias)
 
 
 def test_explicit_non_uuidish_has_no_claude_session_id(monkeypatch, tmp_path):

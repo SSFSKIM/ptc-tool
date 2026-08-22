@@ -37,9 +37,12 @@ from .paths import kernel_dir, private_write_text, run_dir, safe_key, secure_dir
 #: adapter must agree), distinct across processes.
 _ADAPTER_NONCE = secrets.token_hex(4)
 
-# 8+ hex/hyphen chars: good enough to tell a Claude session UUID apart from a
-# human-chosen PTC_SESSION key (which is not itself a Claude session id).
-_UUIDISH = re.compile(r"^[0-9a-fA-F-]{8,}$")
+#: A Claude session id is a UUID, and only the UUID shape is read as one. "Eight or more
+#: hex-or-hyphen characters" also matched a perfectly ordinary kernel alias — `deadbeef`,
+#: `cafe-1234` — and an attach under that alias then wrote it into meta.json as a Claude
+#: session id, sending `history()` and `agent.fork()` to resume a session that never
+#: existed instead of reporting the alias-keyed limitation they document.
+_UUIDISH = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
 
 @dataclass

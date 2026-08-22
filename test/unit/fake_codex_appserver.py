@@ -57,7 +57,7 @@ STUCK = False
 #: What the ``JSON`` marker answers with — a document a schema-constrained turn would send.
 _FINAL_JSON = '{"ok": 1}'
 
-#: The ten server→client request methods `ServerRequest` declares on 0.146.0.
+#: The eleven server→client request methods `ServerRequest` declares on 0.146.0.
 SERVER_REQUESTS = (
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -69,6 +69,7 @@ SERVER_REQUESTS = (
     "attestation/generate",
     "applyPatchApproval",
     "execCommandApproval",
+    "currentTime/read",
 )
 #: Host-credential requests: only a real token satisfies them, so an honest client replies
 #: with a JSON-RPC error. `{}` is NOT a valid result for either.
@@ -157,6 +158,15 @@ def bad_reply(method, msg):
     elif method == "item/tool/call":
         if not isinstance(r.get("contentItems"), list) or not isinstance(r.get("success"), bool):
             return f"{method}: 'contentItems' (array) and 'success' (bool) are required"
+    elif method == "currentTime/read":
+        # CurrentTimeReadResponse.current_time_at: whole Unix SECONDS, and the server feeds
+        # it straight to DateTime::from_timestamp — a bool, a float or milliseconds is not
+        # a time it can render.
+        at = r.get("currentTimeAt")
+        if not isinstance(at, int) or isinstance(at, bool):
+            return f"{method}: 'currentTimeAt' must be whole Unix seconds, got {at!r}"
+        if not 1_000_000_000 < at < 10_000_000_000:
+            return f"{method}: 'currentTimeAt' {at!r} is not a plausible Unix second"
     return None
 
 
@@ -322,6 +332,8 @@ def _request_params(method, turn):
         return {**base, "tool": "t", "namespace": "n", "arguments": {}}
     if method in ("execCommandApproval", "applyPatchApproval"):
         return {"conversationId": "c1", "callId": "c", "command": ["rm", "-rf", "/tmp/x"]}
+    if method == "currentTime/read":
+        return {"threadId": (turn or {}).get("threadId")}
     return {**base, "command": ["rm", "-rf", "/tmp/x"]}
 
 

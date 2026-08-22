@@ -487,11 +487,24 @@ class _Agent:
         one handle name overwrote `_handles` and the registry row of a session whose CLI
         was still live — unlistable and unmanageable from then on. A name held by THIS
         session is the other case, a genuine double-resume, and `_claim_name` decides it.
+
+        The registry is consulted alongside the live handles because it OUTLIVES them: a
+        restart empties `_handles` while `agents.json` survives on purpose, and that is the
+        whole point of the file — `agent.list()` after a restart is what makes an old
+        session resumable at all. Keyed on live handles alone, the first resume after a
+        restart reused a persisted row's name and `_registry_write` overwrote its
+        `session_id`, deleting the only reference to the session it was kept for.
         """
+        rows = {r.get("name"): r.get("session_id") for r in self._registry_load()
+                if isinstance(r, dict)}
         for n in (8, 16, len(session_id)):
             name = f"resumed-{session_id[:n]}"
             prior = self._handles.get(name)
-            if prior is None or prior.session_id == session_id:
+            if prior is not None:
+                if prior.session_id == session_id:
+                    return name
+                continue
+            if name not in rows or rows[name] == session_id:
                 return name
         return f"resumed-{session_id}-{uuid.uuid4().hex[:6]}"
 
