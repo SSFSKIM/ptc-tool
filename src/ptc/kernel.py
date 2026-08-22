@@ -118,6 +118,11 @@ def _clean_stale(kd: Path, key: str, o: "Owner | None", alive: bool) -> None:
         # `ready`, so this reaps a PROVISIONAL kernel too: one whose spawner died between
         # the fork and the end of bootstrap.
         kill_process_tree(o.pid)
+    elif o:
+        # CONFIRMED dead, which is not the same as harmless: the kernel led its own group
+        # and its ordinary children are still in it, running and billing, while the
+        # replacement spawns beside them (r16).
+        bgroups.reap_leaderless_group(o.pid)
     # the dead kernel's background bash groups are in sessions of their own, so the group
     # kill above never reached them (F4)
     bgroups.reap(kd)
@@ -238,12 +243,23 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             # A caller that does not know the Claude session id (an env-keyed rung, a CLI
             # restart) passes None — which must not ERASE the id a previous spawn under
             # this key already learned: history() and fork() read it back from here.
-            # depth AND max_depth: the recursion brake is the pair, and a restart that
-            # restores only one of them is a brake half released (`restart_kernel`).
+            #
+            # The configuration recorded here is exactly the KERNEL-LIFETIME set, and the
+            # rule that decides membership is what the kernel LIVES under travels with the
+            # kernel; what the caller RENDERS with stays the caller's. These four are
+            # consumed once, kernel-side, by the code the spawn brings up — `idle_hours`
+            # arms the TTL watchdog, `max_concurrency` sizes the shared agent/llm/web
+            # semaphore, and `depth`/`max_depth` are the two halves of the recursion brake
+            # — so they are properties of this kernel for the whole of its life and a
+            # restart reads every one of them back (`restart_kernel`). `yield_s` and
+            # `max_output_chars` are read per request by the client and the renderer and
+            # are deliberately absent: pinning them here would make a restart silently
+            # change what a later, unrelated caller's own timeout meant.
             write_meta(key, kernel_key=key,
                        claude_session_id=claude_session_id or read_meta(key).get(
                            "claude_session_id"),
                        cwd=work, depth=cfg.depth, max_depth=cfg.max_depth,
+                       idle_hours=cfg.idle_hours, max_concurrency=cfg.max_concurrency,
                        epoch=epoch, build=build)
             from .client import run_bootstrap
             run_bootstrap(key, cfg)
@@ -314,8 +330,9 @@ def kill_kernel(key: str) -> bool:
 
     The two halves answer to different facts. Cleanup runs on the strength of the RECORD:
     a record whose process is gone (it died, or its pid was recycled) is stale, and
-    deleting it — with the orphaned bash groups it can no longer reap — is the whole point
-    of running `kill` against such a key. The return value answers to the SIGNAL, because
+    deleting it — with the two sets of processes it can no longer reap: the background bash
+    groups, and its own leaderless group of ordinary children — is the whole point of
+    running `kill` against such a key. The return value answers to the SIGNAL, because
     that is what the CLI publishes as its exit code: 0 for a kernel killed, 1 for nothing
     to kill. Returning True for a record deletion made `ptc kill` claim a kill it had not
     made, and a shell loop could not tell a live cleanup from a sweep of dead metadata.
@@ -332,6 +349,12 @@ def kill_kernel(key: str) -> bool:
         killed = bool(o and settled_owner_state(o))
         if killed:
             kill_process_tree(o.pid)
+        elif o:
+            # The record is stale, so there is no process to take the group FROM — but the
+            # group outlived its leader with the kernel's ordinary children still in it,
+            # and cleaning the metadata without reaping them is how an OOM-killed kernel's
+            # agent backends kept running under a key that no longer names anything (r16).
+            bgroups.reap_leaderless_group(o.pid)
         # Only now, with the kernel down and unable to start another one, reap the
         # background bash groups it spawned: each is its own session, so the group kill
         # above cannot reach them and they would outlive the kernel as orphans (F4).
@@ -344,39 +367,72 @@ def kill_kernel(key: str) -> bool:
         return killed
 
 
+#: The Config fields a kernel LIVES under, each paired with the type a recorded value has
+#: to have to be believed. They are the fields the spawn consumes kernel-side — the TTL
+#: watchdog's `idle_hours`, the shared semaphore's `max_concurrency`, and the recursion
+#: brake's `depth`/`max_depth` — and `ensure_kernel` records exactly this set. Everything
+#: else in Config (`yield_s`, `max_output_chars`) is read per request by the client and the
+#: renderer and belongs to whoever is asking; `session` and `cwd` have their own handling.
+_KERNEL_LIFETIME_FIELDS = {
+    "idle_hours": (int, float),
+    "max_concurrency": int,
+    "max_depth": int,
+    "depth": int,
+}
+
+
 def restart_kernel(key: str, **kw) -> KernelInfo:
     """Replace this key's kernel, keeping the config the kernel itself was created with.
 
     A restart is not a fresh spawn: the key already has an identity, and the caller doing
     the restarting need not be the one that made it. The recursion brake is the case that
-    bites, and it is a PAIR — `depth >= max_depth`. A parent adapter (or a terminal)
-    restarts a CHILD kernel by explicit key while running at PTC_DEPTH=0, and rebuilding
-    Config from that caller's environment overwrites the child's stored depth with zero —
-    the still-running child adapter then attaches to a depth-0 kernel and can spawn
-    grandchildren of its own with the brake silently released. Restoring the depth alone
-    leaves the identical hole open from the other side: a restarter carrying
+    bites hardest, and it is a PAIR — `depth >= max_depth`. A parent adapter (or a
+    terminal) restarts a CHILD kernel by explicit key while running at PTC_DEPTH=0, and
+    rebuilding Config from that caller's environment overwrites the child's stored depth
+    with zero — the still-running child adapter then attaches to a depth-0 kernel and can
+    spawn grandchildren of its own with the brake silently released. Restoring the depth
+    alone leaves the identical hole open from the other side: a restarter carrying
     PTC_MAX_DEPTH=3 hands a depth-1/max-1 child a bound of 3, and the grandchildren that
-    child was refused are admitted again. Both numbers belong to the KERNEL and both are
-    recorded at its spawn, so both are what a restart reads back.
+    child was refused are admitted again.
 
-    Migration is by ABSENCE, with no version field: a meta.json written before max_depth
-    was recorded simply has no such key, and that kernel keeps the behaviour it has today
-    (the restarter's bound). Every spawn rewrites meta.json, so a kernel self-upgrades the
-    first time it is restarted and never takes that path twice.
+    The brake is not the only thing that belongs to the kernel, and restoring only the
+    brake left the same defect standing in the other two: a kernel created with
+    PTC_IDLE_HOURS=0.5 and PTC_MAX_CONCURRENCY=2, restarted from a plain shell, came back
+    with a 24-hour TTL and a bound of 8 — a resource decision reversed by a caller that
+    never made one. The whole kernel-lifetime set is read back instead
+    (`_KERNEL_LIFETIME_FIELDS`, recorded at the spawn that created it), and the per-call
+    knobs are deliberately not: `yield_s` and `max_output_chars` are the RESTARTER's, and
+    always were.
 
-    cwd and the Claude session id are the same story and are already restored by both
+    Meta wins over an explicit `config=` for these fields, rather than the config winning
+    wholesale, and that is the point rather than an oversight. `restart_kernel` has no
+    in-tree caller that passes one, and the natural one to write is
+    `restart_kernel(key, config=Config.from_env())` — which is precisely the construction
+    this exists to defeat, only with the restarter's environment carried in an argument
+    instead of read from `os.environ`. An explicit config supplies everything else, and
+    supplies these too for a kernel whose meta.json does not record them.
+
+    Migration is by ABSENCE and per FIELD, with no version marker: a meta.json written
+    before a field was recorded simply has no such key, and that kernel keeps the behaviour
+    it has today for that field alone. Every spawn rewrites meta.json, so a kernel
+    self-upgrades the first time it is restarted and never takes that path twice.
+
+    cwd and the Claude session id are a different story and are already restored by both
     restart callers, which is where they have to be: only the caller knows whether it
     means to move the kernel.
     """
     meta = read_meta(key)
-    depth, max_depth = meta.get("depth"), meta.get("max_depth")
+    recorded = {name: meta.get(name) for name in _KERNEL_LIFETIME_FIELDS}
     kill_kernel(key)
     time.sleep(0.2)
     cfg = kw.pop("config", None) or Config.from_env()
-    if isinstance(depth, int) and cfg.depth != depth:
-        cfg = replace(cfg, depth=depth)
-    if isinstance(max_depth, int) and cfg.max_depth != max_depth:
-        cfg = replace(cfg, max_depth=max_depth)
+    for name, types in _KERNEL_LIFETIME_FIELDS.items():
+        value = recorded[name]
+        # `bool` is an `int` and would be restored as one; nothing writes one, and a
+        # meta.json that somehow holds one is not a number this kernel ever lived under.
+        if isinstance(value, types) and not isinstance(value, bool) \
+                and getattr(cfg, name) != value:
+            cfg = replace(cfg, **{name: value})
     kw["config"] = cfg
     return ensure_kernel(key, **kw)
 

@@ -173,6 +173,42 @@ def signalable(row: dict) -> bool:
     return not unverifiable(row) and not _recycled(row)
 
 
+def reap_leaderless_group(pgid: int) -> bool:
+    """SIGKILL a process group whose recorded leader is CONFIRMED gone. True if signalled.
+
+    The kernel is a session leader (`start_new_session=True`), so its pgid IS its pid and
+    every ordinary child it makes — the Claude SDK's `claude` CLI, a `codex app-server`, a
+    plain `subprocess` — lives in that group. A kernel killed by the OOM killer or a crash
+    therefore leaves a leaderless group of its own descendants still running and still
+    billing, and neither the group kill (there is no live pid to take the group from) nor
+    `reap` above (background `bash()` groups are in sessions of their own, which is the
+    whole reason they are registered separately) reaches them.
+
+    The gate is `_recycled`'s, for a `leader_exited` row, because it is exactly the same
+    question: the recorded leader is known dead, so a process WEARING that pid can only be
+    a recycle and the group behind it a stranger's — fail closed, and note that an
+    unreadable identity already answered that mismatch upstream, since only a settled
+    `False` reaches here. NO process wearing it is the orphaned-descendants case this
+    exists for: POSIX will not hand the number out while it still names a live group, and a
+    group that has already emptied makes this a harmless ESRCH.
+
+    The self-check is `reap`'s, for `reap`'s reason: a caller sitting in a group whose own
+    leader has exited would otherwise SIGKILL itself out of a cleanup path.
+    """
+    if not isinstance(pgid, int) or pgid <= 1 or _pid_exists(pgid):
+        return False
+    try:
+        if pgid == os.getpgid(0):
+            return False
+    except OSError:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        return False                    # already empty (ESRCH) or not ours (EPERM)
+    return True
+
+
 def reap(kernel_dir) -> list:
     """SIGKILL every recorded group, then drop the file. Returns the pgids signalled."""
     killed = []
