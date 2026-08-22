@@ -794,3 +794,32 @@ def test_two_sessions_sharing_an_eight_char_prefix_get_distinct_handles(tmp_path
     rows = {r["name"]: r for r in _rows(tmp_path)}
     assert rows[h1.name]["session_id"] == A and rows[h2.name]["session_id"] == B
     assert {h1.name, h2.name} <= {e["name"] for e in a.list()}
+
+
+# --- r6 finding 7: zero is a deadline, not the absence of one -------------------------
+
+def test_a_zero_timeout_times_out_instead_of_running_unbounded(tmp_path):
+    """`if timeout:` read 0 as "no deadline", so `agent(..., timeout=0)`, `llm(timeout=0)`
+    and `web_search(timeout=0)` — the caller asking for the strictest bound there is — got
+    no bound at all and a hung backend could hold its permit forever. The permit still has
+    to come back, so the next call must not hang either."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        with pytest.raises(asyncio.TimeoutError):
+            await a.run("slow", timeout=0)
+        return await asyncio.wait_for(a.run("after"), 5)
+
+    assert asyncio.run(flow()).text == "after"
+
+
+def test_a_negative_timeout_is_refused_by_name(tmp_path):
+    a = _agent(tmp_path)
+    with pytest.raises(ValueError, match="non-negative"):
+        asyncio.run(a.run("nope", timeout=-1))
+
+
+def test_timeout_none_still_means_no_deadline(tmp_path):
+    a = _agent(tmp_path)
+    assert asyncio.run(a.run("hello", timeout=None)).text == "hello"

@@ -68,13 +68,24 @@ async def guarded(sem: asyncio.Semaphore, make_coro, timeout: float | None):
     """One permit, one deadline, released on every exit path. The deadline covers the
     wait for the permit as well, so a queued call cannot outlive its own timeout. Shared
     by every semaphore consumer (`_Agent._guarded`, `llm()`, and `web_search()`) so this
-    contract lives in exactly one place."""
+    contract lives in exactly one place.
+
+    Only `None` means "no deadline". `timeout=0` is a deadline that has already passed —
+    the call does not get to wait for a permit or a backend — and a negative one is a
+    caller error said out loud. A truthiness test read all three as "no deadline", so the
+    caller asking for the strictest bound got none at all and a hung backend could run
+    forever holding its permit.
+    """
     async def _work():
         async with sem:
             return await make_coro()
-    if timeout:
-        return await asyncio.wait_for(_work(), timeout)
-    return await _work()
+    if timeout is None:
+        return await _work()
+    if timeout < 0:
+        raise ValueError(
+            f"timeout must be a non-negative number of seconds or None, got {timeout!r}: "
+            "a deadline in the past is not the same as no deadline")
+    return await asyncio.wait_for(_work(), timeout)
 
 
 @dataclass
