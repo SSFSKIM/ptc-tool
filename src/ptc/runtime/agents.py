@@ -112,6 +112,25 @@ class AgentResult:
     duration_ms: int
 
 
+class AgentFailed(RuntimeError):
+    """A turn whose own terminal result said it FAILED — a rate limit, a max-turns stop,
+    an execution error inside the CLI.
+
+    The CLI reports these in band: the stream ends with an ordinary terminal message
+    carrying an error flag and, usually, the error text where a normal turn's answer would
+    be. Read as a normal end, that text becomes the answer — `llm()` returned "Claude AI
+    usage limit reached" as a classification and a spawned handle went `done` — so the
+    failure has to leave the backend as an exception instead.
+
+    The partial `result` rides along where a turn produced one: whatever text arrived
+    before the failure is still the caller's to look at, it just is not an answer.
+    """
+
+    def __init__(self, message: str, result: AgentResult | None = None):
+        super().__init__(message)
+        self.result = result
+
+
 #: The bound safe_key() enforces on every session key. A child key is built to fit INSIDE
 #: it — see child_key() — so it is taken from paths rather than restated here: a key that
 #: overshoots comes back digested, and a child that needed the digest would no longer

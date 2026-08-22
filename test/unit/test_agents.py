@@ -823,3 +823,26 @@ def test_a_negative_timeout_is_refused_by_name(tmp_path):
 def test_timeout_none_still_means_no_deadline(tmp_path):
     a = _agent(tmp_path)
     assert asyncio.run(a.run("hello", timeout=None)).text == "hello"
+
+
+# -- r7 finding 1: a turn that reports failure is not a turn that finished ------------
+
+def test_a_turn_that_reports_failure_settles_the_handle_as_an_error(tmp_path):
+    """A ResultMessage with is_error set is a turn that did NOT do its job (rate limit,
+    max turns, execution failure). The backend raises it, so the handle goes `error` and
+    result() re-raises with the CLI's own text — rather than `done` with the error notice
+    standing in for the answer."""
+    from ptc.runtime.agents import AgentFailed
+
+    b = FakeBackend(fail=AgentFailed("the claude turn ended in error: usage limit reached"))
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        h = a.spawn("doomed", name="c3")
+        with pytest.raises(AgentFailed, match="usage limit reached"):
+            await asyncio.wait_for(h.result(), 2)
+        assert h.status == "error"
+        assert b.sessions[0].closed, "a failed turn must still release its CLI"
+        return await asyncio.wait_for(a.run("after"), 2)
+    assert asyncio.run(flow()).text == "after"
+    assert _row(tmp_path, "c3")["status"] == "error"

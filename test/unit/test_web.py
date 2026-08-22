@@ -289,3 +289,48 @@ def test_select_returns_nothing_when_correlation_names_a_different_tool():
 ])
 def test_domain_ok(url, allowed, blocked, ok):
     assert _domain_ok(url, allowed, blocked) is ok
+
+
+# --- r7 finding 6 (P2): a failed search is not a search that found nothing -------------
+
+def _terminal(**kw):
+    from claude_agent_sdk import ResultMessage
+    base = dict(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                num_turns=1, session_id="s-1")
+    return ResultMessage(**{**base, **kw})
+
+
+def _install_query(monkeypatch, messages):
+    import claude_agent_sdk
+
+    async def fake_query(*, prompt, options):
+        for m in messages:
+            yield m
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+
+def test_web_search_raises_when_the_turn_ended_in_error(monkeypatch, tmp_path):
+    """The terminal message is the only one that says whether the turn WORKED, and it
+    carries no list content — so the block loop skipped it and an authentication failure,
+    a rate limit or a dead CLI came back as `[]`, indistinguishable from a search that
+    legitimately found nothing."""
+    from ptc.runtime.agents import AgentFailed
+
+    STATE.kernel_dir = tmp_path
+    STATE.config = {"key": "k", "max_concurrency": 8}
+    _install_query(monkeypatch, [_terminal(subtype="error_during_execution", is_error=True,
+                                           result="Invalid API key")])
+
+    with pytest.raises(AgentFailed, match="Invalid API key"):
+        asyncio.run(web.web_search("anything"))
+
+
+def test_web_search_still_returns_an_empty_list_for_a_genuine_zero_result(monkeypatch,
+                                                                          tmp_path):
+    """The other half: a turn that really did run and found nothing is still `[]`, not an
+    exception. The distinction is the whole point of the fix."""
+    STATE.kernel_dir = tmp_path
+    STATE.config = {"key": "k", "max_concurrency": 8}
+    _install_query(monkeypatch, [_terminal()])
+
+    assert asyncio.run(web.web_search("anything")) == []

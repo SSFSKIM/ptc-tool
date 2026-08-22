@@ -95,7 +95,9 @@ no-tools, single-turn call to a sub-model, useful for map-reduce classification/
 over many chunks. It is NOT a cheap primitive: even isolated, a call still pays a
 ~5 200-prompt-token floor for the CLI's own base system prompt, so it costs more than a
 raw API call would — use it for real semantic work, not as a string op. Shares the same
-concurrency cap as `agent`.
+concurrency cap as `agent`. A turn that FAILS — a rate limit, a max-turns stop, an
+execution error — raises rather than returning the CLI's error notice as the reply; the
+same is true of `agent.*` handles, which settle `error` and re-raise from `result()`.
 
 ## Web
 
@@ -106,12 +108,14 @@ concurrency cap as `agent`.
 `web_fetch(url, *, prompt=None, timeout=30)` GETs the page (redirects followed, 10 MB cap)
 and returns the WHOLE thing as markdown in `.text` — filter it in Python rather than
 asking for a summary. `prompt=` additionally fills `.summary` via `llm()`; the full text
-stays either way.
+stays either way, and a summarization turn that fails raises rather than passing its error
+notice off as a summary (fetch without `prompt=` when you only want the page).
 
 `web_search(query_text, *, allowed_domains=None, blocked_domains=None, max_results=10,
 timeout=300)` returns the search tool's own hits, not a model write-up. Each
 `SearchResult` carries `.title`, `.url`, `.raw`; `.snippet` is empty because the tool
-returns title and url only — call `web_fetch` on a url when you need the content.
+returns title and url only. A search whose turn failed raises — `[]` means the search ran
+and found nothing — call `web_fetch` on a url when you need the content.
 `max_results` only truncates: the model decides how many hits come back (observed: 8),
 PTC just slices to at most `max_results` of them — asking for more than the tool found
 does not make it search harder. It runs a scoped sub-agent, so it shares the `agent`/`llm`

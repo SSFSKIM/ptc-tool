@@ -113,3 +113,29 @@ def test_llm_timeout_releases_the_shared_permit(monkeypatch, tmp_path):
             await llm_mod.llm("x", timeout=0.05)
         return await asyncio.wait_for(a.run("after"), 2)
     assert asyncio.run(flow()).text == "did:after"
+
+
+# --- r7 finding 1: llm() must not return a rate-limit notice as its answer ------------
+
+def test_llm_raises_when_the_turn_ends_in_error(monkeypatch, tmp_path):
+    """The CLI reports a rate limit or an execution failure on the SAME terminal message a
+    successful turn ends on, with the error text where the answer would be. llm() handed
+    that text back as the reply, so a classification silently became "Claude AI usage limit
+    reached" and every caller downstream believed it."""
+    import claude_agent_sdk
+    from claude_agent_sdk import ResultMessage
+
+    from ptc.runtime.agents import AgentFailed
+
+    STATE.kernel_dir = tmp_path
+    STATE.config = {"key": "k", "max_concurrency": 8}
+
+    async def fake_query(*, prompt, options):
+        yield ResultMessage(subtype="error_during_execution", duration_ms=1,
+                            duration_api_ms=1, is_error=True, num_turns=1,
+                            session_id="s-err",
+                            result="Claude AI usage limit reached|1770000000")
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+    with pytest.raises(AgentFailed, match="usage limit reached"):
+        asyncio.run(llm_mod.llm("classify this"))

@@ -24,7 +24,8 @@ from html import unescape
 from urllib.parse import urlsplit
 
 from . import audit
-from .agents import AgentOpts, child_ptc_env, guarded, shared_semaphore
+from .agents import AgentFailed, AgentOpts, child_ptc_env, guarded, shared_semaphore
+from .claude_backend import terminal_failure
 
 #: Hard body cap, enforced WHILE streaming: a limit checked after the download has already
 #: finished is a report, not a cap.
@@ -84,7 +85,9 @@ async def web_fetch(url: str, *, prompt: str | None = None,
     """GET `url`, follow redirects, return the whole page as markdown in `.text`.
 
     `prompt=` additionally runs `llm(prompt, over the text)` and fills `.summary` — the
-    full text is still there; summarizing never replaces it.
+    full text is still there; summarizing never replaces it. A summarization turn that
+    FAILS propagates: a caller who asked for a summary did not get one, and `.summary=None`
+    would claim the model had nothing to add. Fetch without `prompt=` for the page alone.
 
     Two deadlines, deliberately: `timeout` bounds the fetch (including the wait for a
     concurrency permit), while the optional summarization runs under `llm()`'s own
@@ -255,9 +258,17 @@ async def web_search(query_text: str, *, allowed_domains: list | None = None,
 
     tool_names: dict = {}
     seen: list = []
+    failed: list = []
 
     async def run():
         async for m in query(prompt=prompt, options=opts):
+            # The terminal message is the only one that says whether the turn WORKED, and
+            # it carries no list content — so the block loop below skipped it and an
+            # authentication failure, a rate limit or a dead CLI came back as a search
+            # that legitimately found nothing.
+            reason = terminal_failure(m)
+            if reason:
+                failed.append(reason)
             content = getattr(m, "content", None)
             if not isinstance(content, list):
                 continue
@@ -269,6 +280,8 @@ async def web_search(query_text: str, *, allowed_domains: list | None = None,
                     tool_names[b.id] = b.name
 
     await guarded(shared_semaphore(), run, timeout)
+    if failed:
+        raise AgentFailed(f"web_search({query_text[:80]!r}) did not run: {failed[-1]}")
 
     hits = [r for r in _parse_blocks(_select(seen, tool_names))
             if _domain_ok(r.url, allowed_domains, blocked_domains)]
