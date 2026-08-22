@@ -5,7 +5,7 @@ import secrets
 import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import bgroups
@@ -234,8 +234,29 @@ def kill_kernel(key: str) -> bool:
 
 
 def restart_kernel(key: str, **kw) -> KernelInfo:
+    """Replace this key's kernel, keeping the config the kernel itself was created with.
+
+    A restart is not a fresh spawn: the key already has an identity, and the caller doing
+    the restarting need not be the one that made it. Depth is the case that bites. A parent
+    adapter (or a terminal) restarts a CHILD kernel by explicit key while running at
+    PTC_DEPTH=0, and rebuilding Config from that caller's environment overwrites the
+    child's stored depth with zero — the still-running child adapter then attaches to a
+    depth-0 kernel and can spawn grandchildren of its own, with PTC_MAX_DEPTH=1 in force
+    and the recursion brake silently released. The depth belongs to the KERNEL, and
+    meta.json has recorded it since the spawn, so that is where a restart reads it.
+
+    cwd and the Claude session id are the same story and are already restored by both
+    restart callers, which is where they have to be: only the caller knows whether it
+    means to move the kernel.
+    """
+    depth = read_meta(key).get("depth")
     kill_kernel(key)
     time.sleep(0.2)
+    if isinstance(depth, int):
+        cfg = kw.pop("config", None) or Config.from_env()
+        if cfg.depth != depth:
+            cfg = replace(cfg, depth=depth)
+        kw["config"] = cfg
     return ensure_kernel(key, **kw)
 
 

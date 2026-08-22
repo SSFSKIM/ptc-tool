@@ -207,3 +207,45 @@ def test_attaching_to_a_live_kernel_repairs_a_missing_session_id(ptc_home):
     ensure_kernel("meta1", claude_session_id="sess-other")
     assert json.loads(meta.read_text())["claude_session_id"] == "sess-late", "id overwritten"
     kill_kernel("meta1")
+
+
+def test_restart_keeps_the_depth_the_kernel_was_spawned_at(ptc_home, monkeypatch):
+    """Depth belongs to the KERNEL, not to whoever restarts it.
+
+    A parent adapter (or a terminal) restarts a child kernel by explicit key while running
+    at PTC_DEPTH=0, and rebuilding Config from that caller's environment overwrote the
+    child's stored depth with zero. The still-running child adapter then attached to a
+    depth-0 kernel and could spawn grandchildren of its own with PTC_MAX_DEPTH=1 in force —
+    the recursion brake released by a restart nobody thought of as a config change.
+    meta.json has recorded the depth since the spawn, so that is what a restart restores.
+    """
+    from ptc.client import KernelClient
+    from ptc.discovery import read_meta
+    from ptc.paths import Config
+
+    monkeypatch.setenv("PTC_DEPTH", "1")
+    monkeypatch.setenv("PTC_MAX_DEPTH", "1")
+    ensure_kernel("kdepth", cwd=str(ptc_home))
+    assert read_meta("kdepth")["depth"] == 1
+
+    monkeypatch.setenv("PTC_DEPTH", "0")            # the parent doing the restarting
+    kernel.restart_kernel("kdepth", cwd=str(ptc_home))
+    try:
+        assert read_meta("kdepth")["depth"] == 1, \
+            "the restart wrote the restarting caller's depth over the kernel's own"
+        out = KernelClient("kdepth").exec_cell(
+            "import os\n"
+            "from ptc.runtime import agent\n"
+            "from ptc.runtime.state import STATE\n"
+            "print('env', os.environ['PTC_DEPTH'], 'config', STATE.config['depth'])\n"
+            "try:\n"
+            "    agent._check_depth()\n"
+            "    print('ADMITTED')\n"
+            "except RuntimeError as e:\n"
+            "    print('REFUSED', e)\n",
+            timeout_s=60, config=Config.from_env())
+        assert "env 1 config 1" in out.output, out.output
+        assert "REFUSED" in out.output, \
+            f"the respawned child kernel would spawn a grandchild: {out.output}"
+    finally:
+        kill_kernel("kdepth")
