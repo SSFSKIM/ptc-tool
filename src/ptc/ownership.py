@@ -1,6 +1,7 @@
 """owner.json: which OS process is this key's kernel. Identity = pid + birth identity."""
 import ctypes
 import ctypes.util
+import errno
 import functools
 import json
 import os
@@ -78,19 +79,35 @@ def _libc():
         return None
 
 
-def _darwin_birth(pid: int) -> str | None:
+def _darwin_bsdinfo(pid: int) -> "tuple[_ProcBsdInfo | None, int]":
+    """(the filled struct, errno) — the struct only when the read really answered.
+
+    The errno is carried out because WHY the read failed is itself an answer: libproc
+    refuses a zombie with ESRCH, which is the only way this platform tells one apart (see
+    `_has_exited`). A read that filled the wrong length, or reported back a different pid,
+    is a layout that moved and reports no errno of its own.
+    """
     libc = _libc()
     if libc is None:
-        return None
+        return None, 0
     info = _ProcBsdInfo()
     try:
+        ctypes.set_errno(0)
         n = libc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDTBSDINFO),
                               ctypes.c_uint64(0), ctypes.byref(info),
                               ctypes.c_int(ctypes.sizeof(info)))
+        err = ctypes.get_errno()
     except (AttributeError, OSError, ValueError):
-        return None
+        return None, 0
     if n != ctypes.sizeof(info) or info.pbi_pid != pid:
-        return None                      # dead pid, refused read, or a layout that moved
+        return None, err                 # dead pid, refused read, or a layout that moved
+    return info, 0
+
+
+def _darwin_birth(pid: int) -> str | None:
+    info, _ = _darwin_bsdinfo(pid)
+    if info is None:
+        return None
     return f"{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
 
 
@@ -112,8 +129,8 @@ def _proc_stat(pid: int) -> str | None:
         return None
 
 
-def _start_ticks(stat: str) -> str | None:
-    """Field 22 of a `/proc/<pid>/stat` line: start time in clock ticks since boot.
+def _stat_fields(stat: str) -> list[str]:
+    """A `/proc/<pid>/stat` line from field 3 on, so index 0 IS field 3.
 
     Field 2 is the executable name in parentheses and may itself contain spaces AND
     parentheses, so the fields are counted from after the LAST ')' — where field 3 lands at
@@ -121,10 +138,57 @@ def _start_ticks(stat: str) -> str | None:
     whatever the process happened to name itself.
     """
     _, sep, rest = stat.rpartition(")")
-    if not sep:
-        return None
-    parts = rest.split()
+    return rest.split() if sep else []
+
+
+def _start_ticks(stat: str) -> str | None:
+    """Field 22: start time in clock ticks since boot."""
+    parts = _stat_fields(stat)
     return parts[19] if len(parts) > 19 else None
+
+
+def _stat_state(stat: str) -> str | None:
+    """Field 3: the one-character run state — `R`, `S`, `D`, `Z`, `X`..."""
+    parts = _stat_fields(stat)
+    return parts[0] if parts else None
+
+
+#: `/proc/<pid>/stat` states for a process that has already run to completion: `Z` is a
+#: zombie waiting on a `wait()` nobody is going to make, `X`/`x` a task in its final
+#: teardown. Everything else — running, sleeping, uninterruptible, stopped, traced — is a
+#: process that still exists.
+_EXITED_STATES = frozenset("ZXx")
+
+
+def _has_exited(pid: int) -> bool:
+    """Has `pid` already run to completion while its process-table entry lingers?
+
+    The kernel is spawned `start_new_session=True` and its `Popen` is never retained, so
+    nothing ever `wait()`s it: a kernel that dies while its spawning adapter lives stays a
+    ZOMBIE for as long as that adapter does. `kill(pid, 0)` succeeds on a zombie and Linux
+    goes on serving its ORIGINAL start ticks out of `/proc`, so the birth identity still
+    matched and `owner_state` called a corpse alive — `_follow` reported Running forever
+    and `ensure_kernel` attached to it.
+
+    Linux reads the state field of the same line the birth stamp comes from. macOS gets
+    there by a different road than the obvious one: `proc_bsdinfo.pbi_status` would name
+    `SZOMB`, but libproc refuses the read for a zombie outright — measured on darwin 25.5,
+    `proc_pidinfo` returns 0 bytes and sets ESRCH, the same answer it gives for a pid that
+    never existed — so THE STATUS FIELD IS NEVER READABLE and that ESRCH is the signal
+    instead. It only means "exited" for a pid that is still signalable, which is why this
+    is called from `owner_state` after `kill(pid, 0)` and nowhere else; EPERM (a pid this
+    user may not inspect) is deliberately not read as exited.
+
+    False where neither reading exists. An unknown state is not a death, and this answer
+    is only ever allowed to make a process DEADER than the birth stamp says it is.
+    """
+    if _ON_LINUX:
+        stat = _proc_stat(pid)
+        return bool(stat) and _stat_state(stat) in _EXITED_STATES
+    if _ON_DARWIN:
+        info, err = _darwin_bsdinfo(pid)
+        return info is None and err == errno.ESRCH
+    return False
 
 
 def _birth(pid: int) -> str | None:
@@ -230,14 +294,18 @@ def owner_state(o: Owner) -> bool | None:
     """Is this key's recorded kernel still running? True / False / None (cannot tell).
 
     A pid that no longer exists — or that exists and belongs to another user, which our own
-    kernel never can — is a definite no. A pid that is ours and whose birth identity cannot
-    be read is the third answer, and it is the one that matters: converting it to False is
-    what let a transient `ps` failure delete a live kernel's metadata and spawn a duplicate
-    beside it.
+    kernel never can — is a definite no. So is a pid that exists only as a ZOMBIE: it is
+    signalable and its birth stamp still matches, and taking that for life is what let
+    `_follow` report Running forever against a corpse (`_has_exited`). A pid that is ours,
+    is running, and whose birth identity cannot be read is the third answer, and it is the
+    one that matters: converting it to False is what let a transient `ps` failure delete a
+    live kernel's metadata and spawn a duplicate beside it.
     """
     try:
         os.kill(o.pid, 0)
     except OSError:
+        return False
+    if _has_exited(o.pid):
         return False
     return start_time_matches(o.pid, o.proc_start_time)
 

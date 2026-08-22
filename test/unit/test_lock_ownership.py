@@ -12,8 +12,10 @@ from ptc.ownership import (
     Owner,
     UnknownOwner,
     owner_alive,
+    owner_state,
     proc_start_time,
     read_owner,
+    settled_owner_state,
     start_time_matches,
     write_owner,
 )
@@ -270,3 +272,63 @@ def test_killing_a_stale_record_reports_that_nothing_was_killed(monkeypatch, tmp
     assert signalled == [], f"a pid whose identity no longer matches was signalled: {signalled}"
     assert not (kd / "owner.json").exists(), "the stale record was left behind"
     assert not (kd / "ready").exists()
+
+
+# --- r13 finding 1: a zombie is a corpse, not a kernel with a matching birth stamp -----
+
+def _stat_line(state: str, ticks: str = "8675309") -> str:
+    """A `/proc/<pid>/stat` line in the shape the parser has to survive: an executable
+    name carrying spaces AND parentheses, then field 3 (the run state) and field 22
+    (start ticks) where the field arithmetic says they are."""
+    fields = (["4242", "(my (odd) prog)", state]
+              + [f"f{n}" for n in range(4, 22)] + [ticks, "tail"])
+    return " ".join(fields) + "\n"
+
+
+def test_a_zombie_kernels_intact_birth_stamp_does_not_make_it_alive(monkeypatch, tmp_path):
+    """The kernel is spawned `start_new_session=True` and its `Popen` is never retained,
+    so nothing ever wait()s it: a kernel that dies while its spawning adapter lives lingers
+    as a zombie for as long as that adapter does. `kill(pid, 0)` still succeeds on one and
+    Linux goes on serving its ORIGINAL start ticks out of `/proc`, so the identity matched
+    and `owner_state` called a corpse alive — `_follow` reported Running forever and
+    `ensure_kernel` attached to it. The state field is field 3 of the same line the birth
+    stamp is read from, and it is now read with it.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setattr(ownership, "_ON_LINUX", True)
+    monkeypatch.setattr(ownership, "_ON_DARWIN", False)
+    me = os.getpid()                     # signalable for real; the stat line is fabricated
+    o = Owner(me, "btime=8675309", time.time(), "n", "e1")
+
+    monkeypatch.setattr(ownership, "_proc_stat", lambda pid: _stat_line("S"))
+    assert owner_state(o) is True, "a sleeping kernel is alive"
+
+    zombie = _stat_line("Z")
+    monkeypatch.setattr(ownership, "_proc_stat", lambda pid: zombie)
+    assert ownership._start_ticks(zombie) == "8675309", "the birth stamp still matches..."
+    assert start_time_matches(me, "btime=8675309") is True
+    assert owner_state(o) is False, "...and the process behind it is still dead"
+    assert settled_owner_state(o) is False, "unknown is not the answer either"
+
+    # X/x is the same fact one moment later: a task already tearing down.
+    monkeypatch.setattr(ownership, "_proc_stat", lambda pid: _stat_line("X"))
+    assert owner_state(o) is False
+
+
+def test_a_real_unreaped_child_reads_as_dead_on_this_platform(monkeypatch, tmp_path):
+    """The same fact end to end, on whatever this machine really is — no fabricated
+    `/proc` line and no platform branch in the test. macOS gets there by a different road
+    than the obvious one (libproc refuses the read for a zombie rather than reporting
+    SZOMB; see `_has_exited`), so the platform that cannot use the Linux parser still has
+    to answer False here."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+    try:
+        recorded = proc_start_time(p.pid)
+        assert recorded, "the child must be identifiable while it is alive"
+        assert owner_state(Owner(p.pid, recorded, time.time(), "n", "e1")) is True
+        time.sleep(1.5)                  # it exits; nobody wait()s it, so it stays a zombie
+        os.kill(p.pid, 0)                # ...and is still signalable, which is the trap
+        assert owner_state(Owner(p.pid, recorded, time.time(), "n", "e1")) is False
+    finally:
+        p.wait()
