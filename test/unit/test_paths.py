@@ -71,7 +71,9 @@ def test_config_bad_values_fall_back():
 
 def test_safe_key():
     assert safe_key("96abe6e2-80aa") == "96abe6e2-80aa"
-    assert safe_key("a/b c!") == "a-b-c-"
+    # r7: a key the substitution CHANGED keeps the readable prefix and gains a digest of
+    # the original, so two raws that sanitize alike no longer share a kernel directory.
+    assert safe_key("a/b c!").startswith("a-b-c--h")
 
 
 def test_safe_key_neutralizes_dot_segments(monkeypatch, tmp_path):
@@ -136,3 +138,37 @@ def test_private_writes_create_owner_only_files(tmp_path):
     with private_open(tmp_path / "log.txt", "a") as f:
         f.write("line\n")
     assert stat.S_IMODE((tmp_path / "log.txt").stat().st_mode) == 0o600
+
+
+# --- r7 finding 3: sanitization must not merge two distinct session keys --------------
+
+def test_keys_that_sanitize_alike_still_get_their_own_kernel(monkeypatch, tmp_path):
+    """`team/a` and `team?a` both sanitized to `team-a`, so two unrelated sessions shared
+    one kernel directory: the same Python namespace, the same cell logs, the same agent
+    registry. A key the substitution CHANGED carries a digest of the original, so the
+    aliases stay apart while remaining a single safe name under the kernels root."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    a, b = safe_key("team/a"), safe_key("team?a")
+
+    assert a != b
+    assert kernel_dir(a).parent == kernels_root() and kernel_dir(b).parent == kernels_root()
+    assert safe_key(a) == a and safe_key(b) == b, "safe_key must stay idempotent"
+
+
+def test_long_keys_stay_distinct_past_the_truncation_bound(monkeypatch, tmp_path):
+    """Truncation is the other collision: two keys agreeing on their first 128 characters
+    became the same key. The digest is of the WHOLE original, so it separates them."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    base = "s" * 200
+    a, b = safe_key(base + "-one"), safe_key(base + "-two")
+
+    assert a != b
+    assert len(a) <= 128 and len(b) <= 128
+    assert safe_key(a) == a and safe_key(b) == b
+
+
+def test_a_key_that_needed_no_sanitizing_is_byte_identical_to_before():
+    """The common case must not migrate: every kernel directory that was already a clean
+    name keeps exactly the name it has on disk today."""
+    for raw in ("96abe6e2-80aa", "adapter-4711-9f2c", "team_a.1", "s" * 128):
+        assert safe_key(raw) == raw

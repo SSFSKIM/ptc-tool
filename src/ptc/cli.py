@@ -102,14 +102,18 @@ def main(argv=None) -> int:
         # ownership-verified per key: kill_kernel only signals an owner whose pid AND
         # start time still match, so a recycled pid is never killed
         killed = [r["key"] for r in list_kernels() if kill_kernel(r["key"])]
+        # Same rule the single-key kill follows and the epilog/README both state: a kill
+        # that found nothing exits 1. `--all` reported 0 whether it reaped eight kernels
+        # or none, so a shell loop could not tell a cleanup from a no-op.
+        code = 0 if killed else 1
         if a.json:
             print(json.dumps({"all": True, "killed": killed}))
-            return 0
+            return code
         for k in killed:
             print(f"[killed {k}]")
         if not killed:
             print("(no kernels to kill)")
-        return 0
+        return code
 
     key, notice, resolved = _pick_session(a.session)
     if notice:

@@ -1,10 +1,15 @@
 """PTC_HOME filesystem layout and environment-derived configuration."""
+import hashlib
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 MAX_OUTPUT_CLAMP = 50_000
+
+#: Longest kernel directory name safe_key() will hand out. `runtime.agents.child_key`
+#: builds child keys to fit inside it.
+KEY_MAX = 128
 
 #: Kernel state holds model-written code, command output, task prompts and whatever
 #: secrets those touch. Under the common 022 umask a state directory lands 0755 and its
@@ -118,11 +123,29 @@ def private_write_text(path, text: str, *, tmp=None) -> None:
 
 
 def safe_key(raw: str) -> str:
-    key = re.sub(r"[^A-Za-z0-9._-]", "-", raw)[:128]
+    """The one directory name a session key owns — LOSSLESSLY, where it has to be.
+
+    Substitution and truncation are both many-to-one: `team/a` and `team?a` sanitized to
+    the same `team-a`, and any two keys agreeing on 128 characters truncated together. The
+    losers shared a kernel directory — one Python namespace, one cell log, one agent
+    registry for two unrelated sessions. So a key the mapping CHANGED carries a short
+    digest of the original, which the collision partners cannot match.
+
+    A key that was already a clean name of legal length is returned byte-identical, digest
+    and all: that is the common case (every generated key is one) and its kernel directory
+    must not migrate. The mapping stays idempotent — its own output is always clean and
+    within the bound, so a second pass changes nothing.
+    """
+    clean = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
+    if clean != raw or len(clean) > KEY_MAX:
+        digest = hashlib.sha256(raw.encode()).hexdigest()[:8]
+        key = f"{clean[:KEY_MAX - len(digest) - 2]}-h{digest}"
+    else:
+        key = clean
     # Separators are already mapped away, but an all-dots (or empty) result is still a
     # path segment rather than a name — "." is the kernels root itself and ".." its
-    # parent. Prefix it into a literal name; the mapping is idempotent, so a key that
-    # already went through here comes back unchanged.
+    # parent. Prefix it into a literal name. Only an unchanged key can land here: the
+    # substitution emits "-", never ".", so a digested key is never all dots.
     return "key-" + key if key.strip(".") == "" else key
 
 

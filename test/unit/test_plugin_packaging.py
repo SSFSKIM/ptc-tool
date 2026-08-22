@@ -60,3 +60,34 @@ def test_hooks_manifest_registers_session_start():
     assert entries[0]["type"] == "command"
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py" in entries[0]["command"]
     assert (PLUGIN / "hooks" / "session_start.py").exists()
+
+
+# --- r7 finding 4: PTC_HOME is expanded here the way the package expands it -----------
+
+def test_launcher_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
+    """`PTC_HOME=~/.ptc-alt` is resolved to the user's home by `ptc.paths.ptc_home()`, so
+    the adapter looks for its kernel Python there. The launcher treated `~` as a literal
+    relative directory and provisioned `<cwd>/~/.ptc-alt/venv` — a venv the package can
+    never find, in a directory nobody meant to create."""
+    from ptc.paths import ptc_home
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_HOME", "~/.ptc-alt")
+    monkeypatch.chdir(tmp_path)
+    import ptc.paths as paths
+    monkeypatch.setattr(paths, "_HOME", None)
+
+    mod = _load_launcher()
+
+    assert mod.HOME.is_absolute() and "~" not in str(mod.HOME)
+    assert mod.HOME == ptc_home(), "launcher and package must provision one home"
+    assert mod.VENV == ptc_home() / "venv"
+
+
+def test_launcher_default_home_is_the_package_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PTC_HOME", raising=False)
+    import ptc.paths as paths
+    monkeypatch.setattr(paths, "_HOME", None)
+
+    assert _load_launcher().HOME == Path.home() / ".ptc"

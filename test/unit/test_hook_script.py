@@ -167,3 +167,23 @@ def test_hook_is_stdlib_only():
                  else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
         for name in names:
             assert name.split(".")[0] in sys.stdlib_module_names, name
+
+
+def test_hook_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
+    """The hook builds PTC_HOME a second time, and it built it literally: with
+    `PTC_HOME=~/.ptc-alt` the run-file the adapter keys off landed in `<cwd>/~/.ptc-alt/run`
+    while the adapter read the expanded home — session discovery lost its only channel."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_HOME", "~/.ptc-alt")
+    monkeypatch.chdir(tmp_path)
+    m = _load_hook(monkeypatch)
+    monkeypatch.setattr(m, "find_claude_ancestor", lambda: os.getpid())
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        json.dumps({"session_id": "sid-tilde", "cwd": str(tmp_path)})))
+
+    assert m.main() == 0
+
+    rd = tmp_path / ".ptc-alt" / "run"
+    assert not (tmp_path / "~").exists(), "a literal '~' directory was created"
+    written = json.loads((rd / f"claude-{os.getpid()}.json").read_text())
+    assert written["session_id"] == "sid-tilde"

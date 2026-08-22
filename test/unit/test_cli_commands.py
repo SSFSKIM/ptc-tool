@@ -36,12 +36,36 @@ def test_kill_all_kills_every_known_kernel(monkeypatch, capsys):
 
 
 def test_kill_all_with_nothing_to_kill_says_so(monkeypatch, capsys):
+    """The epilog and the README both define exit 1 for "a kill that found nothing", and
+    `--all` is a kill: reporting 0 told shell automation a no-op cleanup had succeeded."""
     _no_session(monkeypatch)
     monkeypatch.setattr(cli, "list_kernels", lambda: [])
     monkeypatch.setattr(cli, "kill_kernel", lambda k: True)
 
-    assert cli.main(["kill", "--all"]) == 0
+    assert cli.main(["kill", "--all"]) == 1
     assert "(no kernels to kill)" in capsys.readouterr().out
+
+
+def test_kill_all_that_killed_nothing_live_also_exits_one(monkeypatch, capsys):
+    """Kernels were listed but every one of them was already gone (ownership check failed,
+    a recycled pid): still nothing killed, still exit 1."""
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: [{"key": "k1"}, {"key": "k2"}])
+    monkeypatch.setattr(cli, "kill_kernel", lambda k: False)
+
+    assert cli.main(["kill", "--all"]) == 1
+    assert "(no kernels to kill)" in capsys.readouterr().out
+
+
+def test_kill_all_json_keeps_the_same_exit_code(monkeypatch, capsys):
+    """The machine form reports the same outcome as the text form — the exit code is the
+    part shell automation actually branches on."""
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: [])
+    monkeypatch.setattr(cli, "kill_kernel", lambda k: True)
+
+    assert cli.main(["kill", "--all", "--json"]) == 1
+    assert _json_out(capsys) == {"all": True, "killed": []}
 
 
 def test_kill_one_still_targets_the_picked_session(monkeypatch, capsys):

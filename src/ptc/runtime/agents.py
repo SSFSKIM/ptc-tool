@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from ptc.paths import private_write_text, secure_dir
+from ptc.paths import KEY_MAX, private_write_text, secure_dir
 
 from . import audit
 from .state import STATE
@@ -113,8 +113,10 @@ class AgentResult:
 
 
 #: The bound safe_key() enforces on every session key. A child key is built to fit INSIDE
-#: it — see child_key().
-_KEY_MAX = 128
+#: it — see child_key() — so it is taken from paths rather than restated here: a key that
+#: overshoots comes back digested, and a child that needed the digest would no longer
+#: carry its own readable parent prefix.
+_KEY_MAX = KEY_MAX
 
 
 def child_key(parent_key: str) -> str:

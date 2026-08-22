@@ -65,7 +65,12 @@ def _record() -> int:
     target = find_claude_ancestor()
     if not sid or not target:
         return 0
-    rd = Path(os.environ.get("PTC_HOME") or (Path.home() / ".ptc")) / "run"
+    # The same rule `ptc.paths.ptc_home()` and `bin/ptc-launch` apply: a `~` or a
+    # relative PTC_HOME must resolve to one directory across all three, or this run-file
+    # — the only channel the adapter keys a session off — is written where nobody reads.
+    raw = os.environ.get("PTC_HOME")
+    home = Path(raw).expanduser().resolve() if raw else Path.home() / ".ptc"
+    rd = home / "run"
     rd.mkdir(parents=True, exist_ok=True)
     # A run-file names the session and the directory it works in, and it is the channel
     # the adapter keys off. Owner-only, like every other PTC state file — with the common

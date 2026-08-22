@@ -12,7 +12,12 @@ import sys
 import time
 from pathlib import Path
 
-HOME = Path(os.environ.get("PTC_HOME") or (Path.home() / ".ptc"))
+#: Byte-for-byte the rule `ptc.paths.ptc_home()` applies — a `~` or a relative PTC_HOME
+#: has to land on the same directory here as it does in the package, or this script
+#: provisions a venv under a path the adapter it execs will never look in.
+_RAW_HOME = os.environ.get("PTC_HOME")
+HOME = (Path(_RAW_HOME).expanduser().resolve() if _RAW_HOME
+        else Path.home() / ".ptc")
 VENV = HOME / "venv"
 PY = VENV / "bin" / "python"
 STAMP = VENV / ".ptc-version"
