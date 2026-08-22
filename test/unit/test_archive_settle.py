@@ -210,7 +210,7 @@ def test_settle_dead_still_reports_kernel_died_when_nothing_was_archived(monkeyp
     kd.mkdir(parents=True)
     (kd / "9.log").write_text("half a line")
 
-    out = KernelClient("r3")._settle_dead(9, 0)
+    out = KernelClient("r3")._settle_dead(9, 0, implicit=True)
 
     assert out.record.error["ename"] == "KernelDied"
     assert "half a line" in out.output
@@ -234,7 +234,7 @@ def test_settle_dead_never_borrows_a_same_numbered_cell_from_an_old_epoch(monkey
     (kd / "1.log").write_text("half a line")        # the dead epoch's own cell 1, mid-run
     _archive(tmp_path, "r4", 1, "an older cell 1\n", _OK)
 
-    out = KernelClient("r4")._settle_dead(1, 0)
+    out = KernelClient("r4")._settle_dead(1, 0, implicit=True)
 
     assert out.record.error and out.record.error["ename"] == "KernelDied"
     assert "half a line" in out.output and "an older cell 1" not in out.output

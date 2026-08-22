@@ -145,3 +145,49 @@ def test_an_immediately_completed_exec_advances_the_cursor(monkeypatch, tmp_path
     done = kc._follow(3, timeout_s=5)
     assert isinstance(done, Completed) and "all of it" in done.output
     assert kc.wait_cell(3, timeout_s=5).output == "", "the cursorless wait replayed the cell"
+
+
+# --- r15 finding 4: since=0 is an explicit request for the whole log ------------------
+
+def _archived_with_a_cursor(key: str, cell_id: int, text: str, cursor: int):
+    """An archived cell plus the archived copy of THIS caller's cursor sidecar — what a
+    restart leaves behind for a caller that had already been served part of the log."""
+    from ptc.cells import offset_name
+    from ptc.paths import kernel_dir
+
+    d = kernel_dir(key) / "cells-prev-1"
+    (d / "offsets").mkdir(parents=True)
+    (d / f"{cell_id}.log").write_text(text)
+    (d / f"{cell_id}.json").write_text(json.dumps(_RECORD))
+    (d / "offsets" / offset_name(cell_id)).write_text(str(cursor))
+    secure_dir(cells_dir(key))
+
+
+def test_an_explicit_since_zero_reads_the_archived_log_from_the_top(monkeypatch, tmp_path):
+    """Zero is an offset, not an absence.
+
+    `since=0` is a caller asking for the whole cell from byte zero — a fresh reader, a
+    retry after a lost render, an operator reading a log somebody else already consumed.
+    The archived-cursor consult tested it for truthiness, so an explicit 0 fell through to
+    the sidecar the previous epoch left behind and the caller was handed the tail with no
+    way to ask for the rest. Only the implicit form (`since=-1`, "resume after what I was
+    last served") has a cursor to look up.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _archived_with_a_cursor("c7", 5, "first half\nsecond half\n", len("first half\n"))
+
+    out = KernelClient("c7").wait_cell(5, timeout_s=10, since=0)
+    assert isinstance(out, Completed)
+    assert "first half" in out.output and "second half" in out.output, \
+        f"an explicit since=0 was answered from the archived cursor: {out.output!r}"
+
+
+def test_the_implicit_form_still_resumes_from_the_archived_cursor(monkeypatch, tmp_path):
+    """The other half of the same rule: a restart moves this caller's sidecar into the
+    archive, and a cursorless wait must still resume behind it rather than replay (r11)."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _archived_with_a_cursor("c8", 5, "first half\nsecond half\n", len("first half\n"))
+
+    out = KernelClient("c8").wait_cell(5, timeout_s=10, since=-1)
+    assert isinstance(out, Completed)
+    assert "first half" not in out.output and "second half" in out.output, out.output

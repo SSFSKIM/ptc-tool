@@ -181,7 +181,7 @@ class KernelClient:
             return False
         return not (kernel_dir(self.key) / "ready").exists()
 
-    def _settle_dead(self, cell_id: int, offset: int) -> Completed:
+    def _settle_dead(self, cell_id: int, offset: int, *, implicit: bool) -> Completed:
         """No kernel is answering: settle the cell from whatever it left behind.
 
         Three places are consulted in the order that keeps the most truth. The live record
@@ -210,7 +210,7 @@ class KernelClient:
             text, _ = read_output_since(self.key, cell_id, offset)
             return Completed(cell_id, rec, text)
         if not (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
-            arch = self._archived(cell_id, offset)
+            arch = self._archived(cell_id, offset, implicit=implicit)
             if arch is not None:
                 return arch
         text, _ = read_output_since(self.key, cell_id, offset)
@@ -223,7 +223,7 @@ class KernelClient:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 out, off = read_output_since(self.key, cell_id, 0)
-                arch = self._rotated_under_the_record(cell_id, 0, out)
+                arch = self._rotated_under_the_record(cell_id, 0, out, implicit=True)
                 if arch is not None:
                     return arch
                 # Same rule as the Running exit below, and it applies to a cell that
@@ -242,7 +242,7 @@ class KernelClient:
                 # spend the whole yield budget and then call a finished cell Running.
                 # (The log is also simply absent for the instant before the kernel opens
                 # it, which is why a miss here just keeps polling.)
-                arch = self._archived(cell_id, 0)
+                arch = self._archived(cell_id, 0, implicit=True)
                 if arch is not None:
                     return arch
             if self._kernel_known_dead():
@@ -253,7 +253,7 @@ class KernelClient:
                 # PROOF of death, not `kernel_alive`'s absence of proof of life: settling
                 # a running cell as KernelDied because one identity read failed is a
                 # terminal answer invented out of nothing (`_kernel_known_dead`).
-                return self._settle_dead(cell_id, 0)
+                return self._settle_dead(cell_id, 0, implicit=True)
             time.sleep(0.2)
         out, off = read_output_since(self.key, cell_id, 0)
         # seed the cursor sidecar: this output has been handed to the caller, so a
@@ -503,9 +503,15 @@ class KernelClient:
             lock_cm.__exit__(None, None, None)
         return self._follow(cell_id, timeout_s)
 
-    def _archived(self, cell_id: int, offset: int = 0) -> Completed | None:
+    def _archived(self, cell_id: int, offset: int = 0, *,
+                  implicit: bool = True) -> Completed | None:
         """A cell id from a previous kernel epoch (F3): settle it from the archive,
         resuming at the caller's cursor so an already-delivered log is not replayed.
+
+        `implicit` is the caller's `since` form, not its offset: True for the cursorless
+        request every exec-path follow makes, False when the caller named a byte
+        (`_archived_start`). It defaults to the implicit form because that is what the
+        API's own default (`since=-1`) is.
 
         Bounded like every other log read (`read_since`), and for the same reason: an
         archived log has no size of its own — a verbose cell leaves gigabytes behind — and
@@ -517,7 +523,8 @@ class KernelClient:
             log = d / f"{cell_id}.log"
             if not log.exists():
                 continue
-            text, new_off = read_since(log, self._archived_start(d, cell_id, offset))
+            text, new_off = read_since(
+                log, self._archived_start(d, cell_id, offset, implicit))
             save_offset(self.key, cell_id, new_off)
             try:
                 rec = json.loads((d / f"{cell_id}.json").read_text())
@@ -532,8 +539,8 @@ class KernelClient:
             return Completed(cell_id, record, text + note, log_path=log)
         return None
 
-    def _rotated_under_the_record(self, cell_id: int, offset: int,
-                                  text: str) -> "Completed | None":
+    def _rotated_under_the_record(self, cell_id: int, offset: int, text: str, *,
+                                  implicit: bool) -> "Completed | None":
         """Did a restart move this cell out from between the record read and the log read?
 
         The record branch is two reads, and a concurrent restart fits between them: the
@@ -559,9 +566,9 @@ class KernelClient:
             return None
         if (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
             return None
-        return self._archived(cell_id, offset)
+        return self._archived(cell_id, offset, implicit=implicit)
 
-    def _archived_start(self, d: Path, cell_id: int, offset: int) -> int:
+    def _archived_start(self, d: Path, cell_id: int, offset: int, implicit: bool) -> int:
         """Where an archived read really starts for THIS caller.
 
         A restart renames `cells/` — every caller's cursor sidecar inside it — and puts a
@@ -571,15 +578,18 @@ class KernelClient:
         moves the cursor out from under it. The rotation kept the sidecar; it just moved it,
         so the archive is asked for it under the same name.
 
-        Consulted only when this caller has NO live sidecar: a live cursor and an explicit
-        `since=` both still win, and the archived answer is a fallback rather than an
-        override. An archived 0 is indistinguishable from a genuine start-at-zero here, and
-        that is fine — both mean "from the top", which is what start-at-zero asks for.
+        Consulted only for an IMPLICIT request (`since=-1` — "resume after what I was last
+        served") that has no live sidecar: an explicit `since=` is the caller naming the
+        byte it wants and the archive has nothing to add to it. Explicitness has to be
+        carried in rather than inferred from the offset, because `since=0` — a fresh
+        reader, a retry after a lost render — is a real request for the whole log that a
+        truthiness test read as "no cursor given" and answered with the previous epoch's
+        tail, leaving the caller no way to ask for the rest.
 
         Ambiguity recorded rather than fixed: once the new epoch hands out this cell id
         again, the live and archived cursors share a key. The live path wins by design.
         """
-        if offset or offset_path(self.key, cell_id).exists():
+        if not implicit or offset or offset_path(self.key, cell_id).exists():
             return offset
         try:
             return int((d / "offsets" / offset_name(cell_id)).read_text())
@@ -601,19 +611,21 @@ class KernelClient:
 
     def wait_cell(self, cell_id: int, timeout_s: float,
                   since: int = -1) -> Completed | Running | NotFound:
-        offset = default_offset(self.key, cell_id) if since < 0 else since
+        implicit = since < 0
+        offset = default_offset(self.key, cell_id) if implicit else since
         deadline = time.monotonic() + timeout_s
         while True:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 text, new_off = read_output_since(self.key, cell_id, offset)
-                arch = self._rotated_under_the_record(cell_id, offset, text)
+                arch = self._rotated_under_the_record(cell_id, offset, text,
+                                                      implicit=implicit)
                 if arch is not None:
                     return arch
                 save_offset(self.key, cell_id, new_off)
                 return Completed(cell_id, rec, text)
             if not (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
-                arch = self._archived(cell_id, offset)
+                arch = self._archived(cell_id, offset, implicit=implicit)
                 if arch is not None:
                     return arch
                 # Nothing under this key ever ran this cell: no record, no log, no
@@ -633,7 +645,7 @@ class KernelClient:
                 if kernel_alive(self.key) and not self._pending_names(cell_id):
                     return NotFound(cell_id)
             if self._kernel_known_dead():
-                return self._settle_dead(cell_id, offset)
+                return self._settle_dead(cell_id, offset, implicit=implicit)
             if time.monotonic() >= deadline:
                 text, new_off = read_output_since(self.key, cell_id, offset)
                 save_offset(self.key, cell_id, new_off)
