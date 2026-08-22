@@ -30,6 +30,37 @@ def test_launcher_stamp_matches_venv_module():
     assert _load_launcher().payload() == stamp_payload()
 
 
+def test_launcher_and_library_run_the_same_provisioning_commands(monkeypatch, tmp_path):
+    """One venv, two provisioners: the launcher builds it before the package is importable
+    and the library rebuilds it afterwards, and each accepts the other's stamp. So the
+    stamp has to be backed by the same BUILD — agreeing about a venv the two filled
+    differently (a lock-respecting sync on one side, a fresh resolution on the other) is
+    worse than not agreeing at all."""
+    import subprocess
+
+    from ptc import venv
+
+    def recorder(calls, home):
+        def run(cmd, **kw):
+            calls.append([("<venv>" if x == str(home / "venv") else x) for x in cmd[1:]])
+            (home / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+        return run
+
+    launcher_home, library_home = tmp_path / "a", tmp_path / "b"
+    launched: list = []
+    monkeypatch.setenv("PTC_HOME", str(launcher_home))
+    monkeypatch.setattr(subprocess, "run", recorder(launched, launcher_home))
+    _load_launcher().provision()
+
+    library: list = []
+    monkeypatch.setenv("PTC_HOME", str(library_home))
+    (library_home / "venv" / "bin").mkdir(parents=True)
+    (library_home / "venv" / "bin" / "python").write_text("#!fake\n")
+    venv.ensure_venv(run=recorder(library, library_home))
+
+    assert launched == library and launched, launched
+
+
 def test_launcher_is_executable():
     assert LAUNCH.stat().st_mode & 0o111, "ptc-launch must be committed with the exec bit"
 

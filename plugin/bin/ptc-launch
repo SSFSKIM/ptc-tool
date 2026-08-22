@@ -25,8 +25,10 @@ PKG = Path(__file__).resolve().parent.parent.parent      # plugin/bin/ptc-launch
 
 
 def payload() -> dict:
-    sha = hashlib.sha256((PKG / "pyproject.toml").read_bytes()).hexdigest()
-    return {"schema": 1, "pyproject_sha": sha, "pkg": str(PKG)}
+    def sha(name):
+        return hashlib.sha256((PKG / name).read_bytes()).hexdigest()
+    return {"schema": 2, "pyproject_sha": sha("pyproject.toml"),
+            "lock_sha": sha("uv.lock"), "pkg": str(PKG)}
 
 
 def current() -> bool:
@@ -42,7 +44,11 @@ def provision() -> None:
     # every upgrade starts from. It still declines to wipe a non-venv directory.
     subprocess.run([uv, "venv", str(VENV), "--python", "3.12", "--seed", "--clear"],
                    check=True)
-    subprocess.run([uv, "pip", "install", "--python", str(PY), "-e", f"{PKG}[kernel]"], check=True)
+    # Installs the checked-in uv.lock, not a fresh resolution of pyproject.toml — see
+    # ptc.venv.ensure_venv, whose two commands this must stay identical to.
+    subprocess.run([uv, "sync", "--locked", "--inexact", "--no-dev", "--extra", "kernel",
+                    "--project", str(PKG)],
+                   check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(VENV)})
     STAMP.write_text(json.dumps(payload()))
 
 

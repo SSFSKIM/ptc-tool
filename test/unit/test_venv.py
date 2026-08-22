@@ -35,9 +35,11 @@ def test_provisions_when_missing(monkeypatch, tmp_path):
     py = venv.ensure_venv(run=_fake_run_factory(calls))
     assert py == venv_dir() / "bin" / "python"
     assert any(c[1] == "venv" for c in calls)
-    assert any("pip" in c for c in calls)          # uv pip install -e .[kernel]
+    sync = next(c for c in calls if c[1] == "sync")
+    # the checked-in lock, not a fresh resolution of pyproject.toml
+    assert "--locked" in sync and "--extra" in sync and "kernel" in sync
     stamp = json.loads((venv_dir() / ".ptc-version").read_text())
-    assert stamp["schema"] == 1 and "pyproject_sha" in stamp
+    assert stamp["schema"] == 2 and stamp["pyproject_sha"] and stamp["lock_sha"]
 
 
 def test_skips_when_stamp_current(monkeypatch, tmp_path):
@@ -98,3 +100,24 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="lock"):
         venv.ensure_venv(run=_must_not_provision)
     assert len(sleep_calls) == 1200
+
+
+def test_a_lock_only_change_reprovisions(monkeypatch, tmp_path):
+    """A dependency fix that changes only `uv.lock` left every existing venv reading as
+    current and every fresh one resolving unconstrained from `pyproject.toml`, so a
+    deployed plugin could keep running versions nobody tested indefinitely."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    proj = tmp_path / "pkg"
+    proj.mkdir()
+    (proj / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (proj / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(venv, "PKG_ROOT", proj)
+
+    calls: list = []
+    venv.ensure_venv(run=_fake_run_factory(calls))
+    venv.ensure_venv(run=_must_not_provision)          # nothing changed: no work
+
+    (proj / "uv.lock").write_text("version = 1\n# a dependency was pinned down\n")
+    calls.clear()
+    venv.ensure_venv(run=_fake_run_factory(calls))
+    assert any(c[1] == "sync" for c in calls), "a lock-only change must reprovision"

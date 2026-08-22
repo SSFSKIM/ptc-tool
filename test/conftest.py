@@ -13,20 +13,25 @@ CACHE_VENV = PKG / ".venv-kernel"
 def kernel_venv() -> Path:
     """A real venv with ipykernel + ptc (editable), cached across runs.
 
-    The cache is keyed on pyproject.toml's contents: the .ok marker stores the
-    hash it was provisioned with, and a change invalidates the cache.
+    Provisioned the way `ptc.venv.ensure_venv` provisions the real one — from the
+    checked-in `uv.lock` — and keyed the same way: the .ok marker stores a hash of
+    BOTH files, so a lock-only dependency change invalidates the cache here too. A
+    test venv resolved differently from the shipped one tests a different program.
     """
     py = CACHE_VENV / "bin" / "python"
     marker = CACHE_VENV / ".ok"
-    sha = hashlib.sha256((PKG / "pyproject.toml").read_bytes()).hexdigest()
+    sha = hashlib.sha256(b"".join((PKG / n).read_bytes()
+                                  for n in ("pyproject.toml", "uv.lock"))).hexdigest()
     if not (py.exists() and marker.exists() and marker.read_text() == sha):
         uv = os.environ.get("UV", "uv")
-        # --clear: the invalidation case (a pyproject change) always starts from an
-        # existing venv, and uv refuses to create over one — the same defect T11 fixed in
-        # the launcher and the provisioner, latent here until the first cache miss.
+        # --clear: the invalidation case always starts from an existing venv, and uv
+        # refuses to create over one — the same defect T11 fixed in the launcher and the
+        # provisioner, latent here until the first cache miss.
         subprocess.run([uv, "venv", str(CACHE_VENV), "--python", "3.12", "--seed", "--clear"],
                        check=True)
-        subprocess.run([uv, "pip", "install", "--python", str(py), "-e", f"{PKG}[kernel]"], check=True)
+        subprocess.run([uv, "sync", "--locked", "--inexact", "--no-dev", "--extra", "kernel",
+                        "--project", str(PKG)],
+                       check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(CACHE_VENV)})
         marker.write_text(sha)
     return CACHE_VENV
 

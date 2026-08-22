@@ -1,6 +1,7 @@
 """Provision ~/.ptc/venv with uv. Stamp payload is shared with plugin/bin/ptc-launch."""
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,8 +20,17 @@ def _uv() -> str:
 
 
 def stamp_payload() -> dict:
-    sha = hashlib.sha256((PKG_ROOT / "pyproject.toml").read_bytes()).hexdigest()
-    return {"schema": 1, "pyproject_sha": sha, "pkg": str(PKG_ROOT)}
+    """What the venv was built FROM, both files of it.
+
+    `uv.lock` is half the answer and used to be no part of it: a dependency fix that
+    changed only the lock left every existing venv reading as current and every fresh one
+    resolving unconstrained from `pyproject.toml`, so the deployed plugin could run
+    versions nobody tested for as long as nobody touched the other file.
+    """
+    def sha(name: str) -> str:
+        return hashlib.sha256((PKG_ROOT / name).read_bytes()).hexdigest()
+    return {"schema": 2, "pyproject_sha": sha("pyproject.toml"),
+            "lock_sha": sha("uv.lock"), "pkg": str(PKG_ROOT)}
 
 
 def stamp_current() -> bool:
@@ -57,8 +67,15 @@ def ensure_venv(run=subprocess.run) -> Path:
         # state every upgrade starts from. It still declines to wipe a non-venv directory.
         run([uv, "venv", str(venv_dir()), "--python", "3.12", "--seed", "--clear"],
             check=True)
-        run([uv, "pip", "install", "--python", str(venv_python()),
-             "-e", f"{PKG_ROOT}[kernel]"], check=True)
+        # `uv sync --locked` installs the versions in the checked-in `uv.lock` and fails
+        # loudly if that lock no longer matches `pyproject.toml` — the honest failure, at
+        # provisioning time, rather than a kernel quietly running a resolution nobody
+        # tested. `--inexact` leaves the seeded pip alone (a bare sync removes anything the
+        # lock does not name); `--no-dev` keeps the test group out of a user's runtime; the
+        # project itself is installed editable, exactly as `uv pip install -e` had it.
+        run([uv, "sync", "--locked", "--inexact", "--no-dev", "--extra", "kernel",
+             "--project", str(PKG_ROOT)],
+            check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv_dir())})
         (venv_dir() / ".ptc-version").write_text(json.dumps(stamp_payload()))
     finally:
         lock.rmdir()

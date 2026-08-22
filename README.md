@@ -66,11 +66,26 @@ survives `--resume` until the idle TTL (default 24 h; `PTC_IDLE_HOURS`), a `rest
 the machine rebooting. A restart loses the Python namespace but not child agent sessions —
 those live in `agents.json` and stay resumable through `agent.list()` / `agent.resume()`.
 
-`ptc list | doctor` inspect this machine's kernels from any shell; `ptc exec | wait |
-interrupt | kill | restart` act on one kernel. Those five take `--session`; with none
-given the CLI picks the newest live kernel and prints which one it picked. `ptc kill
---all` ends every kernel whose ownership still checks out, and `ptc doctor` only reports
-— it prints what `ptc setup` would provision rather than provisioning anything itself.
+`list | doctor` inspect this machine's kernels from any shell; `exec | wait | interrupt |
+kill | restart` act on one kernel. Those five take `--session`; with none given the CLI
+picks the newest live kernel and prints which one it picked. `kill --all` ends every
+kernel whose ownership still checks out, and `doctor` only reports — it prints what
+`setup` would provision rather than provisioning anything itself.
+
+Nothing installs a `ptc` onto your `PATH`, so run it by one of the two paths that exist.
+From the session's own Bash tool, or any shell, the provisioned venv has it:
+
+    ~/.ptc/venv/bin/ptc exec 'print(x)'
+    ~/.ptc/venv/bin/ptc list
+
+From a checkout of this package (the form `setup` above uses), `uv run` puts its own
+project environment on the path for one command:
+
+    cd ptc/ && uv run ptc list
+
+Both drive the same kernels; the venv one is what the skill and the acceptance scenarios
+use, because it needs no checkout and no working directory. Adding a `ptc` to your own
+`PATH` — a symlink, a shell alias — is yours to do and nothing here does it for you.
 
 Exit codes: **0** success · **1** the cell raised, the wait found no such cell, or `kill`
 found nothing to kill · **3** the kernel was busy and the code was **not** run. Nothing is
