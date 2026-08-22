@@ -49,32 +49,41 @@ def read(kernel_dir) -> list:
 
 
 def _recycled(row: dict) -> bool:
-    """True when the recorded pgid is now led by a DIFFERENT process than the one that
-    was registered — the OS handed that pid out again and signalling the group would kill
-    unrelated same-user work.
+    """True when this row's group may NOT be signalled on identity grounds — the recorded
+    pgid is led by a different process than the one registered, or by one nobody can
+    identify at all.
 
-    A leader that no longer exists is NOT this case: a pid cannot be reused while it is
-    still a live group's id, so an absent leader means the group is either gone (ESRCH,
-    harmless) or holds only the orphaned children this reap exists for — a background
-    `bash` whose shell exited leaving its own children behind. That is the row the shell
-    keeps deliberately, flagged `leader_exited` (`runtime/shell.py` `_retire`): it is
-    retained precisely because its group outlived its leader, and this branch is what lets
-    it still be reaped.
+    `start_time_matches` has three answers and the third is the one that bites. None means
+    the identity could not be READ: a `ps` that timed out under load, a `/proc` read that
+    failed, an EPERM on a live process that now leads this recycled pgid. Folding that
+    unknown into "not recycled" is fail-open — it licenses a SIGKILL of a group nothing
+    ever confirmed was ours — so an unreadable leader fails closed.
+
+    Except for `leader_exited` rows, where the unreadable leader is the RECORDED, expected
+    state. A daemonizing background `bash` exits its shell and leaves its children in the
+    same group, so the shell keeps the row precisely to reap them (`runtime/shell.py`
+    `_retire`) and the leader's identity is unreadable forever after. There is no stranger
+    to protect there: POSIX will not hand that pid out again while it is still a live
+    group's id, and a group with no members left is an ESRCH the reap already tolerates.
 
     A row with no identity at all is a different question entirely and is not answered here
     — see `unverifiable()`.
     """
-    return start_time_matches(row["pgid"], row.get("leader_start")) is False
+    match = start_time_matches(row["pgid"], row.get("leader_start"))
+    if match is None:
+        return not row.get("leader_exited")
+    return match is False
 
 
 def unverifiable(row: dict) -> bool:
     """True when nothing ever proved WHICH process led this row's group.
 
-    `_recycled` can only compare against a recorded identity; with none, every stale row
-    reads as safe to signal, and a pgid outlives the group it named — the OS hands that
-    number to unrelated same-user work and the next kill/restart/TTL reap SIGKILLs a
-    stranger's process group. A row that could not be identified when it was written is
-    therefore quarantined: `reap` may DROP it (the file is consumed either way, and a row
+    `_recycled` can only compare against a recorded identity, and a pgid outlives the group
+    it named — the OS hands that number to unrelated same-user work and the next
+    kill/restart/TTL reap would SIGKILL a stranger's process group. A row that could not be
+    identified when it was written is therefore quarantined HERE, ahead of any comparison,
+    so its eligibility never depends on what an identity read happens to answer for a
+    number nobody recorded: `reap` may DROP it (the file is consumed either way, and a row
     whose group is already empty costs nothing to forget), but never signals it. The shell
     retries the identity read before giving up and marks what it could not resolve
     (`runtime/shell.py` `_register`); rows written before identities were recorded at all
@@ -94,6 +103,11 @@ def signalable(row: dict) -> bool:
     signals a recorded pgid owes it: `reap` on the host side and `BashHandle.kill()` inside
     the kernel, which holds the same recorded identity and must not reach a group the
     registry rules would have spared.
+
+    Signalling takes proof, in both directions: a row nobody could identify when it was
+    written is out, and so is one whose leader cannot be identified NOW — unless the row
+    itself records that the leader is expected to be gone. Everything else is spared, at
+    the cost of leaving the odd already-empty group unsignalled, which costs nothing.
     """
     pgid = row.get("pgid")
     if not isinstance(pgid, int) or pgid <= 1:

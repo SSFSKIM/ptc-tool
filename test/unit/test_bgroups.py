@@ -6,6 +6,7 @@ malformed is possible, and the reaper's own group must never be in the blast rad
 """
 import json
 import os
+import signal
 import subprocess
 import time
 
@@ -125,6 +126,51 @@ def test_a_row_that_lost_its_leader_after_registration_is_still_signalled(tmp_pa
         if p.poll() is None:
             p.kill()
             p.wait()
+
+
+# --- r10 finding 2: an identity that cannot be READ is not a licence to signal ---------
+
+def test_reap_never_signals_a_group_whose_identity_cannot_be_read(tmp_path, monkeypatch):
+    """`start_time_matches` has three answers and only one of them is "still ours". None
+    means the identity could not be read AT ALL — a `ps` that timed out under load, an
+    EPERM on a live process that now leads this recycled pgid — and testing it with
+    `is False` folded that unknown into "not recycled", so the reap SIGKILLed a group
+    nothing had identified. An unreadable leader fails closed."""
+    p = _live_group()
+    try:
+        bgroups.write(tmp_path, [{"pgid": p.pid, "pid": p.pid,
+                                  "leader_start": proc_start_time(p.pid)}])
+        monkeypatch.setattr(bgroups, "start_time_matches", lambda pid, rec: None)
+
+        assert bgroups.reap(tmp_path) == []
+        time.sleep(0.3)
+        assert p.poll() is None, "a group whose identity could not be read was signalled"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_an_orphaned_group_whose_leader_is_gone_is_still_reaped(tmp_path):
+    """The exception the fail-closed rule must not swallow, and the reason `_retire` keeps
+    the row at all: a daemonizing command leaves its descendants in the leader's group and
+    then the leader exits, so its identity is unreadable forever after. POSIX will not
+    recycle that pid while the group still has members, so there is no stranger to protect
+    here — the unknown is the RECORDED, expected state, and `leader_exited` is what says
+    so. Real processes, not a stubbed identity: the leader is really reaped first."""
+    p = subprocess.Popen(["/bin/sh", "-c", "sleep 30 & exit 0"], start_new_session=True)
+    p.wait()                                  # the leader is gone; the sleep is not
+    try:
+        os.killpg(p.pid, 0)                   # ESRCH here means the fixture, not the rule
+        bgroups.write(tmp_path, [{"pgid": p.pid, "pid": p.pid,
+                                  "leader_start": "btime=1.000000",
+                                  "leader_exited": True}])
+
+        assert bgroups.reap(tmp_path) == [p.pid], "the orphaned group was left running"
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def test_registration_marks_a_group_it_could_not_identify(tmp_path, monkeypatch):

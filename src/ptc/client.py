@@ -121,10 +121,20 @@ class KernelClient:
 
         Three places are consulted in the order that keeps the most truth. The live record
         first — the settle may have landed in the window between the caller's last look and
-        the kernel's death. Then the ARCHIVE: "no kernel" also describes a RESTART, and a
-        restart moves this cell's log and record into `cells-prev-*` before the replacement
-        comes up, so a completed cell is sitting right there and calling it KernelDied
-        would hide it. Only with neither is KernelDied the verdict.
+        the kernel's death. Then the ARCHIVE, but only when this cell's live log is gone:
+        "no kernel" also describes a RESTART, and a restart moves this cell's log and record
+        into `cells-prev-*` before the replacement comes up, so a completed cell is sitting
+        right there and calling it KernelDied would hide it. Only with neither is KernelDied
+        the verdict.
+
+        The live log is what makes that archive consult about THIS cell. Execution counts
+        restart at 1 in every epoch, so `cells-prev-*` holds ids the current kernel hands
+        out again, and an unguarded lookup settles a cell that died mid-run with a
+        same-numbered stranger from an older epoch — its status, its output, its images,
+        and no KernelDied anywhere. A restart is precisely what MOVES the log out of
+        `cells/`, so one still standing there proves the id belongs to the epoch that just
+        died and nothing in the archive is about it. (`_follow` and `wait_cell` guard their
+        own in-loop consults on the same fact.)
 
         On the first and last paths the cursor is deliberately NOT advanced: a dead kernel
         writes no more output, so there is nothing to resume after. `_archived` advances
@@ -134,9 +144,10 @@ class KernelClient:
         if rec is not None:
             text, _ = read_output_since(self.key, cell_id, offset)
             return Completed(cell_id, rec, text)
-        arch = self._archived(cell_id, offset)
-        if arch is not None:
-            return arch
+        if not (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
+            arch = self._archived(cell_id, offset)
+            if arch is not None:
+                return arch
         text, _ = read_output_since(self.key, cell_id, offset)
         return Completed(cell_id, CellRecord(**_kernel_died_record()), text)
 
@@ -214,8 +225,13 @@ class KernelClient:
         guarantee this whole path exists to keep: nothing is ever silently queued.
 
         Three things do discharge it, and only these three:
-          * the kernel that took the request is gone, or came back under a new epoch —
-            whatever it accepted died with it;
+          * the kernel that took the request is gone, or came back as a different
+            INCARNATION — whatever it accepted died with it. Incarnation is the epoch and
+            the nonce together (`_owner_identity`): the epoch is a whole-second timestamp,
+            so a restart inside one second leaves the marker of the kernel it replaced
+            looking exactly like its own, and a marker naming no cell has nothing else that
+            could ever discharge it. A marker written before nonces were stamped carries
+            none, and an absent key is absence of evidence rather than a mismatch;
           * a terminal record exists for the cell the marker names — that cell settled;
           * current.json names a LATER cell — the kernel runs cells in order, so a later
             one can only have started after ours left the queue.
@@ -225,8 +241,11 @@ class KernelClient:
         if not kernel_alive(self.key):
             return True
         o = read_owner(self.key)
-        if data.get("epoch") and o is not None and o.epoch != data["epoch"]:
-            return True
+        if o is not None:
+            if data.get("epoch") and o.epoch != data["epoch"]:
+                return True
+            if data.get("nonce") and o.nonce != data["nonce"]:
+                return True
         cid = data.get("cell_id")
         if cid is None:
             return False
@@ -282,15 +301,17 @@ class KernelClient:
 
         This one is written BEFORE the send and IS the admission guard, so it raises: a
         marker that cannot be written aborts the submission rather than letting it proceed
-        unguarded. The epoch is stamped in so a later kernel can tell the marker is not
-        about IT (see `_pending_discharged`).
+        unguarded. The whole incarnation is stamped in — epoch AND nonce — so a later
+        kernel can tell the marker is not about IT (see `_pending_discharged`); the epoch
+        alone resolves only to the second, which two restarts can share.
         """
         secure_dir(kernel_dir(self.key) / "cells")
         private_write_text(
             kernel_dir(self.key) / "cells" / "pending.json",
             json.dumps({"msg_id": msg_id, "cell_id": cell_id,
                         "submitted_at": time.time(),
-                        "epoch": owner[0] if owner else None}))
+                        "epoch": owner[0] if owner else None,
+                        "nonce": owner[1] if owner else None}))
 
     def _refresh_pending(self, msg_id: str | None, cell_id: int | None,
                          owner: tuple | None) -> None:

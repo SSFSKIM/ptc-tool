@@ -49,9 +49,11 @@ def _register(proc, cmd: str) -> int | None:
     # `ps` can fail transiently, and a leader that exits inside this call cannot be read at
     # all — so the read is retried once (the same one-retry the kernel spawn gives its own
     # identity), and a row that still has no identity is written MARKED rather than written
-    # bare. A bare row is indistinguishable from a verified one to the reaper: it reads as
-    # "not recycled", and once its pgid is handed out again the reap kills a stranger. The
-    # mark is what keeps such a row droppable but never signalable (`bgroups.unverifiable`).
+    # bare. Nothing about a bare row tells the reaper it was never verified — it once read
+    # as "not recycled", and once its pgid was handed out again the reap killed a stranger.
+    # The mark is what keeps such a row droppable but never signalable
+    # (`bgroups.unverifiable`), independently of what an identity read says about a pgid
+    # nobody recorded.
     # Registration does not fail on it: the command is already running, and a row that can
     # be dropped but not signalled is strictly better than no row at all — `kill()` and
     # `_retire` still find the group through it.
@@ -93,9 +95,12 @@ def _retire(pgid: int | None) -> None:
     A daemonizing command (`sleep 300 >/dev/null 2>&1 &`) exits its shell immediately and
     leaves the descendant behind in the SAME group, so unregistering on the leader's exit
     threw away the only PGID anything could still reap it by, and the descendant outlived
-    the kernel. The row stays, marked `leader_exited` — the shape bgroups._recycled is
-    written to accept, since a pid cannot be recycled while it is still a live group's id,
-    so an absent leader is never the identity-mismatch case that suppresses a reap. Losing
+    the kernel. The row stays, marked `leader_exited`, and that mark is what carries its
+    signal-eligibility: an exited leader has no identity left to read, and `bgroups`
+    otherwise refuses to signal a group it cannot identify. The exception is sound because
+    a pid cannot be recycled while it is still a live group's id — and this row is retained
+    only while the group has members — so an absent leader here is the recorded, expected
+    state rather than the stranger the identity check exists to spare. Losing
     the leader does not cost a row its signal-eligibility either: it was identified when it
     was REGISTERED, and only a row that never was is quarantined (`bgroups.unverifiable`).
     """
@@ -217,10 +222,14 @@ class BashHandle:
         # A background group survives the kernel unless somebody records it: it is its own
         # session, so no group kill on the kernel reaches it.
         self._pgid = _register(proc, cmd)
-        # The registry row as WRITTEN, kept because `_retire` will take it out of `_LIVE`
+        # The registry row ITSELF, not a copy of it: `_retire` will take it out of `_LIVE`
         # while this handle lives on holding the bare number — and a bare number is not an
-        # identity (`kill`).
-        self._row = dict(_LIVE.get(self._pgid, {}))
+        # identity (`kill`) — but it also MARKS it `leader_exited` in place, which is the
+        # one fact that keeps a daemonizer's orphaned group signalable once its leader is
+        # unreadable (`bgroups._recycled`). A snapshot taken at registration never sees that
+        # mark, so `kill()` read the group as unidentifiable and left the descendants
+        # running. Holding the object retains the row past its removal just as well.
+        self._row = _LIVE.get(self._pgid) or {}
         watcher = asyncio.ensure_future(self._forget_when_done())
         _WATCHERS.add(watcher)
         watcher.add_done_callback(_WATCHERS.discard)

@@ -18,19 +18,21 @@ _RECORD = {"status": "ok", "duration_ms": 1, "result_repr": None, "error": None,
            "images": [], "mutations": []}
 
 
-def _live_kernel(key: str, epoch: str = "e1"):
+def _live_kernel(key: str, epoch: str = "e1", nonce: str = "nonce"):
     kd = kernel_dir(key)
     (kd / "cells").mkdir(parents=True)
     write_owner(key, Owner(os.getpid(), proc_start_time(os.getpid()), time.time(),
-                           "nonce", epoch))
+                           nonce, epoch))
     (kd / "ready").write_text(epoch)
     return kd
 
 
-def _mark(kd, cell_id, *, age: float = 3600.0, epoch: str = "e1"):
-    (kd / "cells" / "pending.json").write_text(json.dumps(
-        {"msg_id": "m-1", "cell_id": cell_id, "submitted_at": time.time() - age,
-         "epoch": epoch}))
+def _mark(kd, cell_id, *, age: float = 3600.0, epoch: str = "e1", nonce=...):
+    data = {"msg_id": "m-1", "cell_id": cell_id, "submitted_at": time.time() - age,
+            "epoch": epoch}
+    if nonce is not ...:
+        data["nonce"] = nonce
+    (kd / "cells" / "pending.json").write_text(json.dumps(data))
 
 
 def test_an_aged_marker_alone_never_reopens_admission(monkeypatch, tmp_path):
@@ -298,3 +300,56 @@ def test_a_key_replaced_faster_than_it_can_be_bound_fails_before_sending(monkeyp
         KernelClient("p11").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
 
     assert not marker.exists(), "a submission that never sent anything left a marker"
+
+
+# --- r10 finding 3: the marker names the incarnation, not just the second it started ---
+
+def test_a_marker_from_a_same_second_predecessor_discharges(monkeypatch, tmp_path):
+    """The epoch is a whole-second timestamp, so two incarnations born inside one second
+    carry the SAME one — which is why `_owner_identity` is a pair. The marker recorded only
+    the epoch, so a stamp that lost the race between `_refresh_pending`'s identity check
+    and its write (check-then-write, no lock) landed in the REPLACEMENT's fresh cells/
+    looking exactly like the replacement's own: equal epochs, no cell id for a record to
+    settle, nothing left to discharge it. The fresh kernel was busy for good. The nonce is
+    drawn per spawn and tells the two apart."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p12", epoch="e1", nonce="nonce-2")
+    _mark(kd, None, epoch="e1", nonce="nonce-1")
+
+    assert KernelClient("p12").is_busy() is None, "the fresh kernel inherited a stranger"
+    assert not (kd / "cells" / "pending.json").exists(), "a discharged marker must go"
+
+
+def test_a_marker_from_this_very_incarnation_still_holds_admission(monkeypatch, tmp_path):
+    """The other half: the nonce must not discharge the marker the LIVE kernel's own
+    submitter wrote — that request may still be queued, and admitting past it is the silent
+    queueing this whole path forbids."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p13", epoch="e1", nonce="nonce-1")
+    _mark(kd, None, epoch="e1", nonce="nonce-1")
+
+    assert KernelClient("p13").is_busy() == Busy(-1, reason="pending-unconfirmed")
+
+
+def test_a_marker_written_before_nonces_keeps_the_epoch_only_verdict(monkeypatch,
+                                                                     tmp_path):
+    """Markers live for seconds and are archived by the restart that ends their epoch, so
+    there is nothing to migrate — but one written by the previous build carries no nonce,
+    and absence of the key is absence of evidence, not evidence of a mismatch."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p14", epoch="e1", nonce="nonce-2")
+    _mark(kd, None, epoch="e1")                          # no nonce key at all
+
+    assert KernelClient("p14").is_busy() == Busy(-1, reason="pending-unconfirmed")
+
+
+def test_the_marker_records_the_nonce_it_was_stamped_with(monkeypatch, tmp_path):
+    """The comparison above is only worth as much as what is written: the marker carries
+    the whole identity pair the submission bound itself to."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p15", epoch="e1", nonce="nonce-1")
+
+    KernelClient("p15")._mark_pending("m-1", 4, ("e1", "nonce-1"))
+
+    data = json.loads((kd / "cells" / "pending.json").read_text())
+    assert data["epoch"] == "e1" and data["nonce"] == "nonce-1", data

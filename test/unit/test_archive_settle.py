@@ -216,6 +216,46 @@ def test_settle_dead_still_reports_kernel_died_when_nothing_was_archived(monkeyp
     assert "half a line" in out.output
 
 
+# --- r10 finding 1: an archived id is not this cell's settlement while its log is live --
+
+def test_settle_dead_never_borrows_a_same_numbered_cell_from_an_old_epoch(monkeypatch,
+                                                                          tmp_path):
+    """Execution counts restart at 1 in every epoch, so `cells-prev-*` is full of ids the
+    CURRENT kernel hands out again. `_settle_dead` consulted the archive the moment no live
+    record was found, so a cell that took its own kernel down was settled with a STRANGER's
+    record — an older epoch's status, output and images — and the KernelDied verdict, plus
+    everything this cell had actually printed, was dropped. The live log is the
+    discriminator: a restart MOVES it into the archive, so a log still standing in `cells/`
+    proves this id belongs to the epoch that just died and nothing in the archive is about
+    it."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = tmp_path / "kernels" / "r4" / "cells"
+    kd.mkdir(parents=True)
+    (kd / "1.log").write_text("half a line")        # the dead epoch's own cell 1, mid-run
+    _archive(tmp_path, "r4", 1, "an older cell 1\n", _OK)
+
+    out = KernelClient("r4")._settle_dead(1, 0)
+
+    assert out.record.error and out.record.error["ename"] == "KernelDied"
+    assert "half a line" in out.output and "an older cell 1" not in out.output
+
+
+def test_wait_on_a_died_cell_is_not_answered_by_an_archived_namesake(monkeypatch,
+                                                                     tmp_path):
+    """The same collision reached through the caller-facing route: `wait_cell` guards its
+    own archive consult on the live log and then routes to `_settle_dead`, which did not."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = tmp_path / "kernels" / "r5" / "cells"
+    kd.mkdir(parents=True)
+    (kd / "2.log").write_text("still printing")
+    _archive(tmp_path, "r5", 2, "an older cell 2\n", _OK)
+
+    out = KernelClient("r5").wait_cell(2, timeout_s=30)
+
+    assert isinstance(out, Completed) and out.record.error["ename"] == "KernelDied"
+    assert "still printing" in out.output
+
+
 def test_a_huge_archived_log_is_read_in_bounded_slices(monkeypatch, tmp_path):
     """Archived settles are explicitly uncapped by the renderer, and this read the WHOLE
     file before that truncation ever ran — a verbose multi-gigabyte cell would exhaust the
