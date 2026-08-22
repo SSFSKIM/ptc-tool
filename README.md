@@ -88,10 +88,12 @@ use, because it needs no checkout and no working directory. Adding a `ptc` to yo
 `PATH` — a symlink, a shell alias — is yours to do and nothing here does it for you.
 
 Exit codes: **0** success · **1** the cell raised, the wait found no such cell, or `kill`
-found nothing to kill · **3** the kernel was busy and the code was **not** run. Nothing is
-ever queued, so 3 means "resubmit after it finishes, or `interrupt` first" — a cell that
-was submitted and is merely still running is a success (exit 0) and prints its `wait`
-cell id.
+found nothing to kill · **3** the kernel was busy and the code was **not** run · **130**
+the cell was interrupted before it finished. Nothing is ever queued, so 3 means "resubmit
+after it finishes, or `interrupt` first" — a cell that was submitted and is merely still
+running is a success (exit 0) and prints its `wait` cell id. 130 is the shell's
+128+SIGINT: the cell was stopped, which is a different instruction to a script than a cell
+that ran and failed.
 
 ## Codex (documented, untested)
 

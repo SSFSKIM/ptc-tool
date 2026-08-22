@@ -39,9 +39,18 @@ def _pick_session(explicit: str | None) -> tuple[str, str | None, object]:
 #: code ran and failed", and a script that retries on busy must be able to tell them apart.
 EXIT_BUSY = 3
 
+#: A cell that was STOPPED — `ptc interrupt`, or a SIGINT that reached the kernel — settles
+#: terminal with status "interrupted", and the CLI reported that as exit 0: shell
+#: automation read a cancelled command as one that ran to completion. 128+SIGINT is the
+#: shell's own vocabulary for it, and the point of not folding it into 1 is that
+#: cancellation and failure call for different responses — a script retries the first and
+#: reports the second.
+EXIT_INTERRUPTED = 130
+
 _EXIT_CODES = ("exit codes: 0 success · 1 the cell raised, the wait found no such cell, or "
                f"kill found nothing to kill · {EXIT_BUSY} the kernel was busy and the code "
-               "was NOT run (nothing is ever queued — wait, interrupt, or retry)")
+               "was NOT run (nothing is ever queued — wait, interrupt, or retry) · "
+               f"{EXIT_INTERRUPTED} the cell was interrupted before it finished")
 
 
 def main(argv=None) -> int:
@@ -203,7 +212,14 @@ def _run(argv=None) -> int:
     if isinstance(outcome, NotFound):
         return 1          # a wait on an id this kernel never ran is a failed wait
     # A Running cell IS a submitted cell — the caller's yield budget ran out, not the work.
-    return 0 if not isinstance(outcome, Completed) or outcome.record.status != "error" else 1
+    if not isinstance(outcome, Completed):
+        return 0
+    # Three terminal statuses, three answers. "interrupted" used to fall through to 0 with
+    # "ok", so a stopped cell told the caller its code had finished — the same lie
+    # `EXIT_BUSY` was carved out of 0 to stop telling. Both `exec` and `wait` settle here.
+    if outcome.record.status == "interrupted":
+        return EXIT_INTERRUPTED
+    return 1 if outcome.record.status == "error" else 0
 
 
 if __name__ == "__main__":

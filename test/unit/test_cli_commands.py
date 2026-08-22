@@ -337,3 +337,55 @@ def test_exec_json_says_so_when_the_namespace_was_NOT_replaced(monkeypatch, caps
 
     assert cli.main(["exec", "-s", "k9", "1+1", "--json"]) == 0
     assert _json_out(capsys)["expired"] is None
+
+
+# --- r14 finding 4: an interrupted cell is not a finished one -------------------------
+
+def _completed(status: str):
+    from ptc.cells import CellRecord
+    from ptc.client import Completed
+
+    return Completed(7, CellRecord(status, 1, None, None, [], []), "partial\n")
+
+
+@pytest.mark.parametrize("status, code", [("ok", 0), ("error", 1),
+                                          ("interrupted", 130)])
+def test_the_exit_code_reports_which_of_the_three_terminal_statuses_it_was(
+        monkeypatch, capsys, status, code):
+    """The final status line failed only on "error", so a cell STOPPED by `ptc interrupt`
+    (or by a SIGINT reaching the kernel) exited 0 — telling a shell chain, a Makefile or
+    CI that cancelled work had run to completion. 128+SIGINT is the shell's own name for
+    it, kept out of the generic 1 because a script retries a cancellation and reports a
+    failure."""
+    _exec_returning(monkeypatch, _completed(status))
+    assert cli.main(["exec", "-s", "k9", "1+1"]) == code
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("status, code", [("ok", 0), ("error", 1),
+                                          ("interrupted", 130)])
+def test_wait_reports_the_same_codes_as_exec(monkeypatch, capsys, status, code):
+    """`wait` settles the same outcome through the same line — a caller that polls with
+    `ptc wait` must be able to tell a cancelled cell from a finished one too."""
+    from ptc import client
+
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None,
+                                                         type("R", (), {"cwd": None,
+                                                                        "claude_session_id": None})()))
+    monkeypatch.setattr(client.KernelClient, "wait_cell",
+                        lambda self, *a, **kw: _completed(status))
+    assert cli.main(["wait", "7", "-s", "k9"]) == code
+    capsys.readouterr()
+
+
+def test_the_interrupted_exit_code_is_documented_in_help():
+    """An exit code nobody can look up is a private convention, not a contract — the same
+    rule `EXIT_BUSY` is held to."""
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert f"{cli.EXIT_INTERRUPTED} the cell was interrupted" in " ".join(out.getvalue().split())
+    assert cli.EXIT_INTERRUPTED == 130
