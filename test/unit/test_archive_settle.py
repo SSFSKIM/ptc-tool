@@ -1,6 +1,7 @@
 """Settling a cell from a previous kernel epoch — pure filesystem, no kernel needed."""
 import json
 
+from ptc.cells import CellRecord
 from ptc.client import Completed, KernelClient
 
 
@@ -121,3 +122,41 @@ def test_wait_on_an_acknowledged_but_unpublished_cell_still_waits(monkeypatch, t
         {"msg_id": "m-1", "cell_id": 7, "submitted_at": 0.0, "epoch": "e1"}))
 
     assert isinstance(KernelClient("w2").wait_cell(7, timeout_s=0.5), Running)
+
+
+# --- r6 finding 8: an archived cell names the log it was actually read from -----------
+
+def test_an_archived_cell_advertises_the_log_it_was_read_from(monkeypatch, tmp_path):
+    """`_archived` reads `cells-prev-<ts>/<id>.log`, but rendering always advertised
+    `cells/<id>.log` — so the truncation notice, which exists precisely to hand the caller
+    the untruncated output, named a file that no longer exists, and the CLI's `--json`
+    `full_log` reported the same false path."""
+    from ptc.paths import Config, cells_dir
+    from ptc.shape import render, to_dict
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _archive(tmp_path, "a5", 8, "x" * 5_000, None)
+    archived_log = tmp_path / "kernels" / "a5" / "cells-prev-1" / "8.log"
+
+    out = KernelClient("a5")._archived(8)
+    text = render(out, "a5", Config.from_env(env={"PTC_MAX_OUTPUT_CHARS": "500"})).text
+
+    assert "truncated" in text and str(archived_log) in text
+    assert str(cells_dir("a5") / "8.log") not in text
+    assert to_dict(out, "a5")["full_log"] == str(archived_log)
+
+
+def test_a_live_cell_still_advertises_the_live_log(monkeypatch, tmp_path):
+    """The other half: nothing changes for a cell settled from the current epoch."""
+    from ptc.client import Completed
+    from ptc.paths import Config, cells_dir
+    from ptc.shape import render, to_dict
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    rec = CellRecord(status="ok", duration_ms=1, result_repr=None, error=None,
+                     images=[], mutations=[])
+    out = Completed(3, rec, "y" * 5_000)
+    text = render(out, "a6", Config.from_env(env={"PTC_MAX_OUTPUT_CHARS": "500"})).text
+
+    assert str(cells_dir("a6") / "3.log") in text
+    assert to_dict(out, "a6")["full_log"] == str(cells_dir("a6") / "3.log")

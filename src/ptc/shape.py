@@ -139,6 +139,9 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             f"[still running — call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
             "for more output, or interrupt() to stop]", [])
     rec: CellRecord = outcome.record
+    # An archived cell was read out of `cells-prev-<ts>/`, and naming the live path here
+    # pointed the reader of a truncated body at a file that no longer exists.
+    full_log = outcome.log_path or log_path / f"{outcome.cell_id}.log"
     cap = config.max_output_chars
     lines = [_header(outcome.cell_id, rec.status, rec.duration_ms, degraded)]
     # Everything that trails the body is rendered FIRST and inside the same budget: what
@@ -155,7 +158,7 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
     res_line = (_clip(f"→ result: {rec.result_repr}", trailing_budget(cap))
                 if rec.result_repr is not None else None)
     trailing = sum(len(x) for x in (f, err_line, res_line) if x)
-    body = _truncate(outcome.output, cap - trailing, log_path / f"{outcome.cell_id}.log")
+    body = _truncate(outcome.output, cap - trailing, full_log)
     if body:
         lines.append(body.rstrip("\n"))
     lines.extend(x for x in (err_line, res_line, f) if x)
@@ -174,4 +177,6 @@ def to_dict(outcome, key: str) -> dict:
     return {"status": r.status, "cell_id": outcome.cell_id, "duration_ms": r.duration_ms,
             "output": outcome.output, "result_repr": r.result_repr, "error": r.error,
             "images": r.images, "mutations": r.mutations,
-            "full_log": str(cells_dir(key) / f"{outcome.cell_id}.log")}
+            # the archive, for a cell settled from a previous epoch — the live path names
+            # a file that was moved away with the epoch that wrote it
+            "full_log": str(outcome.log_path or cells_dir(key) / f"{outcome.cell_id}.log")}

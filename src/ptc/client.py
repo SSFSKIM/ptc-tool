@@ -4,6 +4,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from .cells import (
     CellRecord,
@@ -25,6 +26,11 @@ class Completed:
     cell_id: int
     record: CellRecord
     output: str
+    #: Where this cell's output really lives, when that is NOT `cells/<id>.log`. A cell
+    #: settled from a previous epoch was read out of `cells-prev-<ts>/`, and the renderer's
+    #: truncation notice and the CLI's `full_log` both pointed at the live path instead —
+    #: sending whoever needed the untruncated output to a file that does not exist.
+    log_path: Path | None = None
 
 
 @dataclass
@@ -332,7 +338,7 @@ class KernelClient:
                 # know: an archived cell must still settle, never crash the wait
                 record = CellRecord(**_epoch_ended_record())
             note = f"\n[cell {cell_id} belongs to a previous kernel epoch — archived at {d}]"
-            return Completed(cell_id, record, text + note)
+            return Completed(cell_id, record, text + note, log_path=log)
         return None
 
     def _pending_names(self, cell_id: int) -> bool:
