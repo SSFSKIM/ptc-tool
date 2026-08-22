@@ -44,12 +44,18 @@ def kernel_alive(key: str) -> bool:
     return bool(o and owner_alive(o) and (kernel_dir(key) / "ready").exists())
 
 
-def consume_expiry(key: str) -> str | None:
-    m = kernel_dir(key) / "expired.marker"
+def read_expiry(key: str) -> str | None:
+    """The TTL watchdog's note that this key's namespace died, WITHOUT taking it.
+
+    Reading and consuming used to be one step, taken before stale cleanup, the spawn,
+    readiness and bootstrap — so any failure past that point destroyed the notice, and the
+    retry that finally worked reported an ordinary result with nothing to say that a whole
+    session's namespace had been lost. Deletion belongs at the far end of the successful
+    spawn instead (`ensure_kernel`), which is also the only place the notice is delivered
+    from, so it is still delivered exactly once.
+    """
     try:
-        text = m.read_text()
-        m.unlink()
-        return text
+        return (kernel_dir(key) / "expired.marker").read_text()
     except OSError:
         return None
 
@@ -140,7 +146,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             if claude_session_id and not read_meta(key).get("claude_session_id"):
                 write_meta(key, claude_session_id=claude_session_id)
             return KernelInfo(key, o.pid, kd / "connection.json", False, None)
-        expired = consume_expiry(key)
+        expired = read_expiry(key)
         _clean_stale(kd, key, o, alive)
         secure_dir(cells_dir(key))          # the rotation above took the old one away
         secure_dir(cells_dir(key) / "offsets")
@@ -204,6 +210,16 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                 except OSError:
                     pass
             raise
+        # The notice is spent HERE, past the last thing that can fail the spawn — every
+        # path above leaves the marker standing for the retry to find. Deliberately
+        # outside the handler: a marker that cannot be unlinked must not take a kernel
+        # that is already ready down with it, and the worst a leftover costs is one
+        # repeated notice after the NEXT death.
+        if expired is not None:
+            try:
+                (kd / "expired.marker").unlink(missing_ok=True)
+            except OSError:
+                pass
         return KernelInfo(key, proc.pid, conn, True, expired)
 
 

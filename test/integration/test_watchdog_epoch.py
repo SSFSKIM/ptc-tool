@@ -2,10 +2,13 @@
 import os
 import time
 
+import pytest
+
+from ptc import kernel
 from ptc.cells import read_record
 from ptc.client import Completed, KernelClient, Running
 from ptc.kernel import ensure_kernel, kill_kernel, restart_kernel
-from ptc.paths import Config
+from ptc.paths import Config, kernel_dir, secure_dir
 
 IDLE_HOURS = 0.001                                   # 3.6 s — Config.from_env reads this
 TTL_S = IDLE_HOURS * 3600
@@ -100,3 +103,40 @@ def test_cell_ids_monotonic_across_restart(ptc_home):
     assert any("epoch1" in (d / f"{pre_max}.log").read_text() for d in archived
                if (d / f"{pre_max}.log").exists())
     kill_kernel("wd3")
+
+
+# --- r13 finding 7: the expiry notice is not spent on a spawn that failed --------------
+
+def test_the_expiry_notice_survives_a_failed_respawn(ptc_home, monkeypatch):
+    """`consume_expiry` unlinked the marker BEFORE stale cleanup, the spawn, readiness and
+    bootstrap. Any failure past that point took the notice with it, and the retry that
+    finally worked reported an ordinary result — no warning anywhere that the namespace
+    the caller had been building all session was gone. The marker is read where it always
+    was and deleted only once the replacement is ready, which is also the only place it
+    can be delivered from, so it is still delivered exactly once."""
+    kd = secure_dir(kernel_dir("wd4"))
+    (kd / "expired.marker").write_text("expired after 1.00 h idle at 2026-08-20 00:00:00")
+    attempts: list = []
+    real_wait_ports = kernel._wait_ports
+
+    def flaky(conn, timeout=20.0):
+        attempts.append(conn)
+        if len(attempts) == 1:
+            raise TimeoutError("kernel never wrote ports (the first attempt fails)")
+        return real_wait_ports(conn, timeout)
+
+    monkeypatch.setattr(kernel, "_wait_ports", flaky)
+
+    with pytest.raises(TimeoutError):
+        ensure_kernel("wd4", cwd=str(ptc_home))
+    assert (kd / "expired.marker").exists(), "a failed spawn consumed the notice"
+
+    info = ensure_kernel("wd4", cwd=str(ptc_home))
+    assert info.spawned and info.expired_notice is not None, (
+        "the retry that worked reported no expiry at all")
+    assert "1.00 h idle" in info.expired_notice
+    assert not (kd / "expired.marker").exists(), "a delivered notice must be consumed"
+
+    again = ensure_kernel("wd4", cwd=str(ptc_home))
+    assert not again.spawned and again.expired_notice is None, "the notice was delivered twice"
+    kill_kernel("wd4")
