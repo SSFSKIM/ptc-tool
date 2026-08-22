@@ -259,6 +259,12 @@ def test_the_codex_child_env_is_built_not_inherited(fake, monkeypatch, tmp_path)
     assert seen["PTC_SESSION"].startswith("parent-key-a") and seen["PTC_SESSION"] != "parent-key"
     assert seen["PTC_DEPTH"] == "1" and seen["PTC_MAX_DEPTH"] == "1"
     assert seen["PTC_CWD"] == str(tmp_path)
+    # ...and so does the home those keys are relative to. Dropping it sent a codex child
+    # that reaches PTC's own MCP server to the `~/.ptc` default: a registry the parent
+    # cannot see, where it can leave a kernel no cleanup of the parent's ever reaches. It
+    # travels RESOLVED, because the child does not share this process's cwd.
+    from ptc.paths import ptc_home
+    assert seen["PTC_HOME"] == str(ptc_home()) and os.path.isabs(seen["PTC_HOME"])
 
 
 # -- the server→client responder ------------------------------------------

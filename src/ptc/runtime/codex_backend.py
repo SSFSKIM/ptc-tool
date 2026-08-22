@@ -41,6 +41,8 @@ import shlex
 import time
 from collections import Counter
 
+from ptc.paths import ptc_home
+
 from .agents import AgentOpts, AgentResult, child_ptc_env
 from .state import STATE
 
@@ -167,8 +169,19 @@ _ENV_PASSTHROUGH = (
 
 
 def _child_env(o: AgentOpts) -> dict:
+    """The allowlist, plus PTC's rewritten child variables, plus the home they name.
+
+    PTC_HOME is not an allowlist entry because the child must not get whatever string this
+    process was started with: a relative one resolves against the reader's working
+    directory, and the child runs in `_cwd(o)`. It gets the resolved absolute path instead
+    — the same one `ensure_kernel` hands its kernels. Dropping it entirely was the real
+    defect: a codex child that reaches PTC's own MCP server fell back to `~/.ptc`,
+    provisioned or attached to a registry the parent cannot see, and could leave a kernel
+    behind that no cleanup of the parent's ever reaches.
+    """
     env = {name: os.environ[name] for name in _ENV_PASSTHROUGH if name in os.environ}
     env.update(child_ptc_env(o))
+    env["PTC_HOME"] = str(ptc_home())
     return env
 
 
