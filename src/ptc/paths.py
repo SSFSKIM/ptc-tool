@@ -128,8 +128,15 @@ def safe_key(raw: str) -> str:
     Substitution and truncation are both many-to-one: `team/a` and `team?a` sanitized to
     the same `team-a`, and any two keys agreeing on 128 characters truncated together. The
     losers shared a kernel directory — one Python namespace, one cell log, one agent
-    registry for two unrelated sessions. So a key the mapping CHANGED carries a short
-    digest of the original, which the collision partners cannot match.
+    registry for two unrelated sessions. So a key the mapping CHANGED carries a digest of
+    the original, which the collision partners cannot match.
+
+    The digest is the whole of that separation, so its width is the width of an isolation
+    boundary: at eight hex the two aliases `team!@@[x` and `team!)(~x` sanitize alike AND
+    digest alike, which is 32 bits — a few tens of thousands of tries to search for, and
+    near enough that two hand-written aliases can simply land on it. Sixteen is not a
+    guess about how much margin is comfortable; it is the point where a directory name
+    stops being a plausible thing to collide.
 
     A key that was already a clean name of legal length is returned byte-identical, digest
     and all: that is the common case (every generated key is one) and its kernel directory
@@ -138,7 +145,7 @@ def safe_key(raw: str) -> str:
     """
     clean = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
     if clean != raw or len(clean) > KEY_MAX:
-        digest = hashlib.sha256(raw.encode()).hexdigest()[:8]
+        digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
         key = f"{clean[:KEY_MAX - len(digest) - 2]}-h{digest}"
     else:
         key = clean

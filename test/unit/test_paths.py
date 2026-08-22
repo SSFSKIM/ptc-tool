@@ -172,3 +172,23 @@ def test_a_key_that_needed_no_sanitizing_is_byte_identical_to_before():
     name keeps exactly the name it has on disk today."""
     for raw in ("96abe6e2-80aa", "adapter-4711-9f2c", "team_a.1", "s" * 128):
         assert safe_key(raw) == raw
+
+
+# --- r15 finding 5: 32 bits is not enough to separate two isolation boundaries ---------
+
+def test_two_aliases_that_collide_at_eight_hex_still_get_their_own_kernel(monkeypatch,
+                                                                         tmp_path):
+    """The digest is what holds two sanitized aliases apart, so its width IS the boundary.
+
+    `team!@@[x` and `team!)(~x` sanitize to the same name and their sha256 digests agree
+    on the first eight hex — 32 bits, which a birthday search closes in a few tens of
+    thousands of tries and which two hand-written aliases can simply happen to hit. The
+    losers shared one kernel directory: one Python namespace, one cell log, one agent
+    registry for two unrelated sessions.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    a, b = safe_key("team!@@[x"), safe_key("team!)(~x")
+
+    assert a != b, f"two distinct aliases share a kernel directory: {a}"
+    assert kernel_dir(a).parent == kernels_root() and kernel_dir(b).parent == kernels_root()
+    assert safe_key(a) == a and safe_key(b) == b, "safe_key must stay idempotent"
