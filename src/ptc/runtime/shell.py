@@ -165,6 +165,10 @@ class BashHandle:
         # A background group survives the kernel unless somebody records it: it is its own
         # session, so no group kill on the kernel reaches it.
         self._pgid = _register(proc, cmd)
+        # The registry row as WRITTEN, kept because `_retire` will take it out of `_LIVE`
+        # while this handle lives on holding the bare number — and a bare number is not an
+        # identity (`kill`).
+        self._row = dict(_LIVE.get(self._pgid, {}))
         watcher = asyncio.ensure_future(self._forget_when_done())
         _WATCHERS.add(watcher)
         watcher.add_done_callback(_WATCHERS.discard)
@@ -205,9 +209,25 @@ class BashHandle:
         nobody — and the unconditional unregister then threw away the one pgid anything
         could still have reaped those descendants by. `h.kill()` in that state leaked the
         child permanently.
+
+        Verifying the recorded group is the other half, and it is bgroups' rule rather than
+        a second one. Once `_retire` has dropped the row the handle still holds the number,
+        and a pgid whose group has ended is free for the OS to hand out again: signalling it
+        then SIGKILLs unrelated same-user work — precisely the hazard `bgroups.reap` refuses
+        to take, reached by a path that used to bypass its checks. A handle whose recorded
+        identity no longer holds signals no group at all; if its own leader is somehow still
+        alive it is reached by pid, which can only ever be the process this handle spawned.
         """
         if self._pgid is None:              # never registered: the leader was already gone
             _killpg_or_kill(self._proc)
+            return
+        if not bgroups.signalable(self._row):
+            if self._proc.returncode is None:
+                try:
+                    self._proc.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+            _unregister(self._pgid)
             return
         try:
             os.killpg(self._pgid, signal.SIGKILL)

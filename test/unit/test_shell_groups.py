@@ -210,3 +210,33 @@ def test_a_background_command_whose_group_really_ended_is_unregistered(tmp_path)
 
     asyncio.run(flow())
     assert bgroups.read(tmp_path) == []
+
+
+def test_killing_a_retired_handle_whose_pgid_was_recycled_signals_nobody(
+        tmp_path, monkeypatch):
+    """A handle outlives its group. `_retire` drops the row when the group empties, but the
+    handle still holds the bare number — and a pgid whose group has ended is free for the OS
+    to hand out again. `kill()` signalled it regardless, SIGKILLing whatever same-user work
+    inherited the number: the stranger-killing hazard `bgroups.reap` refuses to take,
+    reached by the one path that bypassed its rules. It asks the same question now.
+    """
+    signalled: list = []
+
+    async def flow():
+        h = await shell.bash("echo done", background=True)
+        await h.wait()
+        await asyncio.sleep(0.2)            # let the watcher retire the emptied group
+        return h
+
+    h = asyncio.run(flow())
+    assert bgroups.read(tmp_path) == [], "the ended group's row was not retired"
+
+    # what a recycled pgid looks like to the only question that can tell: the number is
+    # now led by a DIFFERENT process than the one that was registered
+    monkeypatch.setattr(bgroups, "start_time_matches", lambda pid, recorded: False)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append((pgid, sig)))
+
+    h.kill()
+
+    assert [s for s in signalled if s[1] != 0] == [], \
+        f"kill() SIGKILLed a group the handle no longer owns: {signalled}"

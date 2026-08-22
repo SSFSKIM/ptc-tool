@@ -87,17 +87,28 @@ def unverifiable(row: dict) -> bool:
     return bool(row.get("unverifiable")) or not row.get("leader_start")
 
 
+def signalable(row: dict) -> bool:
+    """May this row's group be SIGKILLed at all?
+
+    The two questions above, asked together, because they are one rule and every path that
+    signals a recorded pgid owes it: `reap` on the host side and `BashHandle.kill()` inside
+    the kernel, which holds the same recorded identity and must not reach a group the
+    registry rules would have spared.
+    """
+    pgid = row.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    return not unverifiable(row) and not _recycled(row)
+
+
 def reap(kernel_dir) -> list:
     """SIGKILL every recorded group, then drop the file. Returns the pgids signalled."""
     killed = []
     for row in read(kernel_dir):
         pgid = row.get("pgid")
-        if not isinstance(pgid, int) or pgid <= 1:
+        if not signalable(row):
+            # never identified, or somebody else's group now: drop the row, unsignalled
             continue
-        if unverifiable(row):
-            continue                      # never proved whose group this is: drop it, unsignalled
-        if _recycled(row):
-            continue                      # somebody else's group now: drop it, unsignalled
         try:
             # never the reaper's own group: a stale entry whose pgid has been recycled
             # onto the caller (a CLI, a test runner, the kernel itself mid-cleanup) would
