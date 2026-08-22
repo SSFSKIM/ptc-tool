@@ -160,3 +160,57 @@ def test_a_live_cell_still_advertises_the_live_log(monkeypatch, tmp_path):
 
     assert str(cells_dir("a6") / "3.log") in text
     assert to_dict(out, "a6")["full_log"] == str(cells_dir("a6") / "3.log")
+
+
+# --- r7 finding 6: the follow loop is not blind to a restart under its own cell --------
+
+_OK = {"status": "ok", "duration_ms": 12, "result_repr": "42", "error": None,
+       "images": [], "mutations": []}
+
+
+def test_follow_settles_from_the_archive_when_a_restart_moved_the_cell(monkeypatch,
+                                                                       tmp_path):
+    """Another client restarted the kernel while this exec was still following its cell.
+    The cell's log and record went into `cells-prev-*` with the epoch that ran them, and a
+    REPLACEMENT kernel keeps `kernel_alive` true — so the loop polled a live directory that
+    can never answer again, spent the whole yield budget, and called a finished cell
+    Running."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _live_kernel("r1")                                  # the replacement epoch is alive
+    _archive(tmp_path, "r1", 2, "computed\n", _OK)
+
+    out = KernelClient("r1")._follow(2, timeout_s=30)
+
+    assert isinstance(out, Completed) and out.record.status == "ok"
+    assert out.record.result_repr == "42"
+    assert "computed" in out.output and "previous kernel epoch" in out.output
+
+
+def test_follow_settles_from_the_archive_when_the_restart_left_no_kernel(monkeypatch,
+                                                                         tmp_path):
+    """The other restart timing: no replacement is up yet, so the liveness check fires
+    first and `_settle_dead` answered KernelDied over a completed record sitting in the
+    archive."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    (tmp_path / "kernels" / "r2" / "cells").mkdir(parents=True)
+    _archive(tmp_path, "r2", 5, "computed\n", _OK)
+
+    out = KernelClient("r2")._follow(5, timeout_s=30)
+
+    assert isinstance(out, Completed) and out.record.status == "ok"
+    assert "computed" in out.output
+
+
+def test_settle_dead_still_reports_kernel_died_when_nothing_was_archived(monkeypatch,
+                                                                        tmp_path):
+    """The verdict the archive check must not swallow: a cell whose kernel really did die
+    mid-run leaves no record anywhere, and KernelDied is the honest answer."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = tmp_path / "kernels" / "r3" / "cells"
+    kd.mkdir(parents=True)
+    (kd / "9.log").write_text("half a line")
+
+    out = KernelClient("r3")._settle_dead(9, 0)
+
+    assert out.record.error["ename"] == "KernelDied"
+    assert "half a line" in out.output

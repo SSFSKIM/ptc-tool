@@ -116,24 +116,48 @@ class KernelClient:
         raise TimeoutError("kernel never acknowledged the cell (no execute_input)")
 
     def _settle_dead(self, cell_id: int, offset: int) -> Completed:
-        """The kernel is gone: settle the cell from whatever it left behind.
+        """No kernel is answering: settle the cell from whatever it left behind.
 
-        The record is re-read first — the settle may have landed in the window between the
-        caller's last look and the kernel's death — and only with none is KernelDied the
-        verdict. The cursor is deliberately NOT advanced: a dead kernel writes no more
-        output, so there is nothing to resume after.
+        Three places are consulted in the order that keeps the most truth. The live record
+        first — the settle may have landed in the window between the caller's last look and
+        the kernel's death. Then the ARCHIVE: "no kernel" also describes a RESTART, and a
+        restart moves this cell's log and record into `cells-prev-*` before the replacement
+        comes up, so a completed cell is sitting right there and calling it KernelDied
+        would hide it. Only with neither is KernelDied the verdict.
+
+        On the first and last paths the cursor is deliberately NOT advanced: a dead kernel
+        writes no more output, so there is nothing to resume after. `_archived` advances
+        it, as it does for every other caller — it has just handed the archived log over.
         """
-        rec = read_record(self.key, cell_id) or CellRecord(**_kernel_died_record())
+        rec = read_record(self.key, cell_id)
+        if rec is not None:
+            text, _ = read_output_since(self.key, cell_id, offset)
+            return Completed(cell_id, rec, text)
+        arch = self._archived(cell_id, offset)
+        if arch is not None:
+            return arch
         text, _ = read_output_since(self.key, cell_id, offset)
-        return Completed(cell_id, rec, text)
+        return Completed(cell_id, CellRecord(**_kernel_died_record()), text)
 
     def _follow(self, cell_id: int, timeout_s: float) -> Completed | Running:
         deadline = time.monotonic() + timeout_s
+        live_log = kernel_dir(self.key) / "cells" / f"{cell_id}.log"
         while time.monotonic() < deadline:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 out, off = read_output_since(self.key, cell_id, 0)
                 return Completed(cell_id, rec, out)
+            if not live_log.exists():
+                # Another client restarted the kernel under this cell: its log and its
+                # record went into `cells-prev-*` with the epoch that ran them. The
+                # REPLACEMENT kernel keeps kernel_alive() true, so the check below never
+                # fires and this loop would poll a directory that can never answer again,
+                # spend the whole yield budget and then call a finished cell Running.
+                # (The log is also simply absent for the instant before the kernel opens
+                # it, which is why a miss here just keeps polling.)
+                arch = self._archived(cell_id, 0)
+                if arch is not None:
+                    return arch
             if not kernel_alive(self.key):
                 # The cell took the kernel down with it — os._exit, a segfault, an OOM
                 # kill. Polling for a record nothing can write any more burns the whole
