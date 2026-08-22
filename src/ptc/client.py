@@ -236,6 +236,38 @@ class KernelClient:
         o = read_owner(self.key)
         return (o.epoch, o.nonce) if o else None
 
+    def _connect_to_current_owner(self):
+        """Connect, and return the connection WITH the incarnation it really reached.
+
+        `connection.json` and `owner.json` are two files a restart rewrites one after the
+        other, and reading them in either order across a restart pairs a connection with
+        an incarnation that does not own it. The dangerous half is the marker: an owner
+        read AFTER the restart names the REPLACEMENT, so the pending marker goes down
+        stamped with the replacement's epoch while the request goes out on the OLD
+        kernel's ports. That request times out unanswered, nothing under the replacement
+        can ever discharge a marker naming no cell (`_pending_discharged`), and the fresh
+        kernel is busy for good. The other order is harmless by comparison — a marker
+        stamped with an epoch the current kernel does not share discharges on sight.
+
+        So the pair is bound instead of assumed: read the owner, connect, read it again,
+        and accept only when the two reads agree — which means no incarnation change
+        straddled the connect, so the ports belong to that owner. A restart landing in the
+        window costs one retry; two in a row is a key being replaced faster than anything
+        can bind to it, and that is reported rather than papered over.
+        """
+        for attempt in (0, 1):
+            owner = self._owner_identity()
+            kc = self._connect()
+            if self._owner_identity() == owner:
+                return kc, owner
+            kc.stop_channels()
+            if attempt == 0:
+                time.sleep(0.2)
+        raise RuntimeError(
+            f"kernel {self.key} was replaced twice while this submission was binding to "
+            "it — the owner changed between reading its connection file and connecting. "
+            "Nothing was sent; retry once the restarts have settled.")
+
     def _mark_pending(self, msg_id: str | None, cell_id: int | None,
                       owner: tuple | None) -> None:
         """Record a request that is about to go on the wire, for the incarnation `owner`.
@@ -289,7 +321,10 @@ class KernelClient:
             busy = self.is_busy()
             if busy is not None:
                 return busy
-            kc = self._connect()
+            # The incarnation is captured as part of CONNECTING, not after it: an owner
+            # read once the ports are already open can name a kernel that replaced the one
+            # this connection reaches (`_connect_to_current_owner`).
+            kc, owner = self._connect_to_current_owner()
             try:
                 # The marker goes on disk BEFORE the request goes on the wire. An
                 # exception handler cannot cover the window that matters: a SIGKILL landing
@@ -299,11 +334,10 @@ class KernelClient:
                 # silently queues a second cell on top of it. Nothing has been sent yet, so
                 # a marker that cannot be written aborts the submission (OSError out of
                 # here) rather than sending unguarded.
-                # The incarnation is captured HERE, with the marker, and every later write
-                # is checked against it: a restart can replace the kernel while this
-                # request is in flight, and a marker written into the replacement's
-                # cells/ is one the replacement can never discharge (_refresh_pending).
-                owner = self._owner_identity()
+                # Every later write is checked against `owner`: a restart can replace the
+                # kernel while this request is in flight, and a marker written into the
+                # replacement's cells/ is one the replacement can never discharge
+                # (_refresh_pending).
                 self._mark_pending(None, None, owner)
                 # sent-unacknowledged window: the request is on the wire and only the
                 # marker records it. EVERY exit from here until current.json names our

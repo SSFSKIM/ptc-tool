@@ -206,3 +206,95 @@ def test_a_stale_submitter_never_marks_the_replacement_epoch(monkeypatch, tmp_pa
     assert not (kd / "cells" / "pending.json").exists(), \
         "the stale submitter planted a marker in the replacement's cells/"
     assert KernelClient("p9").is_busy() is None, "the fresh kernel was born busy"
+
+
+# --- r8 finding 1: the marker names the kernel the request actually reached -----------
+
+class _EpochBoundKC:
+    """A connection that remembers WHICH incarnation's ports it opened, and records the
+    marker standing on disk at the instant the request goes out on them."""
+
+    def __init__(self, epoch: str, marker):
+        self.epoch = epoch
+        self._marker = marker
+        self.marker_epoch_at_send = None
+
+    def execute(self, *a, **kw):
+        try:
+            self.marker_epoch_at_send = json.loads(self._marker.read_text())["epoch"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            self.marker_epoch_at_send = None
+        raise _Killed()
+
+    def stop_channels(self):
+        pass
+
+
+def test_the_marker_names_the_incarnation_the_connection_reached(monkeypatch, tmp_path):
+    """`connection.json` and `owner.json` are rewritten one after the other by a restart,
+    and the owner used to be read once the ports were already open. A restart landing in
+    between therefore stamped the marker with the REPLACEMENT's epoch while the request
+    went out on the OLD kernel's ports: that request dies unanswered, and a marker naming
+    no cell under the live epoch is one nothing can discharge — the fresh kernel is busy
+    from the moment it is ready. The connection and the incarnation are bound together
+    instead, so whichever kernel a submission reaches is the one its marker is about.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p10", epoch="e1")
+    marker = kd / "cells" / "pending.json"
+    ports = {"epoch": "e1"}
+    opened: list = []
+
+    def restart():
+        # what restart_kernel leaves behind: cells/ archived, new ports published under a
+        # new incarnation. It lands AFTER the first connection has opened the old ports.
+        (kd / "cells").rename(kd / "cells-prev-1")
+        (kd / "cells").mkdir()
+        ports["epoch"] = "e2"
+        write_owner("p10", Owner(os.getpid(), proc_start_time(os.getpid()), time.time(),
+                                 "nonce-2", "e2"))
+        (kd / "ready").write_text("e2")
+
+    def connect(self, **kw):
+        kc = _EpochBoundKC(ports["epoch"], marker)
+        opened.append(kc)
+        if len(opened) == 1:
+            restart()
+        return kc
+
+    monkeypatch.setattr(KernelClient, "_connect", connect)
+
+    with pytest.raises(_Killed):
+        KernelClient("p10").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
+
+    sent = [kc for kc in opened if kc.marker_epoch_at_send is not None]
+    assert len(sent) == 1, f"the request went out {len(sent)} times"
+    assert sent[0].marker_epoch_at_send == sent[0].epoch, (
+        "the marker was stamped with a kernel other than the one the request reached: "
+        f"marker={sent[0].marker_epoch_at_send} ports={sent[0].epoch}")
+
+
+def test_a_key_replaced_faster_than_it_can_be_bound_fails_before_sending(monkeypatch,
+                                                                         tmp_path):
+    """The retry has to end somewhere. A key whose kernel is replaced on every connect
+    can never be bound to, and guessing which incarnation to name is the failure this
+    binding exists to prevent — so the submission is refused with its reason, having sent
+    nothing and left no marker for the next caller to trip over.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p11", epoch="e1")
+    marker = kd / "cells" / "pending.json"
+    seq = iter(("e2", "e3", "e4"))
+
+    def connect(self, **kw):
+        kc = _EpochBoundKC("whatever", marker)
+        write_owner("p11", Owner(os.getpid(), proc_start_time(os.getpid()), time.time(),
+                                 "n", next(seq)))
+        return kc
+
+    monkeypatch.setattr(KernelClient, "_connect", connect)
+
+    with pytest.raises(RuntimeError, match="replaced twice"):
+        KernelClient("p11").exec_cell("1 + 1", 1.0, Config.from_env(env={}))
+
+    assert not marker.exists(), "a submission that never sent anything left a marker"
