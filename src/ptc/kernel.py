@@ -238,10 +238,13 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             # A caller that does not know the Claude session id (an env-keyed rung, a CLI
             # restart) passes None — which must not ERASE the id a previous spawn under
             # this key already learned: history() and fork() read it back from here.
+            # depth AND max_depth: the recursion brake is the pair, and a restart that
+            # restores only one of them is a brake half released (`restart_kernel`).
             write_meta(key, kernel_key=key,
                        claude_session_id=claude_session_id or read_meta(key).get(
                            "claude_session_id"),
-                       cwd=work, depth=cfg.depth, epoch=epoch, build=build)
+                       cwd=work, depth=cfg.depth, max_depth=cfg.max_depth,
+                       epoch=epoch, build=build)
             from .client import run_bootstrap
             run_bootstrap(key, cfg)
             (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
@@ -345,26 +348,36 @@ def restart_kernel(key: str, **kw) -> KernelInfo:
     """Replace this key's kernel, keeping the config the kernel itself was created with.
 
     A restart is not a fresh spawn: the key already has an identity, and the caller doing
-    the restarting need not be the one that made it. Depth is the case that bites. A parent
-    adapter (or a terminal) restarts a CHILD kernel by explicit key while running at
-    PTC_DEPTH=0, and rebuilding Config from that caller's environment overwrites the
-    child's stored depth with zero — the still-running child adapter then attaches to a
-    depth-0 kernel and can spawn grandchildren of its own, with PTC_MAX_DEPTH=1 in force
-    and the recursion brake silently released. The depth belongs to the KERNEL, and
-    meta.json has recorded it since the spawn, so that is where a restart reads it.
+    the restarting need not be the one that made it. The recursion brake is the case that
+    bites, and it is a PAIR — `depth >= max_depth`. A parent adapter (or a terminal)
+    restarts a CHILD kernel by explicit key while running at PTC_DEPTH=0, and rebuilding
+    Config from that caller's environment overwrites the child's stored depth with zero —
+    the still-running child adapter then attaches to a depth-0 kernel and can spawn
+    grandchildren of its own with the brake silently released. Restoring the depth alone
+    leaves the identical hole open from the other side: a restarter carrying
+    PTC_MAX_DEPTH=3 hands a depth-1/max-1 child a bound of 3, and the grandchildren that
+    child was refused are admitted again. Both numbers belong to the KERNEL and both are
+    recorded at its spawn, so both are what a restart reads back.
+
+    Migration is by ABSENCE, with no version field: a meta.json written before max_depth
+    was recorded simply has no such key, and that kernel keeps the behaviour it has today
+    (the restarter's bound). Every spawn rewrites meta.json, so a kernel self-upgrades the
+    first time it is restarted and never takes that path twice.
 
     cwd and the Claude session id are the same story and are already restored by both
     restart callers, which is where they have to be: only the caller knows whether it
     means to move the kernel.
     """
-    depth = read_meta(key).get("depth")
+    meta = read_meta(key)
+    depth, max_depth = meta.get("depth"), meta.get("max_depth")
     kill_kernel(key)
     time.sleep(0.2)
-    if isinstance(depth, int):
-        cfg = kw.pop("config", None) or Config.from_env()
-        if cfg.depth != depth:
-            cfg = replace(cfg, depth=depth)
-        kw["config"] = cfg
+    cfg = kw.pop("config", None) or Config.from_env()
+    if isinstance(depth, int) and cfg.depth != depth:
+        cfg = replace(cfg, depth=depth)
+    if isinstance(max_depth, int) and cfg.max_depth != max_depth:
+        cfg = replace(cfg, max_depth=max_depth)
+    kw["config"] = cfg
     return ensure_kernel(key, **kw)
 
 
