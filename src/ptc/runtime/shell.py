@@ -27,6 +27,12 @@ _WATCHERS: set = set()
 #: milliseconds-scale wait in practice and a bound for the case where it is not.
 _KILL_SETTLE_S = 1.0
 
+#: How often the watcher of a RETAINED (`leader_exited`) row asks whether the orphaned
+#: group has finally emptied. Coarse on purpose: nobody awaits the answer — it only bounds
+#: how long such a row may name a group that is already gone — and the poll runs for as
+#: long as the daemon does, on the kernel's own loop.
+_ORPHAN_POLL_S = 5.0
+
 
 def _persist() -> None:
     # Outside a bootstrapped kernel (a bare `from ptc.runtime import bash` in a test or a
@@ -40,8 +46,28 @@ def _persist() -> None:
 def _register(proc, cmd: str) -> int | None:
     try:
         pgid = os.getpgid(proc.pid)
-    except OSError:                       # already exited: nothing to reap later
-        return None
+    except OSError:
+        # The leader exited inside this call. That says nothing about its GROUP: `bash()`
+        # spawns `start_new_session=True`, so setsid has already made the pgid equal to the
+        # pid — the number is known by CONSTRUCTION, not by the read that just failed — and
+        # a daemonizing command's descendants are sitting in it right now. Returning None
+        # here handed back a handle with `_pgid=None`, which neither `h.kill()` nor
+        # kill/restart/TTL can reach: a permanent leak, on precisely the command shape the
+        # whole retention rule exists for. So ask the only question that is still
+        # answerable — does the GROUP have members — and keep None for the case where it
+        # genuinely does not.
+        pgid = proc.pid
+        if not _group_alive(pgid):
+            return None                   # truly empty: nothing to reap later
+        # No birth stamp exists to record (its subject is gone), so the row says what it
+        # does know instead: the leader IS exited, and the pgid came from the constructor.
+        # `bgroups` reads that pair as identity enough to signal under its existence gate;
+        # a legacy bare row, which claims neither, stays quarantined (`unverifiable`).
+        _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "leader_start": None,
+                       "cmd": cmd[:200], "started_at": time.time(),
+                       "leader_exited": True, "pgid_source": "setsid"}
+        _persist()
+        return pgid
     # The leader's start time is recorded WITH the pgid: a pgid alone is reusable, and a
     # reaper that trusts a stale row can SIGKILL whatever same-user group inherited the
     # number (ptc/bgroups.py `_recycled`). Same identity pair as ownership.py's.
@@ -111,6 +137,41 @@ def _retire(pgid: int | None) -> None:
     if row is not None and not row.get("leader_exited"):
         row["leader_exited"] = True
         _persist()
+
+
+async def _watch_orphans(pgid: int | None) -> None:
+    """Stay on a RETAINED row's group until it empties, then drop the row.
+
+    `_retire` keeps the row because the leader's exit left descendants behind — that pgid
+    is the only handle anything has on them — and then nothing ever asked again: the
+    watcher had awaited the LEADER, so the row outlived the group by however long it took
+    the next kill/restart/TTL reap to consume the file. A row naming an emptied group names
+    a NUMBER, and a free pgid is one the OS hands out again, so unbounded staleness here is
+    the raw material of every recycle hazard downstream. `killpg(pgid, 0)` is the same
+    question `_group_alive` asks, on a coarse interval, in the same task that was already
+    watching — no new machinery, and it ends the moment the row does (a `kill()` that
+    unregisters first stops this loop on its next look).
+    """
+    while _LIVE.get(pgid) is not None:
+        if not _group_alive(pgid):
+            _unregister(pgid)
+            return
+        await asyncio.sleep(_ORPHAN_POLL_S)
+
+
+def _track_orphans(pgid: int | None) -> None:
+    """`_watch_orphans` as a retained task, for the paths that are not one already.
+
+    A FOREGROUND daemonizer retains a row exactly like a background one (`bash()`'s
+    finally clause) but has no watcher of its own — its call is over. Retained in
+    `_WATCHERS` for the same reason every other watcher is: a task nobody holds can be
+    collected mid-await, and the row it was going to drop would linger until the kernel dies.
+    """
+    if _LIVE.get(pgid) is None:
+        return
+    task = asyncio.ensure_future(_watch_orphans(pgid))
+    _WATCHERS.add(task)
+    task.add_done_callback(_WATCHERS.discard)
 
 
 @dataclass
@@ -242,6 +303,10 @@ class BashHandle:
             await self._proc.wait()
         finally:
             _retire(self._pgid)
+        # `_retire` may have KEPT the row — a daemonizer's descendants outlive its shell —
+        # and this task is the only thing that will ever look at that group again. Awaited
+        # rather than spawned: staying here is what makes the retention bounded (r11).
+        await _watch_orphans(self._pgid)
 
     @property
     def pid(self) -> int:
@@ -364,5 +429,9 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
         # and would make `_group_alive` answer "alive" for good.
         if proc.returncode is not None:
             _retire(pgid)
+            # A foreground daemonizer's row is retained on the same terms as a background
+            # one, and this call is over — so the group it names gets a watcher of its own
+            # rather than waiting for the next reap to notice it is empty.
+            _track_orphans(pgid)
         else:
             _unregister(pgid)

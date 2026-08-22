@@ -173,6 +173,51 @@ def test_an_orphaned_group_whose_leader_is_gone_is_still_reaped(tmp_path):
             pass
 
 
+# --- r11 finding 2: `leader_exited` is not a blank cheque ------------------------------
+
+def test_a_leader_exited_row_whose_pgid_now_names_a_LIVE_process_is_not_signalled(
+        tmp_path, monkeypatch):
+    """The `leader_exited` exemption was fail-OPEN on an unreadable identity, and there is
+    one state where that is wrong: the group emptied, its pgid was handed out again, and the
+    NEW leader's identity read transiently fails. `None` then meant "signal it" and the reap
+    SIGKILLed an unrelated same-user group.
+
+    Existence is the gate, because on a `leader_exited` row it decides the question by
+    itself: the recorded leader is DEAD, so a live process wearing that pid can only be a
+    recycle. No process with that pid is the retained-orphan case — POSIX will not hand the
+    number out while it is still a live group's id — and there the row keeps its exemption.
+    """
+    p = _live_group()
+    try:
+        bgroups.write(tmp_path, [{"pgid": p.pid, "pid": p.pid,
+                                  "leader_start": proc_start_time(p.pid),
+                                  "leader_exited": True}])
+        monkeypatch.setattr(bgroups, "start_time_matches", lambda pid, rec: None)
+
+        assert bgroups.reap(tmp_path) == []
+        time.sleep(0.3)
+        assert p.poll() is None, "a recycled pgid's new group was SIGKILLed"
+    finally:
+        p.kill()
+        p.wait()
+
+
+# --- r11 finding 3: a pgid known by construction is not an unidentified one ------------
+
+def test_a_leader_exited_row_with_a_construction_known_pgid_is_signalable():
+    """`unverifiable()` quarantines a row with no `leader_start`, and it must keep doing so
+    for a LEGACY bare row — nothing there says the number was ever right. A row written
+    after the leader exited inside registration is different in kind: `start_new_session`
+    had already made the pgid the pid, so the number is right by construction and only the
+    birth stamp is missing. The marker is what separates the two."""
+    setsid_row = {"pgid": 4242, "pid": 4242, "leader_start": None,
+                  "leader_exited": True, "pgid_source": "setsid"}
+    legacy_bare = {"pgid": 4242, "pid": 4242, "leader_exited": True}
+
+    assert not bgroups.unverifiable(setsid_row)
+    assert bgroups.unverifiable(legacy_bare), "a bare row must stay quarantined"
+
+
 def test_registration_marks_a_group_it_could_not_identify(tmp_path, monkeypatch):
     """`ps` failing at registration used to persist `leader_start=None` silently. The read
     is retried once, and what still cannot be resolved is written MARKED — the row stays

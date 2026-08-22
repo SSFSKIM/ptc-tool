@@ -48,6 +48,21 @@ def read(kernel_dir) -> list:
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
+def _pid_exists(pid: int) -> bool:
+    """Is there a process wearing this pid at all? Existence only — never identity.
+
+    EPERM proves existence just as well as success does (the process is there, it is simply
+    somebody else's), and only ESRCH proves absence.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _recycled(row: dict) -> bool:
     """True when this row's group may NOT be signalled on identity grounds — the recorded
     pgid is led by a different process than the one registered, or by one nobody can
@@ -59,20 +74,48 @@ def _recycled(row: dict) -> bool:
     unknown into "not recycled" is fail-open — it licenses a SIGKILL of a group nothing
     ever confirmed was ours — so an unreadable leader fails closed.
 
-    Except for `leader_exited` rows, where the unreadable leader is the RECORDED, expected
-    state. A daemonizing background `bash` exits its shell and leaves its children in the
-    same group, so the shell keeps the row precisely to reap them (`runtime/shell.py`
-    `_retire`) and the leader's identity is unreadable forever after. There is no stranger
-    to protect there: POSIX will not hand that pid out again while it is still a live
-    group's id, and a group with no members left is an ESRCH the reap already tolerates.
+    `leader_exited` rows are the exception, and the exception has a gate. Such a row's
+    unreadable leader is the RECORDED, expected state: a daemonizing background `bash`
+    exits its shell and leaves its children in the same group, so the shell keeps the row
+    precisely to reap them (`runtime/shell.py` `_retire`) and the leader is unreadable
+    forever after. But an exemption granted on the strength of "unreadable" alone is
+    fail-open in one state — the group emptied, the pgid was handed out again, and the read
+    on the NEW leader transiently failed — and there the reap SIGKILLed a stranger.
+
+    EXISTENCE decides it, because on a `leader_exited` row it decides it by itself. The
+    recorded leader is dead, so a live process wearing that pid can only be a recycle: fail
+    closed. NO process wearing it is the retained-orphan case the exemption is for — POSIX
+    will not hand the number out while it is still a live group's id, and a group that has
+    since emptied makes `killpg` a harmless ESRCH the reap already tolerates.
+
+    One residual is accepted rather than closed: the recycled id's new leader could ALSO
+    have died leaving its own orphan group, between the recycle and this reap, which reads
+    exactly like our own retained orphan. That is a double coincidence inside a window
+    `runtime/shell.py` `_watch_orphans` already keeps short by dropping retained rows as
+    soon as their group empties.
 
     A row with no identity at all is a different question entirely and is not answered here
     — see `unverifiable()`.
     """
     match = start_time_matches(row["pgid"], row.get("leader_start"))
     if match is None:
-        return not row.get("leader_exited")
+        if not row.get("leader_exited"):
+            return True
+        return _pid_exists(row["pgid"])
     return match is False
+
+
+def _construction_known(row: dict) -> bool:
+    """Is this row's pgid known by CONSTRUCTION rather than by a read?
+
+    `bash()` spawns `start_new_session=True`, so setsid makes the child's pgid equal to its
+    pid before anything reads either. A leader that exits inside registration therefore
+    leaves a row that knows its group id exactly and its leader's birth stamp not at all
+    (`runtime/shell.py` `_register`) — the opposite shape from the row `unverifiable`
+    exists to quarantine, which knows neither and says so by claiming neither. The marker
+    is what tells the two apart, so a LEGACY bare row cannot be mistaken for this one.
+    """
+    return row.get("pgid_source") == "setsid" and bool(row.get("leader_exited"))
 
 
 def unverifiable(row: dict) -> bool:
@@ -92,7 +135,13 @@ def unverifiable(row: dict) -> bool:
 
     This is not the `leader_exited` case: those rows WERE identified at registration and
     keep their signal-eligibility by design, which is the whole point of retaining them.
+    Nor is it the row whose leader was already gone when registration ran: it has no birth
+    stamp to offer either, but its pgid is a construction guarantee rather than a reading
+    (`_construction_known`), and `_recycled`'s existence gate is what stands in for the
+    stamp it cannot have.
     """
+    if _construction_known(row):
+        return False
     return bool(row.get("unverifiable")) or not row.get("leader_start")
 
 
@@ -106,8 +155,9 @@ def signalable(row: dict) -> bool:
 
     Signalling takes proof, in both directions: a row nobody could identify when it was
     written is out, and so is one whose leader cannot be identified NOW — unless the row
-    itself records that the leader is expected to be gone. Everything else is spared, at
-    the cost of leaving the odd already-empty group unsignalled, which costs nothing.
+    records that the leader is expected to be gone AND no process is wearing that pid to
+    contradict it. Everything else is spared, at the cost of leaving the odd already-empty
+    group unsignalled, which costs nothing.
     """
     pgid = row.get("pgid")
     if not isinstance(pgid, int) or pgid <= 1:

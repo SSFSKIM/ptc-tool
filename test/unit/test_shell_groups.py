@@ -242,6 +242,87 @@ def test_killing_a_retired_handle_whose_pgid_was_recycled_signals_nobody(
         f"kill() SIGKILLed a group the handle no longer owns: {signalled}"
 
 
+# --- r11 finding 2: a retained row's staleness is BOUNDED -----------------------------
+
+def test_a_retained_row_goes_when_its_orphaned_group_finally_empties(tmp_path, monkeypatch):
+    """`_retire` keeps a daemonizer's row because its descendants are still in the group —
+    and then nothing ever asked again. The watcher awaited the LEADER, so once it exited the
+    row sat there naming a group that emptied seconds later, until the next kill/restart/TTL
+    reap happened to consume the file. A row that names an emptied group names a NUMBER, and
+    a free pgid is one the OS hands out again: that staleness is the raw material every
+    recycle hazard downstream is built from. The same watcher stays on the group instead.
+    """
+    monkeypatch.setattr(shell, "_ORPHAN_POLL_S", 0.05)
+
+    async def flow() -> tuple[int, list]:
+        h = await shell.bash("sleep 0.6 >/dev/null 2>&1 & echo $!", background=True)
+        pid = int((await h.wait()).stdout.strip())
+        await asyncio.sleep(0.2)
+        assert bgroups.read(tmp_path), "the row went while its orphaned group still lived"
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and bgroups.read(tmp_path):
+            await asyncio.sleep(0.05)
+        return pid, bgroups.read(tmp_path)
+
+    pid, rows = asyncio.run(flow())
+    try:
+        assert _gone(pid), "the fixture's descendant outlived its own sleep"
+        assert rows == [], f"the row outlived the orphaned group it was kept for: {rows}"
+    finally:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+# --- r11 finding 3: a leader that exits before registration still has a GROUP ----------
+
+def test_a_daemonizer_whose_leader_exits_before_registration_is_still_reapable(
+        tmp_path, monkeypatch):
+    """`os.getpgid(proc.pid)` raising meant "already exited: nothing to reap later", and
+    that second half is false. `start_new_session=True` means setsid already made the pgid
+    the pid, so the group id is known by CONSTRUCTION — and a daemonizer's descendants are
+    sitting in it. Dropping the registration returned a handle with no pgid at all, so
+    neither `h.kill()` nor kill/restart/TTL could ever reach them: a permanent leak, on the
+    exact command shape the whole retention rule exists for.
+
+    The row it writes now has no birth stamp to offer (its leader is gone), so it says what
+    it does know instead: `leader_exited` plus a pgid the constructor guarantees. That pair
+    is what `bgroups` lets past the quarantine — a legacy bare row, which claims neither,
+    still does not get through.
+    """
+    real_getpgid = os.getpgid
+
+    def gone_by_the_time_we_ask(pid):
+        if pid == 0:                       # the reaper asking about ITSELF is untouched
+            return real_getpgid(0)
+        raise ProcessLookupError(pid)
+
+    async def flow() -> int:
+        monkeypatch.setattr(os, "getpgid", gone_by_the_time_we_ask)
+        try:
+            h = await shell.bash("sleep 300 >/dev/null 2>&1 & echo $!", background=True)
+            return int((await h.wait()).stdout.strip())
+        finally:
+            monkeypatch.setattr(os, "getpgid", real_getpgid)
+
+    pid = asyncio.run(flow())
+    try:
+        rows = bgroups.read(tmp_path)
+        assert len(rows) == 1, f"the group was dropped as if it had no members: {rows}"
+        assert rows[0]["leader_exited"] is True and rows[0]["leader_start"] is None
+        assert bgroups.signalable(rows[0]), "a construction-known pgid stayed quarantined"
+        assert not _gone(pid, patience=0.5), "the descendant died before the reap was tested"
+
+        assert bgroups.reap(tmp_path) == [rows[0]["pgid"]]
+        assert _gone(pid), f"descendant {pid} had no pgid anything could reap it by"
+    finally:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
 # --- r8 finding 9: a background handle's buffers are bounded --------------------------
 
 _CHATTY = "yes hello | head -n 1000000"          # 6 000 000 bytes, whole lines
