@@ -1068,3 +1068,63 @@ def test_reconciliation_is_a_startup_step_and_not_a_sweep(tmp_path):
         assert _row(tmp_path, "ghost")["status"] == "orphaned"
         await h.interrupt()
     asyncio.run(flow())
+
+
+# --- r14 finding 5: a generated handle name must not land on a persisted row -----------
+
+class _CollidingUUID:
+    """`uuid4()` that draws the same value once before diverging — a 24-bit collision made
+    real rather than waited for."""
+
+    def __init__(self, *hexes):
+        self._hexes = list(hexes)
+
+    def __call__(self):
+        return type("U", (), {"hex": self._hexes.pop(0)})()
+
+
+def test_a_generated_name_never_overwrites_a_persisted_rows_session(tmp_path,
+                                                                     monkeypatch):
+    """`_claim_name` looks only at `_handles`, which a restart empties — while
+    `agents.json` survives on purpose, because that file is what makes an old session
+    resumable at all. A generated name landing on a persisted row therefore made
+    `_registry_write` UPSERT that row and overwrite its `session_id`, deleting the only
+    reference to the session it was being kept for. (r12 widened child KERNEL keys; this
+    is the handle NAME, a different site with the same 24-bit arithmetic behind it.)
+
+    Nobody asked for this name, so the collision is regenerated rather than raised: an
+    explicit name is the caller's choice and keeps its own refusal.
+    """
+    a = _agent(tmp_path)
+    # Both widths of the same draw are already spoken for: the six-hex prefix a narrow
+    # generator would have produced, and the twelve-hex name a wide one lands on.
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"name": "agent-aaaaaa", "provider": "claude", "session_id": "precious",
+          "status": "done", "created_at": 1},
+         {"name": "agent-aaaaaaaaaaaa", "provider": "claude", "session_id": "also-precious",
+          "status": "done", "created_at": 2}]))
+    monkeypatch.setattr(agents.uuid, "uuid4",
+                        _CollidingUUID("aaaaaaaaaaaa0000", "bbbbbbbbbbbb0000"))
+
+    async def flow():
+        h = a.spawn("alpha")
+        await asyncio.wait_for(h.result(), 5)
+        return h
+
+    h = asyncio.run(flow())
+
+    assert _row(tmp_path, "agent-aaaaaa")["session_id"] == "precious"
+    assert _row(tmp_path, "agent-aaaaaaaaaaaa")["session_id"] == "also-precious"
+    assert _row(tmp_path, "agent-aaaaaaaaaaaa")["status"] == "done"
+    assert h.name == "agent-bbbbbbbbbbbb", "the collision was taken rather than redrawn"
+
+
+def test_generated_suffixes_are_wide_enough_to_make_the_draw_unremarkable(tmp_path):
+    """Six hex characters is 24 bits — a birthday collision inside a few thousand handles
+    on one long-lived kernel. Twelve is the width `child_key` already uses for the same
+    reason, and every generated name here is drawn at it."""
+    a = _agent(tmp_path)
+    for prefix in ("agent", "fork", "resumed-sess"):
+        name = a._generated_name(prefix)
+        suffix = name[len(prefix) + 1:]
+        assert len(suffix) == 12 and int(suffix, 16) >= 0, name

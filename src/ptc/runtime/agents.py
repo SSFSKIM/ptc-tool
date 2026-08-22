@@ -519,6 +519,28 @@ class _Agent:
                 f"agent name already in use: {name!r} (status={prior.status}, its session "
                 "is still live) — await that handle's close() before reusing the name")
 
+    def _generated_name(self, prefix: str) -> str:
+        """A handle name PTC invented, checked against everything that already holds one.
+
+        Six hex characters is 24 bits, and the only thing they were ever checked against
+        was `_handles` — which a restart empties while `agents.json` survives on purpose.
+        A generated name colliding with a persisted row made `_registry_write` upsert THAT
+        row and overwrite its `session_id`, deleting the only reference to a session the
+        file was being kept for (the same failure `_resumed_name` was taught to avoid, from
+        the other direction). Twelve hex characters make the draw itself unremarkable, and
+        the registry is consulted anyway because unremarkable is not the same as never.
+
+        Regenerating rather than raising, because nobody asked for this name: a collision
+        here is an implementation detail and the caller has no way to act on it. An
+        EXPLICIT name is the opposite — the caller chose it, so `_claim_name` still refuses
+        it when its previous holder is live.
+        """
+        taken = {r.get("name") for r in self._registry_load() if isinstance(r, dict)}
+        while True:
+            name = f"{prefix}-{uuid.uuid4().hex[:12]}"
+            if name not in taken and name not in self._handles:
+                return name
+
     def _resumed_name(self, session_id: str) -> str:
         """`resumed-<first 8 of the session id>`, lengthened when that prefix is already
         taken by a DIFFERENT session.
@@ -546,7 +568,7 @@ class _Agent:
                 continue
             if name not in rows or rows[name] == session_id:
                 return name
-        return f"resumed-{session_id}-{uuid.uuid4().hex[:6]}"
+        return self._generated_name(f"resumed-{session_id}")
 
     def _registry_path(self):
         return STATE.kernel_dir / "agents.json"
@@ -592,7 +614,7 @@ class _Agent:
     def spawn(self, task: str, *, name: str | None = None, **kw) -> AgentHandle:
         self._check_depth()
         o = self._opts(kw)
-        name = name or f"agent-{uuid.uuid4().hex[:6]}"
+        name = name or self._generated_name("agent")
         self._claim_name(name)
         h = AgentHandle(self, name, o.provider, o.timeout)
         self._handles[name] = h
@@ -653,7 +675,7 @@ class _Agent:
             o.timeout)
         # S2: a forked child's own transcript carries no back-pointer to its parent, so
         # this row is the only place the relation survives on disk.
-        self._registry_write(f"fork-{uuid.uuid4().hex[:6]}", "claude", r.session_id,
+        self._registry_write(self._generated_name("fork"), "claude", r.session_id,
                              "done", task_head=task, parent_session_id=sid)
         return r
 
