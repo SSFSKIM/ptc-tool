@@ -79,10 +79,21 @@ def test_the_fakes_hand_transcribed_enums_still_match_the_installed_schema(tmp_p
 
     server_requests = [m for v in load("ServerRequest.json")["oneOf"]
                        for m in v["properties"]["method"]["enum"]]
-    assert set(fk.SERVER_REQUESTS) == set(server_requests)
+    # Methods the fakes and responder table carry AHEAD of the installed binary — each
+    # transcribed from upstream's current schema because a newer app-server sends it
+    # (r9: `currentTime/read` aborts the turn unanswered). An extra in the fakes must be
+    # declared here, and the declaration self-expires: the moment the installed binary's
+    # schema gains the method, the disjointness assert fails and the entry comes out —
+    # this list is a dated loan, not a place drift can hide.
+    forward = {"currentTime/read"}
+    assert not (forward & set(server_requests)), \
+        f"installed schema caught up — remove from forward: {forward & set(server_requests)}"
+    assert set(server_requests) <= set(fk.SERVER_REQUESTS)
+    assert set(fk.SERVER_REQUESTS) - set(server_requests) <= forward
     assert set(fk.CREDENTIAL_REQUESTS) <= set(server_requests)
-    # Everything PTC answers with a real result must still be a method the server asks.
-    assert set(codex_backend._RESPONDERS) <= set(server_requests)
+    # Everything PTC answers with a real result must still be a method the server asks —
+    # or a declared forward loan.
+    assert set(codex_backend._RESPONDERS) <= set(server_requests) | forward
 
     for literal, file, name in [
         (fk._SANDBOX_MODES, "ThreadStartParams.json", "SandboxMode"),
