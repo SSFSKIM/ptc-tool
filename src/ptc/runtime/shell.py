@@ -45,8 +45,20 @@ def _register(proc, cmd: str) -> int | None:
     # The leader's start time is recorded WITH the pgid: a pgid alone is reusable, and a
     # reaper that trusts a stale row can SIGKILL whatever same-user group inherited the
     # number (ptc/bgroups.py `_recycled`). Same identity pair as ownership.py's.
-    _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "leader_start": proc_start_time(pgid),
-                   "cmd": cmd[:200], "started_at": time.time()}
+    #
+    # `ps` can fail transiently, and a leader that exits inside this call cannot be read at
+    # all — so the read is retried once (the same one-retry the kernel spawn gives its own
+    # identity), and a row that still has no identity is written MARKED rather than written
+    # bare. A bare row is indistinguishable from a verified one to the reaper: it reads as
+    # "not recycled", and once its pgid is handed out again the reap kills a stranger. The
+    # mark is what keeps such a row droppable but never signalable (`bgroups.unverifiable`).
+    # Registration does not fail on it: the command is already running, and a row that can
+    # be dropped but not signalled is strictly better than no row at all — `kill()` and
+    # `_retire` still find the group through it.
+    start = proc_start_time(pgid) or proc_start_time(pgid)
+    _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "leader_start": start,
+                   "cmd": cmd[:200], "started_at": time.time(),
+                   **({} if start else {"unverifiable": True})}
     _persist()
     return pgid
 
@@ -83,7 +95,9 @@ def _retire(pgid: int | None) -> None:
     threw away the only PGID anything could still reap it by, and the descendant outlived
     the kernel. The row stays, marked `leader_exited` — the shape bgroups._recycled is
     written to accept, since a pid cannot be recycled while it is still a live group's id,
-    so an absent leader is never the identity-mismatch case that suppresses a reap.
+    so an absent leader is never the identity-mismatch case that suppresses a reap. Losing
+    the leader does not cost a row its signal-eligibility either: it was identified when it
+    was REGISTERED, and only a row that never was is quarantined (`bgroups.unverifiable`).
     """
     if not _group_alive(pgid):
         _unregister(pgid)

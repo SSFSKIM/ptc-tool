@@ -37,8 +37,12 @@ def test_reap_tolerates_stale_and_malformed_entries(tmp_path):
 
 def test_reap_never_signals_the_reapers_own_group(tmp_path):
     """A recycled pgid that lands on the caller would make this reap suicidal — it runs
-    inside the CLI, the adapter, and the kernel's own watchdog."""
-    bgroups.write(tmp_path, [{"pgid": os.getpgid(0)}])
+    inside the CLI, the adapter, and the kernel's own watchdog.
+
+    The row carries a verified identity on purpose: an unverifiable one is skipped before
+    this guard is ever consulted, which would make the test pass without exercising it."""
+    me = os.getpgid(0)
+    bgroups.write(tmp_path, [{"pgid": me, "pid": me, "leader_start": proc_start_time(me)}])
 
     assert bgroups.reap(tmp_path) == []
     assert os.getpid() == os.getpid()                   # still here to say so
@@ -84,3 +88,69 @@ def test_reap_still_signals_a_group_whose_leader_identity_matches(tmp_path):
         if p.poll() is None:
             p.kill()
             p.wait()
+
+
+# --- r6 finding 3: a group nobody could identify is never signalled -------------------
+
+def test_reap_never_signals_a_row_whose_leader_was_never_identified(tmp_path):
+    """A row written without an identity reads as "not recycled" to `_recycled`, which is
+    the same answer a VERIFIED row gets — so once its pgid is handed out again, the reap
+    every kill/restart/TTL runs SIGKILLs whatever same-user group inherited the number.
+    An unidentified row may be dropped; it may never be signalled."""
+    p = _live_group()
+    try:
+        bgroups.write(tmp_path, [{"pgid": p.pid, "pid": p.pid, "leader_start": None,
+                                  "unverifiable": True}])
+        assert bgroups.reap(tmp_path) == []
+        time.sleep(0.3)
+        assert p.poll() is None, "an unidentifiable group was signalled anyway"
+        assert not bgroups.path_for(tmp_path).exists(), "the row was not dropped"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_a_row_that_lost_its_leader_after_registration_is_still_signalled(tmp_path):
+    """The other half of the rule, and the one the daemonizing-background case depends on
+    (r4): a row that WAS identified when it was written keeps its signal-eligibility when
+    its leader later exits. Only never-identified rows are quarantined."""
+    p = _live_group()
+    try:
+        bgroups.write(tmp_path, [{"pgid": p.pid, "pid": p.pid,
+                                  "leader_start": proc_start_time(p.pid),
+                                  "leader_exited": True}])
+        assert bgroups.reap(tmp_path) == [p.pid]
+        assert p.wait(timeout=5) is not None
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+
+
+def test_registration_marks_a_group_it_could_not_identify(tmp_path, monkeypatch):
+    """`ps` failing at registration used to persist `leader_start=None` silently. The read
+    is retried once, and what still cannot be resolved is written MARKED — the row stays
+    (kill() and _retire still need it) but the reaper will not signal it."""
+    import asyncio
+
+    from ptc.runtime import shell
+    from ptc.runtime.state import STATE
+
+    monkeypatch.setattr(STATE, "kernel_dir", tmp_path)
+    shell._LIVE.clear()
+    calls = []
+    monkeypatch.setattr(shell, "proc_start_time", lambda pid: calls.append(pid) or None)
+    try:
+        async def flow():
+            h = await shell.bash("sleep 300", background=True)
+            rows = bgroups.read(tmp_path)
+            h.kill()
+            await h.wait()
+            return rows
+
+        rows = asyncio.run(flow())
+        assert len(rows) == 1 and rows[0]["unverifiable"] is True, rows
+        assert len(calls) == 2, f"the identity read must be retried once, got {calls}"
+        assert bgroups.unverifiable(rows[0])
+    finally:
+        shell._LIVE.clear()

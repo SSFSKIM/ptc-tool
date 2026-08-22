@@ -19,7 +19,7 @@ import os
 import signal
 from pathlib import Path
 
-from .ownership import proc_start_time
+from .ownership import start_time_matches
 from .paths import private_write_text, secure_dir
 
 FILENAME = "bash-pgids.json"
@@ -59,14 +59,32 @@ def _recycled(row: dict) -> bool:
     `bash` whose shell exited leaving its own children behind. That is the row the shell
     keeps deliberately, flagged `leader_exited` (`runtime/shell.py` `_retire`): it is
     retained precisely because its group outlived its leader, and this branch is what lets
-    it still be reaped. Rows written before identities were recorded carry no
-    `leader_start` and keep the pre-identity behavior.
+    it still be reaped.
+
+    A row with no identity at all is a different question entirely and is not answered here
+    — see `unverifiable()`.
     """
-    recorded = row.get("leader_start")
-    if not recorded:
-        return False
-    current = proc_start_time(row["pgid"])
-    return current is not None and current != recorded
+    return start_time_matches(row["pgid"], row.get("leader_start")) is False
+
+
+def unverifiable(row: dict) -> bool:
+    """True when nothing ever proved WHICH process led this row's group.
+
+    `_recycled` can only compare against a recorded identity; with none, every stale row
+    reads as safe to signal, and a pgid outlives the group it named — the OS hands that
+    number to unrelated same-user work and the next kill/restart/TTL reap SIGKILLs a
+    stranger's process group. A row that could not be identified when it was written is
+    therefore quarantined: `reap` may DROP it (the file is consumed either way, and a row
+    whose group is already empty costs nothing to forget), but never signals it. The shell
+    retries the identity read before giving up and marks what it could not resolve
+    (`runtime/shell.py` `_register`); rows written before identities were recorded at all
+    carry no `leader_start` and land here too, which is the safe direction for a registry
+    whose rows are recreated on every command.
+
+    This is not the `leader_exited` case: those rows WERE identified at registration and
+    keep their signal-eligibility by design, which is the whole point of retaining them.
+    """
+    return bool(row.get("unverifiable")) or not row.get("leader_start")
 
 
 def reap(kernel_dir) -> list:
@@ -76,6 +94,8 @@ def reap(kernel_dir) -> list:
         pgid = row.get("pgid")
         if not isinstance(pgid, int) or pgid <= 1:
             continue
+        if unverifiable(row):
+            continue                      # never proved whose group this is: drop it, unsignalled
         if _recycled(row):
             continue                      # somebody else's group now: drop it, unsignalled
         try:
