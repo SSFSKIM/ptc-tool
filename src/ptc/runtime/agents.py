@@ -147,8 +147,14 @@ def child_key(parent_key: str) -> str:
     losing session isolation and the recursion brake in one step. The parent portion is
     hash-shortened when it has to be, so the suffix always survives, and the shortening is
     deterministic — the same parent always contributes the same prefix.
+
+    Twelve hex characters, not six. Six is 24 bits, which collides somewhere in a fleet of
+    a thousand concurrent children about 2.9% of the time — and the collision is silent
+    and total: two unrelated children resolve to ONE key, attach to one kernel and share a
+    Python namespace. 48 bits takes the same fleet to ~1.8e-9, and the parent portion still
+    fits (a shortened parent needs `_KEY_MAX - len(suffix)` characters, digest included).
     """
-    suffix = f"-a{uuid.uuid4().hex[:6]}"
+    suffix = f"-a{uuid.uuid4().hex[:12]}"
     room = _KEY_MAX - len(suffix)
     if len(parent_key) > room:
         digest = hashlib.sha256(parent_key.encode()).hexdigest()[:12]
@@ -621,11 +627,21 @@ class _Agent:
         return list(await asyncio.gather(*(h.result() for h in handles)))
 
     def list(self) -> list:
+        """The registry, with this kernel's own handles laid over it.
+
+        `live` is a claim about the CLI BEHIND the handle, not about the row: close() and
+        the error teardown both null the session out, and send() refuses a handle without
+        one — so a flat True invited a call that cannot work, on exactly the handles a
+        caller runs list() to sort out. A driver that has not opened its session yet is
+        live all the same; it is on its way to one. The row itself survives either way —
+        its status and its session id are the record of what ran and what may be resumed.
+        """
         rows = {r["name"]: dict(r) for r in self._registry_load() if r.get("name")}
         for h in self._handles.values():
             rows.setdefault(h.name, {"name": h.name})
             rows[h.name].update({"provider": h.provider, "session_id": h.session_id,
-                                 "status": h.status, "live": True})
+                                 "status": h.status,
+                                 "live": h._session is not None or h.status == "running"})
         return sorted(rows.values(), key=lambda r: r.get("created_at", 0))
 
     def resume(self, session_id: str, **kw) -> AgentHandle:

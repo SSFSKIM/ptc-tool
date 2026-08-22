@@ -607,6 +607,27 @@ def test_list_merges_live_handles_over_registry(tmp_path):
     assert next(e for e in a.list() if e["name"] == "fresh")["live"] is True
 
 
+def test_list_shows_a_closed_handle_as_not_live(tmp_path):
+    """`live` said True for every handle this kernel had ever made. A closed one has no
+    session — send() refuses it by design — so the flag invited a call that cannot work,
+    on exactly the handles a caller runs list() to sort out. The ROW stays either way:
+    its status and its session id are the record of what ran and what may be resumed.
+    """
+    a = _agent(tmp_path)
+
+    async def flow():
+        h = a.spawn("live", name="fresh")
+        await asyncio.wait_for(h.result(), 2)
+        assert next(e for e in a.list() if e["name"] == "fresh")["live"] is True
+        await h.close()                    # a finished handle whose CLI has been reaped
+        return h
+
+    h = asyncio.run(flow())
+    row = next(e for e in a.list() if e["name"] == "fresh")
+    assert row["live"] is False, row
+    assert row["status"] == "done" and row["session_id"] == h.session_id
+
+
 def _secretish(name: str, value: str) -> bool:
     """The spec's redaction predicate (Trust model + T18 Decision Log), restated here as
     the assertion this test makes about the explicitly forwarded child env."""
@@ -654,7 +675,19 @@ def test_child_key_survives_a_parent_key_at_the_length_bound(tmp_path):
     assert child_ptc_env(AgentOpts())["PTC_SESSION"].startswith("short-a")
     _agent(tmp_path, key=parent)
     other = child_ptc_env(AgentOpts())["PTC_SESSION"]
-    assert other != child and other[:-8] == child[:-8], "same parent, same prefix"
+    assert other != child and other[:-12] == child[:-12], "same parent, same prefix"
+
+
+def test_a_child_key_suffix_carries_enough_entropy_to_not_collide(tmp_path):
+    """Six hex characters is 24 bits: ~2.9% odds of a collision somewhere in a fleet of a
+    thousand concurrent children, and the collision is SILENT — the two children resolve
+    to one kernel and share a Python namespace with each other. Twelve puts the same fleet
+    at ~1.8e-9, and the parent prefix still fits inside safe_key()'s bound above."""
+    from ptc.runtime.agents import child_key
+
+    suffix = child_key("short")[len("short"):]
+    assert suffix.startswith("-a") and len(suffix) == 14, suffix
+    int(suffix[2:], 16)                    # 12 hex characters — 48 bits
 
 
 def test_interrupt_during_a_follow_up_send_reaches_the_backend(tmp_path):
