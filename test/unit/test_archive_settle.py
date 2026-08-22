@@ -322,3 +322,89 @@ def test_wait_keeps_waiting_when_the_kernels_identity_cannot_be_read(monkeypatch
 
     assert isinstance(out, Running), f"a running cell was settled dead: {out}"
     assert "working" in out.output
+
+
+# --- r14 finding 3: a restart between the record read and the log read ----------------
+
+def _rotating_read_record(monkeypatch, key: str, cell_id: int):
+    """Fabricate the race: the record comes back, then `cells/` is renamed out from under
+    the caller before it can open the log — exactly the window a concurrent `ptc restart`
+    occupies, in the one order that is hard to hit by waiting for it."""
+    from ptc import client as client_mod
+    from ptc.paths import cells_dir, kernel_dir
+
+    real = client_mod.read_record
+
+    def rotate_after_reading(k, cid):
+        rec = real(k, cid)
+        if rec is not None and k == key and cid == cell_id:
+            cells_dir(k).rename(kernel_dir(k) / "cells-prev-9")
+            (kernel_dir(k) / "cells").mkdir()
+        return rec
+
+    monkeypatch.setattr(client_mod, "read_record", rotate_after_reading)
+
+
+def _live_cell(key: str, cell_id: int, text: str, images: list) -> None:
+    import json as _json
+
+    from ptc.paths import cells_dir
+
+    d = cells_dir(key)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{cell_id}.log").write_text(text)
+    for name in images:
+        (d / name).write_bytes(b"png-bytes")
+    (d / f"{cell_id}.json").write_text(_json.dumps(
+        {"status": "ok", "duration_ms": 1, "result_repr": None, "error": None,
+         "images": [str(d / n) for n in images], "mutations": []}))
+
+
+def test_a_restart_between_the_record_and_the_log_settles_from_the_archive(monkeypatch,
+                                                                           tmp_path):
+    """`wait_cell`'s record branch is TWO reads, and a restart fits between them: the
+    record is read, `cells/` becomes `cells-prev-*`, and the log read then opens nothing.
+    The caller got a terminal Completed with the cell's status, no output at all, and
+    `record.images` naming a directory that had moved — which the renderer drops silently.
+    Everything the cell produced was sitting in the archive the whole time.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _live_cell("r1", 4, "the output\n", ["4-0.png"])
+    _rotating_read_record(monkeypatch, "r1", 4)
+
+    out = KernelClient("r1").wait_cell(4, timeout_s=5)
+
+    assert isinstance(out, Completed)
+    assert "the output" in out.output, "a finished cell settled with nothing to show"
+    archive = tmp_path / "kernels" / "r1" / "cells-prev-9"
+    assert out.record.images == [str(archive / "4-0.png")], out.record.images
+
+
+def test_follow_settles_the_same_race_from_the_archive(monkeypatch, tmp_path):
+    """`_follow`'s record branch is the same two reads in the same order, so it inherits
+    the same window — and `exec_cell` is the path most likely to be standing in it, since
+    it is the one following a cell it just submitted."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _live_cell("r2", 6, "followed output\n", ["6-0.png"])
+    _rotating_read_record(monkeypatch, "r2", 6)
+
+    out = KernelClient("r2")._follow(6, timeout_s=5)
+
+    assert isinstance(out, Completed)
+    assert "followed output" in out.output
+    archive = tmp_path / "kernels" / "r2" / "cells-prev-9"
+    assert out.record.images == [str(archive / "6-0.png")], out.record.images
+
+
+def test_a_cell_that_really_printed_nothing_is_not_re_settled(monkeypatch, tmp_path):
+    """Empty alone is ordinary — a cell that printed nothing, or a cursor already past the
+    end. Only empty AND no live log describes the rotation, and the live record still wins
+    when the log is standing where it belongs."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _live_cell("r3", 2, "", [])
+    _archive(tmp_path, "r3", 2, "a stranger from an older epoch\n", None)
+
+    out = KernelClient("r3").wait_cell(2, timeout_s=5)
+
+    assert isinstance(out, Completed)
+    assert out.output == "" and out.record.status == "ok"

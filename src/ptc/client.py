@@ -223,6 +223,9 @@ class KernelClient:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 out, off = read_output_since(self.key, cell_id, 0)
+                arch = self._rotated_under_the_record(cell_id, 0, out)
+                if arch is not None:
+                    return arch
                 # Same rule as the Running exit below, and it applies to a cell that
                 # finished inside the yield just as much: this output HAS been handed to
                 # the caller. Dropping the offset here left the sidecar unseeded, so a
@@ -529,6 +532,35 @@ class KernelClient:
             return Completed(cell_id, record, text + note, log_path=log)
         return None
 
+    def _rotated_under_the_record(self, cell_id: int, offset: int,
+                                  text: str) -> "Completed | None":
+        """Did a restart move this cell out from between the record read and the log read?
+
+        The record branch is two reads, and a concurrent restart fits between them: the
+        record comes back, `cells/` is renamed to `cells-prev-*`, and the log read then
+        opens nothing. The caller got a TERMINAL Completed carrying the record's status and
+        no output at all — plus `record.images` naming paths in a directory that has moved,
+        which the renderer drops silently. The cell finished and everything it produced was
+        sitting in the archive.
+
+        Both facts are required before re-settling, because either alone is ordinary: a
+        cell that genuinely printed nothing is empty for good reasons, and a cursor already
+        past the end of a live log reads empty every time. Only empty AND no live log at
+        all describes the rotation. `_archived` then reads the archived log and rebases the
+        image paths onto the directory that now holds them; an archive with nothing to say
+        (a cell whose id the CURRENT epoch handed out, whose log was never rotated) leaves
+        the caller with exactly what the live read gave.
+
+        Each caller passes the cursor its own branch uses — `wait_cell` resumes at the
+        caller's offset, `_follow` reads the whole cell — and `_archived` advances the
+        sidecar as it does for every other archived read.
+        """
+        if text:
+            return None
+        if (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
+            return None
+        return self._archived(cell_id, offset)
+
     def _archived_start(self, d: Path, cell_id: int, offset: int) -> int:
         """Where an archived read really starts for THIS caller.
 
@@ -575,6 +607,9 @@ class KernelClient:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 text, new_off = read_output_since(self.key, cell_id, offset)
+                arch = self._rotated_under_the_record(cell_id, offset, text)
+                if arch is not None:
+                    return arch
                 save_offset(self.key, cell_id, new_off)
                 return Completed(cell_id, rec, text)
             if not (kernel_dir(self.key) / "cells" / f"{cell_id}.log").exists():
