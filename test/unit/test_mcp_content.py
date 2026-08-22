@@ -47,3 +47,54 @@ def test_per_image_cap_skips_oversized_image_keeps_small_one(tmp_path):
     assert "1500001 bytes" in skip_item.text
     assert "1.5MB per-image cap" in skip_item.text
     assert str(big) in skip_item.text
+
+
+# --- r14 finding 6: an image moved mid-reply does not cost the reply ------------------
+
+def test_an_image_moved_after_render_costs_a_note_not_the_whole_response(tmp_path):
+    """`render()` verifies these paths and `_content` then stats and reads them — and a
+    concurrent restart rotating `cells/` into `cells-prev-*` fits between the two. The
+    unguarded reads raised FileNotFoundError out of the handler, so the caller lost the
+    cell's TEXT (the thing it asked for) and every image that was still there, over one
+    file that had merely moved.
+
+    The note names the convention rather than the vanished file, because a reader who
+    wants that image has to know where a restart puts it.
+    """
+    cells = tmp_path / "cells"
+    cells.mkdir()
+    gone, kept = cells / "1-0.png", cells / "1-1.png"
+    for p in (gone, kept):
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+
+    outcome = Completed(1, _rec(images=[str(gone), str(kept)]), "the output\n")
+    rendered = render(outcome, "k", Config.from_env(env={}))
+    assert rendered.images == [gone, kept], "render() must have verified both"
+
+    gone.unlink()                                  # the restart moved it out from under us
+
+    out = _content(rendered)
+
+    assert out[0].type == "text" and out[0].text == rendered.text, "the text must survive"
+    assert out[1].type == "text"
+    assert "1-0.png" in out[1].text and "cells-prev-*" in out[1].text
+    assert out[2].type == "image", "a later image was dropped with the missing one"
+    assert base64.b64decode(out[2].data) == kept.read_bytes()
+
+
+def test_a_whole_rotated_cells_directory_still_returns_the_text(tmp_path):
+    """The real shape of the race: not one file, the whole directory renamed at once."""
+    cells = tmp_path / "cells"
+    cells.mkdir()
+    img = cells / "2-0.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+
+    rendered = render(Completed(2, _rec(images=[str(img)]), "still here\n"), "k",
+                      Config.from_env(env={}))
+    cells.rename(tmp_path / "cells-prev-9")
+
+    out = _content(rendered)
+
+    assert len(out) == 2
+    assert out[0].text == rendered.text
+    assert "2-0.png" in out[1].text and "cells-prev-*" in out[1].text

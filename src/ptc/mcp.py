@@ -34,18 +34,45 @@ server = MCPServer("ptc", instructions=INSTRUCTIONS)
 _MAX_IMAGE_BYTES = 1_500_000
 
 
+def _moved_image_note(path: Path) -> TextContent:
+    """Names the convention rather than the file, because the file is what is missing:
+    a restart archives the whole of `cells/` under a `cells-prev-<stamp>` sibling, so
+    that is where a reader goes looking."""
+    return TextContent(type="text", text=(
+        f"[image {path.name} is gone: a concurrent restart moved this cell's files out "
+        f"of {path.parent} into a `cells-prev-*` archive beside it while this reply was "
+        "being assembled — look for it there]"))
+
+
 def _content(rendered) -> list:
+    """The tool reply: the cell's text, then up to two of its images.
+
+    The text is the result; the images are an enrichment of it. `render()` verified those
+    paths, but a restart rotating `cells/` into `cells-prev-*` between that verification
+    and these reads takes the files out from under them — and an unguarded stat or read
+    then raised out of the whole handler, discarding the text the caller actually asked
+    for along with every image that was still there. A lost image costs a note and the
+    next image is still tried; the text survives every one of them.
+    """
     out = [TextContent(type="text", text=rendered.text)]
     budget = 4_000_000 - len(rendered.text)
     for p in rendered.images[:2]:
         path = Path(p)
-        size = path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError:
+            out.append(_moved_image_note(path))
+            continue
         if size > _MAX_IMAGE_BYTES:
             out.append(TextContent(type="text", text=(
                 f"[image {path.name} skipped: {size} bytes exceeds 1.5MB per-image cap "
                 f"— saved at {path}]")))
             continue
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            out.append(_moved_image_note(path))
+            continue
         if len(data) * 1.4 > budget:      # base64 inflation
             break
         import base64
