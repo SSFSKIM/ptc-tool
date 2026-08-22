@@ -66,6 +66,33 @@ def test_one_caller_still_resumes_where_it_left_off(monkeypatch, tmp_path):
     assert kc.wait_cell(4, timeout_s=10).output == "second delivery\n"
 
 
+def test_a_forked_child_does_not_inherit_its_parents_cursor(monkeypatch, tmp_path):
+    """A fork copies globals, so a cursor identity computed before the fork came out of
+    the child unchanged — and on Linux, where `multiprocessing` forks by default, that is
+    the ordinary case rather than an exotic one. Parent and child then read and advance
+    one sidecar: whichever waits first consumes the output and the other is handed the gap
+    per-caller cursors exist to prevent. The identity is recomputed when the pid moves.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _seed("c4", 5, "the whole output\n")
+
+    kc = KernelClient("c4")
+    assert "the whole output" in kc.wait_cell(5, timeout_s=10).output   # parent consumes it
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:                                    # child: never returns to pytest
+        try:
+            os.write(w, KernelClient("c4").wait_cell(5, timeout_s=10).output.encode())
+        finally:
+            os._exit(0)
+    os.close(w)
+    seen = os.read(r, 4096).decode()
+    os.close(r)
+    os.waitpid(pid, 0)
+
+    assert "the whole output" in seen, "the forked child inherited the parent's cursor"
+
+
 def test_an_explicit_cursor_is_still_the_cross_process_contract(monkeypatch, tmp_path):
     """`since=` is what one process hands another (every `Running` render prints it), and
     it must keep meaning the same offset regardless of which caller carries it."""
