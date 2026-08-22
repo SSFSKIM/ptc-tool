@@ -262,6 +262,44 @@ def test_restart_keeps_the_depth_and_the_bound_the_kernel_was_spawned_at(ptc_hom
         kill_kernel("kdepth")
 
 
+
+def test_restart_keeps_the_ttl_and_the_concurrency_bound_the_kernel_was_spawned_with(
+        ptc_home, monkeypatch):
+    """The whole kernel-lifetime set travels with the kernel, not just the recursion brake.
+
+    `idle_hours` arms the TTL watchdog and `max_concurrency` sizes the shared agent/llm/web
+    semaphore; both are read once, kernel-side, out of the bootstrap payload the spawn
+    hands over. A restart from a plain shell rebuilt them from THAT process's environment,
+    so a kernel deliberately created with a 30-minute TTL and a bound of 2 came back with
+    the 24-hour default and a bound of 8 — silently, and for the rest of its life.
+    """
+    from ptc.client import KernelClient
+    from ptc.discovery import read_meta
+    from ptc.paths import Config
+
+    monkeypatch.setenv("PTC_IDLE_HOURS", "0.5")
+    monkeypatch.setenv("PTC_MAX_CONCURRENCY", "2")
+    ensure_kernel("kcfg", cwd=str(ptc_home))
+    assert (read_meta("kcfg")["idle_hours"], read_meta("kcfg")["max_concurrency"]) == (0.5, 2), \
+        "the spawn never recorded what the kernel was created to live under"
+
+    monkeypatch.delenv("PTC_IDLE_HOURS")           # the terminal doing the restarting,
+    monkeypatch.delenv("PTC_MAX_CONCURRENCY")      # which knows none of this
+    kernel.restart_kernel("kcfg", cwd=str(ptc_home))
+    try:
+        assert read_meta("kcfg")["idle_hours"] == 0.5, "the restart reset the idle TTL"
+        assert read_meta("kcfg")["max_concurrency"] == 2, \
+            "the restart reset the concurrency bound"
+        out = KernelClient("kcfg").exec_cell(
+            "from ptc.runtime.state import STATE\n"
+            "print('ttl', STATE.config['idle_hours'],\n"
+            "      'bound', STATE.config['max_concurrency'])\n",
+            timeout_s=60, config=Config.from_env())
+        assert "ttl 0.5 bound 2" in out.output, out.output
+    finally:
+        kill_kernel("kcfg")
+
+
 # --- r13 finding 4: a venv rebuilt under a live kernel strands it on deleted code ------
 
 def test_a_venv_upgrade_recycles_the_kernel_it_stranded(ptc_home, monkeypatch):
