@@ -107,9 +107,11 @@ same is true of `agent.*` handles, which settle `error` and re-raise from `resul
 
 `web_fetch(url, *, prompt=None, timeout=30)` GETs the page (redirects followed, 10 MB cap)
 and returns the WHOLE thing as markdown in `.text` — filter it in Python rather than
-asking for a summary. `prompt=` additionally fills `.summary` via `llm()`; the full text
-stays either way, and a summarization turn that fails raises rather than passing its error
-notice off as a summary (fetch without `prompt=` when you only want the page).
+asking for a summary. `prompt=` additionally fills `.summary` via `llm()` — up to 200 000
+characters of the page go into that sub-model call, so it costs a real turn on top of the
+fetch. The full text stays either way, and a summarization turn that fails raises rather
+than passing its error notice off as a summary (fetch without `prompt=` when you only want
+the page).
 
 `web_search(query_text, *, allowed_domains=None, blocked_domains=None, max_results=10,
 timeout=300)` returns the search tool's own hits, not a model write-up. Each
