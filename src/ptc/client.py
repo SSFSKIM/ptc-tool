@@ -652,21 +652,69 @@ class KernelClient:
                 return Running(cell_id, text, new_off)
             time.sleep(0.2)
 
+    def _target_stands(self, target: Busy) -> bool:
+        """Is the cell captured at entry still the one this kernel is working on?
+
+        The cheap half of the question is direct: a terminal record for that id means it is
+        over, and everything after that would land on whatever came next.
+
+        The other half reads current.json, and the three answers it can give are not
+        symmetric. A DIFFERENT id with no record of its own is another cell in flight —
+        somebody else's admission, and the retarget this whole check exists to refuse.
+        A different id that HAS settled is the stale name of an older cell, which is
+        exactly what current.json holds while a target captured from `pending.json` waits
+        for its own `execute_input`; it contradicts nothing. And no name at all means the
+        kernel has published nothing yet — a fresh kernel, or a `cells/` a restart rotated
+        away — which is not evidence of a swap and is left to the incarnation check.
+        """
+        if target.cell_id < 0:
+            # An admitted request whose number nobody knows yet (`pending-unconfirmed`
+            # before `execute_input`). There is no id to compare, so the only thing that
+            # can be established is that the kernel is still working on something — and
+            # the cell it starts next is overwhelmingly ours, since this call holds no
+            # admission and cannot tell the two apart anyway.
+            return self.is_busy() is not None
+        if read_record(self.key, target.cell_id) is not None:
+            return False
+        cur = current_cell(self.key)
+        return (cur is None or cur == target.cell_id
+                or read_record(self.key, cur) is not None)
+
     def interrupt(self) -> None:
         """interrupt_request on the control channel, then SIGINT after a 2 s grace.
 
-        The fallback signals the kernel this call ENTERED on, or nothing at all. It used to
-        re-read the owner fresh and signal whatever pid stood there: a restart landing
-        inside the grace redirects the SIGINT onto the REPLACEMENT — quite possibly
-        part-way into a new cell — for a cell it never ran, and the cell this call meant to
-        stop died with its kernel anyway. So the whole incarnation is captured up front
-        (`Owner` compares pid, birth identity, epoch, nonce and spawn stamp, and each is
-        written once per kernel) and the fallback fires only when the record still names
-        it AND the pid's identity confirms it. Unknown is not a target either: an
-        unreadable identity is how a recycled pid looks, and that process is somebody
-        else's to interrupt.
+        Bound to a KERNEL and to a CELL, and it needs both. The fallback used to re-read
+        the owner fresh and signal whatever pid stood there: a restart landing inside the
+        grace redirects the SIGINT onto the REPLACEMENT — quite possibly part-way into a
+        new cell — for a cell it never ran, and the cell this call meant to stop died with
+        its kernel anyway. So the whole incarnation is captured up front (`Owner` compares
+        pid, birth identity, epoch, nonce and spawn stamp, and each is written once per
+        kernel) and the fallback fires only when the record still names it AND the pid's
+        identity confirms it. Unknown is not a target either: an unreadable identity is how
+        a recycled pid looks, and that process is somebody else's to interrupt.
+
+        The same retarget arrives a second way, which no incarnation check can see because
+        the kernel never changed: cell A settles and another client admits cell B during
+        the connect, the send or the grace, and both the interrupt_request and the SIGINT
+        stop B. So the CELL is captured at entry too and re-checked before each signalling
+        step. Nothing in flight at entry means there is nothing to interrupt — the silent
+        no-op callers already rely on, now taken without opening a control channel and
+        blocking two seconds on a reply to reach it.
+
+        RESIDUAL, stated rather than papered over: the swap can still land between the last
+        check and the signal arriving. Closing that would mean holding admission for the
+        length of the interrupt, which is the one thing an interrupt must not do — it has
+        to reach a kernel that is by definition busy. The window is narrowed from the whole
+        of the operation (up to ~4 s) to the microseconds around the call.
         """
+        # The incarnation is read first and the cell second, so "entry" is one moment
+        # rather than two: a restart landing between them leaves a captured cell belonging
+        # to a kernel the captured owner no longer names, and the fallback's identity check
+        # refuses it — the safe direction.
         entry = read_owner(self.key)
+        busy = self.is_busy()
+        if busy is None or not self._target_stands(busy):
+            return
         try:
             # No heartbeat: hb_channel.start() spawns a thread that creates its socket
             # only once it is scheduled, and this client is torn down moments later —
@@ -685,11 +733,16 @@ class KernelClient:
                 kc.stop_channels()
         except Exception:
             pass
+        # The grace watches the CAPTURED cell, not global idleness: an idle kernel one
+        # moment and a fresh cell the next used to read as "still busy" and keep the
+        # fallback armed for a cell that was already over.
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if self.is_busy() is None:
+            if not self._target_stands(busy):
                 return
             time.sleep(0.1)
+        if not self._target_stands(busy):
+            return
         o = read_owner(self.key)
         if o is not None and o == entry and start_time_matches(o.pid,
                                                               o.proc_start_time) is True:
