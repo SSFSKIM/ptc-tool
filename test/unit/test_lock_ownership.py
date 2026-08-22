@@ -332,3 +332,36 @@ def test_a_real_unreaped_child_reads_as_dead_on_this_platform(monkeypatch, tmp_p
         assert owner_state(Owner(p.pid, recorded, time.time(), "n", "e1")) is False
     finally:
         p.wait()
+
+
+# --- r14 finding 1: a birth stamp is refuted only by another birth stamp ---------------
+
+def test_a_birth_marked_record_is_not_refuted_by_an_lstart_fallback(monkeypatch, tmp_path):
+    """`proc_start_time` DEGRADES: where `/proc` or libproc transiently refuses the read it
+    answers with the `ps -o lstart=` fallback instead, and no birth-marked record can ever
+    equal that string. Read as a mismatch, one failed read declared a LIVE kernel dead —
+    `settled_owner_state` then let kill/ensure drop its metadata and spawn a duplicate
+    beside it, which is the exact failure the unknown answer exists to prevent.
+
+    A cross-SOURCE disagreement is evidence of nothing; a same-source one is still a
+    mismatch, and the second half of this test is what keeps the first from being a
+    blanket amnesty.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    me = os.getpid()
+    monkeypatch.setattr(ownership, "_birth", lambda pid: None)
+    monkeypatch.setattr(ownership, "_ps",
+                        lambda pid, fmt, **kw: "Fri Aug 21 09:14:02 2026")
+    assert proc_start_time(me) == "Fri Aug 21 09:14:02 2026", "the fallback must be live"
+
+    assert start_time_matches(me, "btime=8675309") is None
+
+    o = Owner(me, "btime=8675309", time.time(), "n", "e1")
+    assert owner_state(o) is None, "an unreadable identity is not a dead kernel"
+    with pytest.raises(UnknownOwner, match="cannot tell"):
+        settled_owner_state(o)
+
+    # Same source, different stamp: still a refutation, and nothing here softens it.
+    monkeypatch.setattr(ownership, "_birth", lambda pid: "8675310")
+    assert start_time_matches(me, "btime=8675309") is False
+    assert settled_owner_state(Owner(me, "btime=8675309", time.time(), "n", "e1")) is False

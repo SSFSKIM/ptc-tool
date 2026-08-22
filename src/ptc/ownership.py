@@ -248,10 +248,18 @@ def start_time_matches(pid: int, recorded: str | None) -> bool | None:
     a birth stamp, so a record that names no source is re-compared against exactly the two
     readings that used to be written, which proves identity in every case that ever worked
     and rescues nothing beyond it. A record that DOES name its source is answered by its own
-    reading alone: a birth stamp is what this machine writes now, so a mismatch is a
-    mismatch. Nothing on disk is migrated — every kernel spawn writes a fresh `owner.json`
-    and every `bash()` registration a fresh row, so records self-upgrade and never take this
-    path twice.
+    reading alone: a birth stamp is what this machine writes now, so a SAME-SOURCE mismatch
+    is a mismatch. Nothing on disk is migrated — every kernel spawn writes a fresh
+    `owner.json` and every `bash()` registration a fresh row, so records self-upgrade and
+    never take this path twice.
+
+    Same-source is the whole of that qualifier, and it is load-bearing. `proc_start_time`
+    degrades: where `/proc` or libproc transiently refuses the read it answers with the
+    `ps -o lstart=` fallback instead, which no birth-marked record can ever equal. Reading
+    that cross-source disagreement as a mismatch declared a LIVE kernel dead on the strength
+    of one failed read — `settled_owner_state` then let kill/ensure drop its metadata and
+    spawn a duplicate beside it. A birth stamp may only be REFUTED by another birth stamp;
+    anything else is the unknown that already has an answer of its own.
     """
     if not recorded:
         return None
@@ -261,7 +269,7 @@ def start_time_matches(pid: int, recorded: str | None) -> bool | None:
     if current == recorded:
         return True
     if recorded.startswith(_BIRTH_MARK):
-        return False
+        return False if current.startswith(_BIRTH_MARK) else None
     for legacy in (_ps(pid, "lstart="), proc_start_time(pid, pinned=False)):
         if legacy is not None and legacy == recorded:
             return True
