@@ -72,6 +72,12 @@ given the CLI picks the newest live kernel and prints which one it picked. `ptc 
 --all` ends every kernel whose ownership still checks out, and `ptc doctor` only reports
 — it prints what `ptc setup` would provision rather than provisioning anything itself.
 
+Exit codes: **0** success · **1** the cell raised, the wait found no such cell, or `kill`
+found nothing to kill · **3** the kernel was busy and the code was **not** run. Nothing is
+ever queued, so 3 means "resubmit after it finishes, or `interrupt` first" — a cell that
+was submitted and is merely still running is a success (exit 0) and prints its `wait`
+cell id.
+
 ## Codex (documented, untested)
 
     codex mcp add ptc -- /abs/path/to/ptc/plugin/bin/ptc-launch
@@ -84,7 +90,7 @@ host session id, every result header says so (`[keying: adapter-local]`).
 
 | env | default | meaning |
 |---|---|---|
-| PTC_HOME | ~/.ptc | root |
+| PTC_HOME | ~/.ptc | root (expanded and resolved to an absolute path, so a relative setting means the same directory in the kernel and its children as in the shell that set it) |
 | PTC_SESSION | — | session key override; set on the kernel and its children |
 | PTC_YIELD_S | 300 | exec/wait yield timeout |
 | PTC_MAX_OUTPUT_CHARS | 12000 | result cap (server clamp 50000) |

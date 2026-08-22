@@ -29,6 +29,8 @@ def seen(monkeypatch, tmp_path):
 
     def fake_exec(self, code, timeout_s, config):
         captured.update(timeout_s=timeout_s, cap=config.max_output_chars)
+        # any outcome would do here; Busy is the cheapest to build, which is why the CLI
+        # cases below expect the busy exit code rather than success
         return Busy(None, "lock-held")
 
     for mod in (cli, mcp_mod):
@@ -58,10 +60,10 @@ def test_cli_omitted_timeout_takes_the_environment(seen, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_pick_session",
                         lambda explicit: ("k7", None, Resolved("k7", "explicit", None, None, False)))
 
-    assert cli.main(["exec", "1"]) == 0
+    assert cli.main(["exec", "1"]) == cli.EXIT_BUSY
     assert seen["timeout_s"] == 11.0
 
-    assert cli.main(["exec", "-t", "2", "1"]) == 0
+    assert cli.main(["exec", "-t", "2", "1"]) == cli.EXIT_BUSY
     assert seen["timeout_s"] == 2.0, "an explicit -t must still win"
 
 
@@ -73,6 +75,6 @@ def test_cli_exec_carries_the_resolved_metadata_into_the_kernel(seen, monkeypatc
         cli, "_pick_session",
         lambda explicit: ("k8", None, Resolved("k8", "hook-runfile", "sess-1", "/w", False)))
 
-    assert cli.main(["exec", "1"]) == 0
+    assert cli.main(["exec", "1"]) == cli.EXIT_BUSY
     assert seen["ensure"]["cwd"] == "/w"
     assert seen["ensure"]["claude_session_id"] == "sess-1"

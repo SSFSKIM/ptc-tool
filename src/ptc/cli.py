@@ -31,8 +31,20 @@ def _pick_session(explicit: str | None) -> tuple[str, str | None, object]:
     return r.key, "[no session given and no live kernel — using a fresh local key]", r
 
 
+#: `ptc exec` on a kernel that is already running (or admitting) a cell executes NOTHING
+#: and says so — but it said so with exit status 0, so shell automation, `&&` chains and CI
+#: read a dropped command as a command that ran. It is its own code rather than the generic
+#: 1: "your code did not run, try again" is a different instruction to the caller than "your
+#: code ran and failed", and a script that retries on busy must be able to tell them apart.
+EXIT_BUSY = 3
+
+_EXIT_CODES = ("exit codes: 0 success · 1 the cell raised, the wait found no such cell, or "
+               f"kill found nothing to kill · {EXIT_BUSY} the kernel was busy and the code "
+               "was NOT run (nothing is ever queued — wait, interrupt, or retry)")
+
+
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="ptc")
+    p = argparse.ArgumentParser(prog="ptc", epilog=_EXIT_CODES)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def com(name, **kw):
@@ -151,9 +163,12 @@ def main(argv=None) -> int:
         if info is not None and info.expired_notice:
             print(f"[previous kernel expired: {info.expired_notice.strip()}]")
         print(render(outcome, key, cfg).text)
-    from .client import Completed, NotFound
+    from .client import Busy, Completed, NotFound
+    if isinstance(outcome, Busy):
+        return EXIT_BUSY  # nothing was submitted and nothing was queued: this is not success
     if isinstance(outcome, NotFound):
         return 1          # a wait on an id this kernel never ran is a failed wait
+    # A Running cell IS a submitted cell — the caller's yield budget ran out, not the work.
     return 0 if not isinstance(outcome, Completed) or outcome.record.status != "error" else 1
 
 

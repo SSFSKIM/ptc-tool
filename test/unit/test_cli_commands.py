@@ -197,3 +197,49 @@ def test_restart_json_still_respawns_where_the_kernel_lived(monkeypatch, capsys)
 
     cli.main(["restart", "-s", "k9", "--json"])
     assert seen == {"cwd": "/proj", "claude_session_id": "s"}
+
+
+# --- r6 finding 9: a refused exec is not a successful exec ----------------------------
+
+def _exec_returning(monkeypatch, outcome):
+    from ptc import client
+
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None,
+                                                         type("R", (), {"cwd": None,
+                                                                        "claude_session_id": None})()))
+    monkeypatch.setattr(cli, "ensure_kernel",
+                        lambda k, **kw: KernelInfo(k, 1, Path("/c.json"), False, None))
+    monkeypatch.setattr(client.KernelClient, "exec_cell", lambda self, *a, **kw: outcome)
+
+
+def test_exec_refused_as_busy_exits_nonzero(monkeypatch, capsys):
+    """`exec_cell` returning Busy means the kernel ran NOTHING and queued nothing, but the
+    CLI exited 0 — so a shell chain, a Makefile or CI treated a dropped command as one that
+    had executed. Busy has its own code so a script can retry on it."""
+    from ptc.client import Busy
+
+    _exec_returning(monkeypatch, Busy(7, reason="running"))
+    assert cli.main(["exec", "-s", "k9", "1+1"]) == cli.EXIT_BUSY
+    assert cli.EXIT_BUSY != 0
+    assert "busy" in capsys.readouterr().out
+
+
+def test_exec_that_yielded_while_still_running_is_still_success(monkeypatch, capsys):
+    """The distinction the code carries: a Running cell WAS submitted — the caller's yield
+    budget ran out, not the work — so it keeps exit 0 and a cell id to wait on."""
+    from ptc.client import Running
+
+    _exec_returning(monkeypatch, Running(7, "partial\n", 8))
+    assert cli.main(["exec", "-s", "k9", "1+1"]) == 0
+    assert "still running" in capsys.readouterr().out
+
+
+def test_the_busy_exit_code_is_documented_in_help():
+    """An exit code nobody can look up is a private convention, not a contract."""
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert f"{cli.EXIT_BUSY} the kernel was busy" in " ".join(out.getvalue().split())
