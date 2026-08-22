@@ -379,6 +379,19 @@ class AgentHandle:
             raise
 
     async def close(self) -> None:
+        """Release this handle's CLI, whichever side of open_session() it is on.
+
+        With a session, closing it is the whole job. WITHOUT one the handle is not idle —
+        it is a driver still queued on the semaphore, or inside open_session/connect, about
+        to spawn a CLI and run a whole billed turn for a handle whose owner has already
+        closed it. Nothing was ever asked to stop, so the driver is pre-empted at once;
+        this is interrupt()'s no-session branch, reached from the other door.
+
+        The driver's own cancel handler settles the handle (status, registry row and
+        result), which keeps settlement exactly-once whichever of the two got there first;
+        the belt below covers a cancel that outlives the teardown budget, where waiting
+        longer would just hang the caller on an unsettled future.
+        """
         session, self._session = self._session, None
         if session is not None:
             self._session_id_seen = getattr(session, "session_id", None) or self._session_id_seen
@@ -388,6 +401,21 @@ class AgentHandle:
             # transcript view there is — history() refuses that provider by design.
             self._messages_seen = list(session.messages())
             await _bounded(session.close())
+            return
+        driver = self._driver
+        # `is not current_task()`: the driver calls close() itself on its own error path
+        # (spawn's `except Exception`), and cancelling yourself there aborts the settlement
+        # you are on your way to making.
+        if driver is None or driver.done() or driver is asyncio.current_task():
+            return
+        driver.cancel()
+        await _bounded(asyncio.gather(driver, return_exceptions=True))
+        if self._status not in _TERMINAL:
+            self._status = "interrupted"
+            self._owner._registry_update(self, "interrupted")
+        if not self._result_fut.done():
+            self._settle_exception(
+                RuntimeError(f"agent {self.name!r} was closed before its turn started"))
 
     # -- settlement ---------------------------------------------------------
     def _settle_result(self, r: AgentResult) -> None:

@@ -825,7 +825,55 @@ def test_timeout_none_still_means_no_deadline(tmp_path):
     assert asyncio.run(a.run("hello", timeout=None)).text == "hello"
 
 
-# -- r7 finding 1: a turn that reports failure is not a turn that finished ------------
+# -- r7 findings 1 & 2: closing before the turn starts, and a turn that reports failure --
+
+def test_close_preempts_a_queued_turn_that_never_opened_a_session(tmp_path):
+    """close() before the driver assigned `_session` — right after spawn(), or while the
+    handle is still queued on the semaphore — returned without touching the driver, which
+    then took its permit, opened a CLI and ran a whole billed turn for a handle its owner
+    had already closed. It is interrupt()'s no-session branch reached from the other door:
+    nothing is draining, so the driver is pre-empted at once and the handle settles."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        sem = a._semaphore()
+        await sem.acquire()                    # the only permit: the spawn must queue
+        try:
+            h = a.spawn("queued", name="c1")
+            await asyncio.sleep(0.05)
+            assert h._session is None, "the queued turn should not have opened a session"
+            await asyncio.wait_for(h.close(), 2)
+            assert h.status == "interrupted"
+            assert h._driver.done()
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(h.result(), 2)
+        finally:
+            sem.release()
+        await asyncio.sleep(0.2)               # a surviving driver would run its turn here
+        assert b.sessions == [], "the closed handle still opened (and billed) a session"
+        return await asyncio.wait_for(a.run("after"), 2)
+    assert asyncio.run(flow()).text == "after"
+    assert _row(tmp_path, "c1")["status"] == "interrupted"
+
+
+def test_close_leaves_a_finished_handle_alone(tmp_path):
+    """The pre-emption is for a driver that never started its turn. A handle that FINISHED
+    keeps its terminal status and its settled result through close() — and through a second
+    close(), which finds no session and a driver long done."""
+    b = FakeBackend()
+    a = _agent(tmp_path, backend=b, max_concurrency=1)
+
+    async def flow():
+        h = a.spawn("quick", name="c2")
+        r = await asyncio.wait_for(h.result(), 2)
+        await asyncio.wait_for(h.close(), 2)
+        await asyncio.wait_for(h.close(), 2)
+        assert h.status == "done" and b.sessions[0].closed
+        assert (await asyncio.wait_for(h.result(), 2)) is r
+    asyncio.run(flow())
+    assert _row(tmp_path, "c2")["status"] == "done"
+
 
 def test_a_turn_that_reports_failure_settles_the_handle_as_an_error(tmp_path):
     """A ResultMessage with is_error set is a turn that did NOT do its job (rate limit,
