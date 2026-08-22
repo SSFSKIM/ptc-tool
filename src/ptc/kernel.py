@@ -231,12 +231,27 @@ def kill_process_tree(pid: int) -> None:
 
 
 def kill_kernel(key: str) -> bool:
+    """SIGKILL this key's kernel and clear up after it. True only if one was SIGNALLED.
+
+    The two halves answer to different facts. Cleanup runs on the strength of the RECORD:
+    a record whose process is gone (it died, or its pid was recycled) is stale, and
+    deleting it — with the orphaned bash groups it can no longer reap — is the whole point
+    of running `kill` against such a key. The return value answers to the SIGNAL, because
+    that is what the CLI publishes as its exit code: 0 for a kernel killed, 1 for nothing
+    to kill. Returning True for a record deletion made `ptc kill` claim a kill it had not
+    made, and a shell loop could not tell a live cleanup from a sweep of dead metadata.
+
+    An identity that cannot be read is neither: `settled_owner_state` raises `UnknownOwner`
+    out of here, and nothing is signalled, deleted or reported (the CLI prints it and exits
+    1). A live kernel's metadata is never dropped on a guess.
+    """
     with key_lock(key):
         o = read_owner(key)
         # pid + birth identity: never killpg a recycled pid's group — and never drop a
         # live kernel's metadata on an identity that could not be read (`UnknownOwner`
         # leaves the key untouched rather than reporting an orphaning as a success).
-        if o and settled_owner_state(o):
+        killed = bool(o and settled_owner_state(o))
+        if killed:
             kill_process_tree(o.pid)
         # Only now, with the kernel down and unable to start another one, reap the
         # background bash groups it spawned: each is its own session, so the group kill
@@ -247,7 +262,7 @@ def kill_kernel(key: str) -> bool:
             return False
         (kernel_dir(key) / "owner.json").unlink(missing_ok=True)
         (kernel_dir(key) / "ready").unlink(missing_ok=True)
-        return True
+        return killed
 
 
 def restart_kernel(key: str, **kw) -> KernelInfo:

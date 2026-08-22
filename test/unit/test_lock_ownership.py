@@ -241,3 +241,32 @@ def test_an_unreadable_identity_neither_deletes_metadata_nor_respawns(monkeypatc
 
     assert read_owner(key) is not None, "the live owner's metadata was deleted"
     assert (kd / "ready").exists()
+
+
+# --- r12 finding 4: a kill that signalled nothing did not kill anything ----------------
+
+def test_killing_a_stale_record_reports_that_nothing_was_killed(monkeypatch, tmp_path):
+    """The record is there and the process behind it is not — the kernel died, or its pid
+    was handed to somebody else. Clearing the metadata is right and stays; reporting a
+    KILL for it is not. `ptc kill` exited 0 on it, against the contract its own epilog and
+    the README state — 0 for a kernel actually signalled, 1 when there was nothing to
+    kill — so a shell loop could not tell a cleanup from a sweep of dead records.
+    """
+    from ptc import kernel
+    from ptc.kernel import kill_kernel
+    from ptc.paths import kernel_dir, secure_dir
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = secure_dir(kernel_dir("stale"))
+    # our own pid, recorded with a birth stamp that is not ours: exactly what a recycled
+    # pid looks like, and answerable without a second process
+    write_owner("stale", Owner(os.getpid(), "btime=1.000000", time.time(), "n", "e1"))
+    (kd / "ready").write_text("e1")
+    signalled: list = []
+    monkeypatch.setattr(kernel, "kill_process_tree", lambda pid: signalled.append(pid))
+
+    assert kill_kernel("stale") is False, "a kill that signalled nothing reported success"
+
+    assert signalled == [], f"a pid whose identity no longer matches was signalled: {signalled}"
+    assert not (kd / "owner.json").exists(), "the stale record was left behind"
+    assert not (kd / "ready").exists()

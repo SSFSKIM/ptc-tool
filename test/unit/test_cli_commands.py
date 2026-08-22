@@ -78,6 +78,16 @@ def test_kill_one_still_targets_the_picked_session(monkeypatch, capsys):
     assert killed == ["k9"]
 
 
+def test_kill_one_that_signalled_nothing_exits_one(monkeypatch, capsys):
+    """The single-key half of the contract the epilog states. `kill_kernel` returns False
+    for a key whose record was stale — it cleared the metadata, it killed nothing — and
+    the exit code has to carry that distinction to whoever scripted the call (r12)."""
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli, "kill_kernel", lambda k: False)
+
+    assert cli.main(["kill", "-s", "k9"]) == 1
+
+
 def test_doctor_inspects_and_never_provisions(monkeypatch, tmp_path, capsys):
     """doctor is an INSPECTION command: it reports what setup would do and changes
     nothing. Calling ensure_venv() made the diagnostic rebuild the venv it was asked
