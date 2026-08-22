@@ -61,6 +61,13 @@ class NotFound:
     cell_id: int
 
 
+#: How long a submission waits for its connection to be provably synchronized with the
+#: kernel (`_connect_to_current_owner`). Matches the readiness budget `ensure_kernel` gives
+#: the same round trip at spawn: a kernel that cannot answer kernel_info inside it is not
+#: one this submission should be sending to.
+_READY_S = 20.0
+
+
 def _epoch_ended_record() -> dict:
     """The settle for a cell whose kernel epoch ended before it did (F3)."""
     return {"status": "error", "duration_ms": 0, "result_repr": None,
@@ -106,17 +113,40 @@ class KernelClient:
         kc.start_channels(**channels)
         return kc
 
-    def _await_cell_id(self, kc, msg_id: str, timeout: float = 15.0) -> int:
+    def _await_cell_id(self, kc, msg_id: str, baseline: int | None,
+                       timeout: float = 15.0) -> int:
+        """Which cell number the kernel gave this request — from iopub, or from disk.
+
+        iopub is the primary witness and the one that can go missing. `start_channels()`
+        returns before the SUB socket's subscription has reached the kernel's PUB, so a
+        fast cell publishes its `execute_input` into that gap and this loop waits out its
+        whole budget for a message that was already sent to nobody. The submission then
+        failed with a marker naming cell_id None — undischargeable while the kernel lives
+        (`_pending_discharged`), so every later submission was Busy until a restart. The
+        handshake is now waited out before the send (`_connect_to_current_owner`); this is
+        the second witness for the case that survives it.
+
+        The kernel-side pre_run_cell publishes the same number to current.json, on disk,
+        over no socket at all. `baseline` is what that file named BEFORE this request went
+        out, read by the caller under the same lock it still holds — so a strictly newer id
+        standing there cannot belong to anyone else's submission, and equality is not
+        enough (it would re-attribute the previous cell to this request).
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            cur = current_cell(self.key)
+            if cur is not None and (baseline is None or cur > baseline):
+                return cur
             try:
-                msg = kc.get_iopub_msg(timeout=max(deadline - time.monotonic(), 0.1))
+                msg = kc.get_iopub_msg(timeout=min(0.2, max(deadline - time.monotonic(),
+                                                            0.05)))
             except Exception:
                 continue
             if (msg.get("parent_header", {}).get("msg_id") == msg_id
                     and msg["header"]["msg_type"] == "execute_input"):
                 return int(msg["content"]["execution_count"])
-        raise TimeoutError("kernel never acknowledged the cell (no execute_input)")
+        raise TimeoutError("kernel never acknowledged the cell (no execute_input, and "
+                           "current.json never named a new one)")
 
     def _kernel_known_dead(self) -> bool:
         """PROOF that nothing can still be running under this key — never a guess.
@@ -320,10 +350,26 @@ class KernelClient:
         straddled the connect, so the ports belong to that owner. A restart landing in the
         window costs one retry; two in a row is a key being replaced faster than anything
         can bind to it, and that is reported rather than papered over.
+
+        The connection is also SYNCHRONIZED before it is accepted. `start_channels()`
+        returns as soon as the sockets are created, and a ZeroMQ SUB subscription reaches
+        the kernel's PUB some time after that — so a cell submitted immediately could
+        publish its `execute_input` before anyone was subscribed to hear it, and the
+        submission that lost that race left a marker nothing could discharge (see
+        `_await_cell_id`). `wait_for_ready` is jupyter_client's own name for closing that
+        gap: a kernel_info round trip on shell, then iopub drained until it answers, which
+        is precisely the proof that the subscription is live. It runs BEFORE anything is
+        sent and before the marker is written, so its failure is an ordinary
+        connection failure — nothing on the wire, nothing on disk to clean up.
         """
         for attempt in (0, 1):
             owner = self._owner_identity()
             kc = self._connect()
+            try:
+                kc.wait_for_ready(timeout=_READY_S)
+            except BaseException:
+                kc.stop_channels()
+                raise
             if self._owner_identity() == owner:
                 return kc, owner
             kc.stop_channels()
@@ -413,10 +459,15 @@ class KernelClient:
                 # Ctrl-C — or the next caller admits a second cell on top of one this
                 # kernel may still be about to run (F2).
                 msg_id = cell_id = None
+                # What current.json named before this request existed. The submit lock has
+                # been held since the busy check and is held until our cell is published,
+                # so nothing else can advance that number in between — which is what makes
+                # a strictly newer one proof of OUR cell (`_await_cell_id`).
+                baseline = current_cell(self.key)
                 try:
                     msg_id = kc.execute(code, store_history=True, allow_stdin=False,
                                         stop_on_error=False)
-                    cell_id = self._await_cell_id(kc, msg_id)
+                    cell_id = self._await_cell_id(kc, msg_id, baseline)
                     deadline = time.monotonic() + 15.0
                     while current_cell(self.key) != cell_id:
                         if time.monotonic() >= deadline:
@@ -586,8 +637,12 @@ class KernelClient:
         installed by the very cell this runs). Follows the shell execute_reply."""
         kc = self._connect()
         try:
+            # The key lock is `ensure_kernel`'s for the whole of this call and cells/ was
+            # rotated moments ago, so the baseline is the same fact it is on the submission
+            # path: whatever current.json named before this request, under exclusion.
+            baseline = current_cell(self.key)
             msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
-            cell_id = self._await_cell_id(kc, msg_id)
+            cell_id = self._await_cell_id(kc, msg_id, baseline)
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
                 try:

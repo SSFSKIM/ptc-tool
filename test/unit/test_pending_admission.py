@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from ptc.client import Busy, KernelClient
+from ptc.client import Busy, Completed, KernelClient
 from ptc.ownership import Owner, proc_start_time, write_owner
 from ptc.paths import Config, kernel_dir
 
@@ -116,6 +116,9 @@ class _FakeKC:
         self.marker_at_send = self._marker.exists()
         raise _Killed()
 
+    def wait_for_ready(self, timeout=None):
+        pass
+
     def stop_channels(self):
         pass
 
@@ -175,6 +178,9 @@ class _RestartingKC:
         self._restart()
         raise _Killed()
 
+    def wait_for_ready(self, timeout=None):
+        pass
+
     def stop_channels(self):
         pass
 
@@ -227,6 +233,9 @@ class _EpochBoundKC:
         except (OSError, json.JSONDecodeError, KeyError):
             self.marker_epoch_at_send = None
         raise _Killed()
+
+    def wait_for_ready(self, timeout=None):
+        pass
 
     def stop_channels(self):
         pass
@@ -390,3 +399,61 @@ def test_an_unreadable_identity_keeps_a_running_cell_busy(monkeypatch, tmp_path)
     _unreadable_identity(monkeypatch)
 
     assert KernelClient("p17").is_busy() == Busy(7, reason="running")
+
+
+# --- r13 finding 2: the SUB handshake losing the race must not wedge the key -----------
+
+class _SilentIopubKC:
+    """A connection whose iopub never delivers.
+
+    That is the ZeroMQ subscription race, not a fault: `start_channels()` returns before
+    the SUB socket's subscription has reached the kernel's PUB, and a fast cell publishes
+    its `execute_input` into that gap. The kernel-side pre_run_cell writes the same fact to
+    current.json on DISK, over no socket at all, which is why that file is the second
+    witness.
+    """
+
+    def __init__(self, key: str, cell_id: int):
+        self._kd = kernel_dir(key)
+        self._cell_id = cell_id
+        self.ready_waits = 0
+
+    def wait_for_ready(self, timeout=None):
+        self.ready_waits += 1
+
+    def execute(self, code, **kw):
+        cells = self._kd / "cells"
+        cells.mkdir(parents=True, exist_ok=True)
+        (cells / f"{self._cell_id}.log").write_text("hi\n")
+        (cells / f"{self._cell_id}.json").write_text(json.dumps(_RECORD))
+        (cells / "current.json").write_text(json.dumps({"cell_id": self._cell_id}))
+        return "m-race"
+
+    def get_iopub_msg(self, timeout=None):
+        raise TimeoutError("the subscription is not up yet")
+
+    def stop_channels(self):
+        pass
+
+
+def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_path):
+    """`_connect` starts the channels and `exec_cell` sends immediately, so a fast cell
+    could publish `execute_input` before the SUB handshake completed. `_await_cell_id` then
+    timed out and `_refresh_pending` recorded a marker naming cell_id None — a marker
+    nothing can ever discharge while the kernel lives, so every later submission was Busy
+    until a restart. The id is on disk too, and the submit lock is held for this whole
+    window, so an id NEWER than the one standing there before the send can only be ours.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("p20")
+    (kd / "cells" / "current.json").write_text(json.dumps({"cell_id": 6}))
+    (kd / "cells" / "6.json").write_text(json.dumps(_RECORD))   # settled: not busy
+    kc = _SilentIopubKC("p20", 7)
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: kc)
+
+    out = KernelClient("p20").exec_cell("1 + 1", 5.0, Config.from_env(env={}))
+
+    assert isinstance(out, Completed) and out.cell_id == 7, f"the id was never learned: {out}"
+    assert kc.ready_waits == 1, "the submission never waited for the subscription handshake"
+    assert not (kd / "cells" / "pending.json").exists(), "an undischargeable marker was left"
+    assert KernelClient("p20").is_busy() is None, "the key stayed busy for good"
