@@ -8,6 +8,7 @@ from .client import KernelClient
 from .discovery import read_meta
 from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
+from .ownership import UnknownOwner
 from .paths import Config
 from .shape import render, to_dict
 from .venv import ensure_venv, stamp_current, venv_python
@@ -44,6 +45,18 @@ _EXIT_CODES = ("exit codes: 0 success · 1 the cell raised, the wait found no su
 
 
 def main(argv=None) -> int:
+    """`_run`, with the one error that is a STATE report rather than a crash spelled out.
+
+    `UnknownOwner` means a command declined to act on a kernel it could not identify — it
+    changed nothing, and that is a sentence for the user, not a traceback."""
+    try:
+        return _run(argv)
+    except UnknownOwner as e:
+        print(f"ptc: {e}", file=sys.stderr)
+        return 1
+
+
+def _run(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ptc", epilog=_EXIT_CODES)
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -101,13 +114,24 @@ def main(argv=None) -> int:
     if a.cmd == "kill" and a.all:
         # ownership-verified per key: kill_kernel only signals an owner whose pid AND
         # start time still match, so a recycled pid is never killed
-        killed = [r["key"] for r in list_kernels() if kill_kernel(r["key"])]
+        killed, unverified = [], []
+        for r in list_kernels():
+            # `--all` kills every kernel whose ownership CHECKS OUT, and one whose identity
+            # cannot be read does not check out: it is skipped and named, never signalled,
+            # and never allowed to abort the sweep over the kernels that can be verified.
+            try:
+                if kill_kernel(r["key"]):
+                    killed.append(r["key"])
+            except UnknownOwner as e:
+                unverified.append(r["key"])
+                print(f"ptc: skipped {r['key']}: {e}", file=sys.stderr)
         # Same rule the single-key kill follows and the epilog/README both state: a kill
         # that found nothing exits 1. `--all` reported 0 whether it reaped eight kernels
         # or none, so a shell loop could not tell a cleanup from a no-op.
         code = 0 if killed else 1
         if a.json:
-            print(json.dumps({"all": True, "killed": killed}))
+            print(json.dumps({"all": True, "killed": killed,
+                              "unverified": unverified}))
             return code
         for k in killed:
             print(f"[killed {k}]")

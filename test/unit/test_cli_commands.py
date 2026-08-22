@@ -11,6 +11,7 @@ import pytest
 
 from ptc import cli
 from ptc.kernel import KernelInfo
+from ptc.ownership import UnknownOwner
 
 
 def _no_session(monkeypatch):
@@ -65,7 +66,7 @@ def test_kill_all_json_keeps_the_same_exit_code(monkeypatch, capsys):
     monkeypatch.setattr(cli, "kill_kernel", lambda k: True)
 
     assert cli.main(["kill", "--all", "--json"]) == 1
-    assert _json_out(capsys) == {"all": True, "killed": []}
+    assert _json_out(capsys) == {"all": True, "killed": [], "unverified": []}
 
 
 def test_kill_one_still_targets_the_picked_session(monkeypatch, capsys):
@@ -179,7 +180,38 @@ def test_kill_all_json_lists_what_it_killed(monkeypatch, capsys):
     monkeypatch.setattr(cli, "kill_kernel", lambda k: k != "k2")
 
     assert cli.main(["kill", "--all", "--json"]) == 0
-    assert _json_out(capsys) == {"all": True, "killed": ["k1"]}
+    assert _json_out(capsys) == {"all": True, "killed": ["k1"], "unverified": []}
+
+
+def test_kill_all_skips_a_kernel_whose_ownership_cannot_be_read(monkeypatch, capsys):
+    """`--all` kills every kernel whose ownership CHECKS OUT. One whose identity could not
+    be read does not check out — it is named and left alone, and it must not abort the
+    sweep over the kernels that can be verified."""
+    def kill(k):
+        if k == "k1":
+            raise UnknownOwner("cannot tell whether pid 7 is still running")
+        return True
+
+    _no_session(monkeypatch)
+    monkeypatch.setattr(cli, "list_kernels", lambda: [{"key": "k1"}, {"key": "k2"}])
+    monkeypatch.setattr(cli, "kill_kernel", kill)
+
+    assert cli.main(["kill", "--all", "--json"]) == 0
+    assert _json_out(capsys) == {"all": True, "killed": ["k2"], "unverified": ["k1"]}
+
+
+def test_an_unidentifiable_owner_is_a_sentence_not_a_traceback(monkeypatch, capsys):
+    """A command that declined to act on a kernel it could not identify changed nothing;
+    that is a state report for the user, and it exits nonzero without a stack trace."""
+    def kill(k):
+        raise UnknownOwner("cannot tell whether pid 7 is still running")
+
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None, None))
+    monkeypatch.setattr(cli, "kill_kernel", kill)
+
+    assert cli.main(["kill", "-s", "k9"]) == 1
+    out = capsys.readouterr()
+    assert "cannot tell whether pid 7" in out.err and out.out == ""
 
 
 def test_kill_one_json_reports_the_outcome_and_keeps_the_exit_code(monkeypatch, capsys):

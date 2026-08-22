@@ -11,7 +11,14 @@ from pathlib import Path
 from . import bgroups
 from .discovery import read_meta, write_meta
 from .lock import key_lock
-from .ownership import Owner, owner_alive, proc_start_time, read_owner, write_owner
+from .ownership import (
+    Owner,
+    owner_alive,
+    proc_start_time,
+    read_owner,
+    settled_owner_state,
+    write_owner,
+)
 from .paths import (
     Config,
     cells_dir,
@@ -64,9 +71,12 @@ def _rotate_cells(kd: Path) -> None:
     cd.rename(target)
 
 
-def _clean_stale(kd: Path, key: str) -> None:
-    o = read_owner(key)
-    if o and owner_alive(o):
+def _clean_stale(kd: Path, key: str, o: "Owner | None", alive: bool) -> None:
+    """Owner and liveness are passed in, not re-read: the caller has already SETTLED them
+    (`settled_owner_state`), and re-asking here would let a second, unluckier read answer
+    "not alive" to a question that was already answered — the deletions below are exactly
+    what must never happen on a guess."""
+    if o and alive:
         # A live kernel with no `ready` must be reaped before respawn, or every retry
         # leaks a detached process (F4) — and its children with it, for the same reason
         # kill_kernel takes the group. Ownership is keyed off owner.json alone, never
@@ -118,7 +128,11 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
     secure_dir(cells_dir(key) / "offsets")
     with key_lock(key):
         o = read_owner(key)
-        if o and owner_alive(o) and (kd / "ready").exists():
+        # Settled BEFORE the expiry marker is consumed and before anything is deleted: an
+        # owner whose identity cannot be read is neither attached to nor cleaned up, and
+        # `UnknownOwner` leaves this key exactly as it was found.
+        alive = settled_owner_state(o)
+        if o and alive and (kd / "ready").exists():
             # Attaching to a live kernel is the only chance to repair a meta.json that
             # was written before anyone knew the Claude session id (a CLI exec keyed off
             # an env rung, an MCP attach after the CLI spawned the kernel): history() and
@@ -127,7 +141,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                 write_meta(key, claude_session_id=claude_session_id)
             return KernelInfo(key, o.pid, kd / "connection.json", False, None)
         expired = consume_expiry(key)
-        _clean_stale(kd, key)
+        _clean_stale(kd, key, o, alive)
         secure_dir(cells_dir(key))          # the rotation above took the old one away
         secure_dir(cells_dir(key) / "offsets")
         conn = kd / "connection.json"
@@ -219,7 +233,10 @@ def kill_process_tree(pid: int) -> None:
 def kill_kernel(key: str) -> bool:
     with key_lock(key):
         o = read_owner(key)
-        if o and owner_alive(o):   # pid + start time: never killpg a recycled pid's group
+        # pid + birth identity: never killpg a recycled pid's group — and never drop a
+        # live kernel's metadata on an identity that could not be read (`UnknownOwner`
+        # leaves the key untouched rather than reporting an orphaning as a success).
+        if o and settled_owner_state(o):
             kill_process_tree(o.pid)
         # Only now, with the kernel down and unable to start another one, reap the
         # background bash groups it spawned: each is its own session, so the group kill

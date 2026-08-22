@@ -1,10 +1,22 @@
 import json
 import multiprocessing as mp
 import os
+import subprocess
+import sys
 import time
 
+import pytest
+from ptc import ownership
 from ptc.lock import flock_path, key_lock, submit_lock
-from ptc.ownership import Owner, owner_alive, proc_start_time, read_owner, write_owner
+from ptc.ownership import (
+    Owner,
+    UnknownOwner,
+    owner_alive,
+    proc_start_time,
+    read_owner,
+    start_time_matches,
+    write_owner,
+)
 
 
 def _hold(path, dur, q):
@@ -35,7 +47,6 @@ def test_flock_timeout(tmp_path):
     proc.start()
     q.get(timeout=5)
     try:
-        import pytest
         with pytest.raises(TimeoutError):
             with flock_path(p, timeout=0.2):
                 pass
@@ -91,15 +102,142 @@ def test_an_owner_recorded_before_pinning_is_still_recognized(monkeypatch, tmp_p
     """Migration tolerance: an owner.json on disk from before reads were pinned holds the
     writer's unpinned string. One unpinned re-read settles it exactly as the pre-pinning
     code did, so upgrading PTC does not orphan the kernel that is already running."""
-    from ptc.ownership import start_time_matches
-
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
     me = os.getpid()
     monkeypatch.setenv("TZ", "Asia/Seoul")
     legacy = proc_start_time(me, pinned=False)
-    assert legacy and legacy != proc_start_time(me), "this machine renders TZ into lstart"
+    assert legacy and legacy != ownership._ps(me, "lstart="), \
+        "this machine renders TZ into lstart"
 
     assert start_time_matches(me, legacy) is True
     assert owner_alive(Owner(me, legacy, time.time(), "n", "e1"))
     # and a string from neither read is still a mismatch, not a free pass
     assert start_time_matches(me, "Thu Jan  1 00:00:00 1970") is False
+
+
+# --- r9 finding 1: a birth time good only to the second is not an identity -------------
+
+def _sleeper():
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
+
+
+def test_identity_is_finer_than_the_second_the_process_was_born_in():
+    """`ps -o lstart=` resolves to the second, and a pid or pgid can be handed out again
+    inside one — after which the recorded identity matched a completely unrelated process
+    and kill/restart/TTL cleanup would signal its whole group. The OS kernel's own birth
+    stamp (`/proc/<pid>/stat` ticks on Linux, libproc microseconds on macOS) tells apart
+    two processes born in the same second, which is all this asks of it."""
+    a, b = _sleeper(), _sleeper()
+    try:
+        same_second = ownership._ps(a.pid, "lstart=") == ownership._ps(b.pid, "lstart=")
+        if not same_second:
+            pytest.skip("the two probe processes did not land in the same second")
+        assert proc_start_time(a.pid) != proc_start_time(b.pid)
+    finally:
+        for p in (a, b):
+            p.kill()
+            p.wait()
+
+
+def test_the_identity_recorded_at_spawn_still_matches_moments_later():
+    """The identity is written the instant after the fork and compared for the whole life
+    of the process, so its source must be settled at the fork. `ps -o comm=` is not: macOS
+    reports the invoked path for a freshly forked process and the resolved executable a
+    moment later, so composing it into the identity made every live kernel read as a
+    recycled pid a second after it started — the next ensure deleting its metadata and
+    spawning a duplicate beside it."""
+    p = _sleeper()
+    try:
+        recorded = proc_start_time(p.pid)
+        assert recorded
+        time.sleep(1.2)
+        assert start_time_matches(p.pid, recorded) is True
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_linux_identity_is_the_kernels_own_subsecond_birth_stamp(monkeypatch):
+    """Field 22 of `/proc/<pid>/stat` is start time in clock ticks since boot. Field 2 is
+    the command in parentheses and may contain spaces and parentheses of its own, which is
+    why the fields are counted from the last ')' rather than by splitting the line."""
+    fields = (["4242", "(my (odd) prog)"]
+              + [f"f{n}" for n in range(3, 22)] + ["8675309", "tail"])
+    monkeypatch.setattr(ownership, "_ON_LINUX", True)
+    monkeypatch.setattr(ownership, "_ON_DARWIN", False)
+    monkeypatch.setattr(ownership, "_proc_stat", lambda pid: " ".join(fields) + "\n")
+    assert ownership._start_ticks(" ".join(fields)) == "8675309"
+    assert proc_start_time(4242) == "btime=8675309"
+    assert start_time_matches(4242, "btime=8675309") is True
+    assert start_time_matches(4242, "btime=8675310") is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="libproc is macOS only")
+def test_macos_birth_stamp_is_read_from_libproc_and_refuses_a_dead_pid():
+    """The struct is declared here and filled by the OS, so the read is validated rather
+    than trusted: the call must fill exactly the declared length and report back the pid it
+    was asked about, or the answer is "unknown" instead of somebody else's birth time."""
+    assert ownership._darwin_birth(os.getpid()) == ownership._darwin_birth(os.getpid())
+    assert "." in ownership._darwin_birth(os.getpid())     # seconds.microseconds
+    assert ownership._darwin_birth(99999999) is None
+
+
+def test_a_platform_with_no_birth_stamp_falls_back_to_the_pinned_lstart(monkeypatch,
+                                                                        tmp_path):
+    """No third behaviour for a platform PTC has never met: it gets exactly the identity
+    r6 shipped, and records written that way stay comparable in both directions."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setattr(ownership, "_birth", lambda pid: None)
+    me = os.getpid()
+    recorded = proc_start_time(me)
+    assert recorded == ownership._ps(me, "lstart=")
+    assert start_time_matches(me, recorded) is True
+    assert owner_alive(Owner(me, recorded, time.time(), "n", "e1"))
+
+
+def test_an_owner_recorded_before_the_birth_stamp_is_still_recognized(monkeypatch,
+                                                                      tmp_path):
+    """Migration, r6's pattern again: rows written by the previous version hold a bare
+    `ps -o lstart=` string, which can never equal a birth stamp. A record that names no
+    source is re-compared against exactly the two readings that used to be written, so an
+    upgrade does not orphan the kernel already running."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    me = os.getpid()
+    legacy = ownership._ps(me, "lstart=")          # byte-for-byte what r6 wrote
+    assert legacy and not legacy.startswith("btime=")
+    assert start_time_matches(me, legacy) is True
+    assert owner_alive(Owner(me, legacy, time.time(), "n", "e1"))
+
+
+# --- r9 finding 2: an identity that could not be READ is not a dead kernel -------------
+
+def test_an_unreadable_identity_neither_deletes_metadata_nor_respawns(monkeypatch,
+                                                                      tmp_path):
+    """A `ps` that fails transiently used to read as "the owner is dead": `ensure_kernel`
+    then deleted a live kernel's metadata and spawned a duplicate beside it, and
+    `kill_kernel` reported success while orphaning it. Unknown is now its own answer —
+    retried once, then refused, with everything on disk left exactly as it was found."""
+    from ptc.kernel import ensure_kernel, kill_kernel
+    from ptc.paths import kernel_dir, secure_dir
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    key = "unreadable"
+    kd = secure_dir(kernel_dir(key))
+    write_owner(key, Owner(os.getpid(), proc_start_time(os.getpid()), time.time(),
+                           "n", "e1"))
+    (kd / "ready").write_text("e1")
+
+    reads: list = []
+    monkeypatch.setattr(ownership, "proc_start_time",
+                        lambda pid, **kw: reads.append(pid) or None)
+
+    with pytest.raises(UnknownOwner, match="cannot tell"):
+        ensure_kernel(key)
+    assert len(reads) == 2, f"a transient ps failure is retried exactly once: {reads}"
+    assert not (kd / "connection.json").exists(), "a duplicate kernel was spawned"
+
+    with pytest.raises(UnknownOwner, match="cannot tell"):
+        kill_kernel(key)
+
+    assert read_owner(key) is not None, "the live owner's metadata was deleted"
+    assert (kd / "ready").exists()
