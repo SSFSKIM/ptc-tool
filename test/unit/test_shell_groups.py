@@ -434,3 +434,41 @@ def test_killing_an_unregistered_handle_still_ends_its_own_child(tmp_path, monke
 
     assert calls == [], f"kill() went looking for a group on a live child: {calls}"
     assert _gone(h.pid), "the handle's own child survived its kill()"
+
+
+# --- r14 finding 2: the OTHER registration path keeps the setsid proof too -------------
+
+def test_a_daemonizer_whose_identity_read_failed_is_still_reapable(tmp_path, monkeypatch):
+    """`os.getpgid` SUCCEEDING and both identity reads then failing is the same
+    construction fact as the getpgid-OSError case above: `start_new_session=True` had
+    already made the pgid the pid, whatever the reads managed to answer a moment later.
+    Registered without that marker, the row was quarantined for the rest of the kernel's
+    life — so when `_retire` marked its exited leader, neither `h.kill()` nor
+    kill/restart/TTL could signal the descendants the retention rule kept the row FOR, and
+    the daemonizing command outlived the kernel exactly as it did before r11.
+
+    A leader that is alive and unidentified is still spared: the marker earns this row the
+    existence gate, not an exemption from proof.
+    """
+    monkeypatch.setattr(shell, "proc_start_time", lambda pid: None)
+
+    async def flow() -> tuple[int, list]:
+        h = await shell.bash("sleep 300 >/dev/null 2>&1 & echo $!", background=True)
+        r = await h.wait()                  # the shell leader exits; `_retire` marks the row
+        await asyncio.sleep(0.2)
+        return int(r.stdout.strip()), bgroups.read(tmp_path)
+
+    pid, rows = asyncio.run(flow())
+    try:
+        assert len(rows) == 1, f"the row was dropped or never written: {rows}"
+        assert rows[0]["leader_start"] is None and rows[0]["leader_exited"] is True
+        assert not _gone(pid, patience=0.5), "the descendant died before the reap was tested"
+
+        assert bgroups.signalable(rows[0]), "the orphaned group stayed quarantined"
+        assert bgroups.reap(tmp_path) == [rows[0]["pgid"]]
+        assert _gone(pid), f"descendant {pid} had no reachable pgid to be reaped by"
+    finally:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass

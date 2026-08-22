@@ -74,19 +74,24 @@ def _register(proc, cmd: str) -> int | None:
     #
     # `ps` can fail transiently, and a leader that exits inside this call cannot be read at
     # all — so the read is retried once (the same one-retry the kernel spawn gives its own
-    # identity), and a row that still has no identity is written MARKED rather than written
-    # bare. Nothing about a bare row tells the reaper it was never verified — it once read
-    # as "not recycled", and once its pgid was handed out again the reap killed a stranger.
-    # The mark is what keeps such a row droppable but never signalable
-    # (`bgroups.unverifiable`), independently of what an identity read says about a pgid
-    # nobody recorded.
+    # identity), and a row that still has no identity records instead the one thing this
+    # path DOES know for certain: `start_new_session=True` already made the pgid equal to
+    # the pid, so the group id is a constructor guarantee, not the reading that just failed.
+    # The distinction matters later, not now — while the leader is alive and unidentified
+    # `bgroups` spares the row either way, but once `_retire` marks `leader_exited` the
+    # construction marker plus the existence gate are what let a reap reach the orphans an
+    # exited shell left in that group. Written bare instead (the `unverifiable` mark alone),
+    # the row was quarantined for the rest of the kernel's life and neither `h.kill()` nor
+    # kill/restart/TTL could signal the survivors — the same permanent leak the getpgid
+    # branch above exists to prevent, on the same command shape. A LEGACY bare row claims
+    # neither and stays quarantined.
     # Registration does not fail on it: the command is already running, and a row that can
     # be dropped but not signalled is strictly better than no row at all — `kill()` and
     # `_retire` still find the group through it.
     start = proc_start_time(pgid) or proc_start_time(pgid)
     _LIVE[pgid] = {"pgid": pgid, "pid": proc.pid, "leader_start": start,
                    "cmd": cmd[:200], "started_at": time.time(),
-                   **({} if start else {"unverifiable": True})}
+                   **({} if start else {"pgid_source": "setsid"})}
     _persist()
     return pgid
 

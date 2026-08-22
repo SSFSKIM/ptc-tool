@@ -220,8 +220,9 @@ def test_a_leader_exited_row_with_a_construction_known_pgid_is_signalable():
 
 def test_registration_marks_a_group_it_could_not_identify(tmp_path, monkeypatch):
     """`ps` failing at registration used to persist `leader_start=None` silently. The read
-    is retried once, and what still cannot be resolved is written MARKED — the row stays
-    (kill() and _retire still need it) but the reaper will not signal it."""
+    is retried once, and what still cannot be resolved records the constructor guarantee
+    it does have instead — the row stays (kill() and _retire still need it) and stays
+    quarantined for as long as its leader is alive and unidentified."""
     import asyncio
 
     from ptc.runtime import shell
@@ -240,8 +241,38 @@ def test_registration_marks_a_group_it_could_not_identify(tmp_path, monkeypatch)
             return rows
 
         rows = asyncio.run(flow())
-        assert len(rows) == 1 and rows[0]["unverifiable"] is True, rows
+        assert len(rows) == 1 and rows[0]["leader_start"] is None, rows
+        assert rows[0]["pgid_source"] == "setsid", rows
         assert len(calls) == 2, f"the identity read must be retried once, got {calls}"
-        assert bgroups.unverifiable(rows[0])
+        assert bgroups.unverifiable(rows[0]), "a live unidentified leader is not signalable"
     finally:
         shell._LIVE.clear()
+
+
+# --- r14 finding 2: the middle registration path keeps the setsid proof too -----------
+
+def test_an_unidentifiable_row_reaches_its_orphans_once_its_leader_exits():
+    """`os.getpgid` SUCCEEDING and both identity reads then failing is the same
+    construction fact as the getpgid-OSError path: `start_new_session=True` had already
+    made the pgid the pid, whatever `ps` managed to answer a moment later. Written without
+    that marker the row was quarantined for the rest of the kernel's life — so when
+    `_retire` later marked its exited leader, neither `BashHandle.kill()` nor
+    kill/restart/TTL could signal the descendants the retention rule kept the row FOR.
+
+    The marker is what earns the row the existence gate, and it earns nothing else: a
+    legacy bare row claims neither a stamp nor a construction and stays quarantined.
+    """
+    gone = _dead_pgid()          # nothing wears it, so the existence gate can answer
+    identity_read_failed = {"pgid": gone, "pid": gone, "leader_start": None,
+                            "cmd": "sleep 300 &", "pgid_source": "setsid"}
+    legacy_bare = {"pgid": gone, "pid": gone, "leader_start": None, "cmd": "sleep 300 &"}
+
+    assert bgroups.unverifiable(identity_read_failed), "a live leader is still unproven"
+    assert bgroups.unverifiable(legacy_bare)
+
+    retired = {**identity_read_failed, "leader_exited": True}
+    assert not bgroups.unverifiable(retired)
+    assert bgroups.signalable(retired), "the orphaned group stayed unreachable"
+
+    assert bgroups.unverifiable({**legacy_bare, "leader_exited": True}), \
+        "a legacy bare row must stay quarantined"

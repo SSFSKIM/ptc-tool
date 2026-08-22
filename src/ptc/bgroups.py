@@ -109,11 +109,19 @@ def _construction_known(row: dict) -> bool:
     """Is this row's pgid known by CONSTRUCTION rather than by a read?
 
     `bash()` spawns `start_new_session=True`, so setsid makes the child's pgid equal to its
-    pid before anything reads either. A leader that exits inside registration therefore
-    leaves a row that knows its group id exactly and its leader's birth stamp not at all
-    (`runtime/shell.py` `_register`) — the opposite shape from the row `unverifiable`
-    exists to quarantine, which knows neither and says so by claiming neither. The marker
-    is what tells the two apart, so a LEGACY bare row cannot be mistaken for this one.
+    pid before anything reads either. Registration leaves a row that knows its group id
+    exactly and its leader's birth stamp not at all whenever that identity read comes back
+    empty — because the leader exited inside the call, or because `ps` and `/proc` both
+    failed there (`runtime/shell.py` `_register`, both branches). That is the opposite
+    shape from the row `unverifiable` exists to quarantine, which knows neither and says so
+    by claiming neither. The marker is what tells the two apart, so a LEGACY bare row
+    cannot be mistaken for this one.
+
+    `leader_exited` is required alongside it because the marker alone proves only the
+    NUMBER. While the leader is still alive and unidentified nothing has been established
+    about who leads that group now, and the row waits in quarantine like any other; the
+    exemption begins when the exit is recorded and the existence gate can stand in for the
+    stamp (`_recycled`).
     """
     return row.get("pgid_source") == "setsid" and bool(row.get("leader_exited"))
 
@@ -127,16 +135,16 @@ def unverifiable(row: dict) -> bool:
     identified when it was written is therefore quarantined HERE, ahead of any comparison,
     so its eligibility never depends on what an identity read happens to answer for a
     number nobody recorded: `reap` may DROP it (the file is consumed either way, and a row
-    whose group is already empty costs nothing to forget), but never signals it. The shell
-    retries the identity read before giving up and marks what it could not resolve
-    (`runtime/shell.py` `_register`); rows written before identities were recorded at all
-    carry no `leader_start` and land here too, which is the safe direction for a registry
-    whose rows are recreated on every command.
+    whose group is already empty costs nothing to forget), but never signals it. A missing
+    `leader_start` is the whole test, so rows written before identities were recorded at
+    all land here too — the safe direction for a registry whose rows are recreated on every
+    command.
 
     This is not the `leader_exited` case: those rows WERE identified at registration and
     keep their signal-eligibility by design, which is the whole point of retaining them.
-    Nor is it the row whose leader was already gone when registration ran: it has no birth
-    stamp to offer either, but its pgid is a construction guarantee rather than a reading
+    Nor is it the row registration could not identify at all — because the leader was gone
+    before it asked, or because both reads failed. Such a row has no birth stamp to offer
+    either, but its pgid is a construction guarantee rather than a reading
     (`_construction_known`), and `_recycled`'s existence gate is what stands in for the
     stamp it cannot have.
     """
