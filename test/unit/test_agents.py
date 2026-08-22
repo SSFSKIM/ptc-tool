@@ -1014,3 +1014,57 @@ def test_the_registry_learns_a_child_session_id_while_the_turn_is_still_running(
     assert row["status"] == "running", "the turn must still have been in flight"
     assert row["session_id"] == "fake-alpha", \
         "a kernel death here leaves a row that can never name the child it spawned"
+
+
+# --- r13 finding 6: a row does not outlive its kernel as "running" --------------------
+
+def test_a_running_row_from_a_dead_kernel_is_reconciled_at_startup(tmp_path):
+    """`agents.json` outliving the kernel is the POINT of the file — it is what makes a
+    session resumable after a restart — but a row is only ever rewritten by the process
+    that owns its handle. A kernel killed under a turn (a restart, the TTL watchdog, a
+    crash) therefore left `running` on disk forever, and the fresh kernel reported phantom
+    running agents with no handle behind any of them. The reconciliation runs where a
+    fresh kernel first loads the registry, and keeps the session id: that id is the whole
+    reason the row was kept.
+    """
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"name": "midflight", "provider": "claude", "session_id": "sess-9",
+          "status": "running", "created_at": 1.0, "task_head": "the long job"},
+         {"name": "finished", "provider": "claude", "session_id": "sess-8",
+          "status": "done", "created_at": 2.0}]))
+
+    a = _agent(tmp_path, backend=FakeBackend())      # a fresh kernel: no live handles
+
+    row = _row(tmp_path, "midflight")
+    assert row["status"] == "orphaned", "a phantom running agent survived the kernel"
+    assert row["session_id"] == "sess-9", "the only reference to that session was dropped"
+    assert row["task_head"] == "the long job"
+    assert _row(tmp_path, "finished")["status"] == "done", "a settled row was rewritten"
+    assert [e["status"] for e in a.list() if e["name"] == "midflight"] == ["orphaned"]
+
+    # and the row is still resumable, which is what preserving the id was for
+    async def flow():
+        h = a.resume("sess-9")
+        await asyncio.wait_for(h.result(), 2)
+        return h
+
+    assert asyncio.run(flow()).session_id == "sess-9"
+
+
+def test_reconciliation_is_a_startup_step_and_not_a_sweep(tmp_path):
+    """It runs once, where a fresh kernel first loads the registry, and only over what is
+    already on disk: a handle spawned afterwards writes `running` and keeps it, which is
+    the status a caller needs to be able to trust while a turn really is in flight."""
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"name": "ghost", "provider": "claude", "session_id": "s0", "status": "running",
+          "created_at": 1.0}]))
+    a = _agent(tmp_path, backend=FakeBackend(hang=True))
+    assert _row(tmp_path, "ghost")["status"] == "orphaned"
+
+    async def flow():
+        h = a.spawn("slow", name="live-one")
+        await asyncio.sleep(0.05)
+        assert _row(tmp_path, "live-one")["status"] == "running"
+        assert _row(tmp_path, "ghost")["status"] == "orphaned"
+        await h.interrupt()
+    asyncio.run(flow())

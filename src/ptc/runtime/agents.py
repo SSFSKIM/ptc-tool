@@ -442,6 +442,40 @@ class _Agent:
         self._config = config
         self._backends = backends
         self._handles: dict[str, AgentHandle] = {}
+        self._reconcile_registry()
+
+    def _reconcile_registry(self) -> None:
+        """Rows left "running" belong to a kernel that is gone. Say so, once, at startup.
+
+        `agents.json` outliving its kernel is the POINT of the file — it is what makes an
+        old session resumable at all — but a row is only ever rewritten by the process that
+        owns its handle. A kernel killed under a turn (a restart, the TTL watchdog, a
+        crash, an OOM) therefore leaves "running" on disk forever, and the fresh kernel
+        reported those as running agents with no handle behind any of them: `agent.list()`
+        showed phantoms, and nothing could ever settle them.
+
+        "orphaned" rather than "interrupted": nobody interrupted that turn, its kernel
+        died under it, and the two are different facts to whoever reads the row back. The
+        session id and everything else on the row are kept — that id is the whole reason
+        the row was kept — so `resume()` still works on every row this touches.
+
+        This is the constructor of the per-kernel agent namespace, which is where a fresh
+        kernel first loads the registry, so `_handles` is empty by construction and nothing
+        live can be relabelled by it. Bookkeeping never breaks a run: an unwritable
+        registry costs visibility, not a result.
+        """
+        rows = self._registry_load()
+        orphans = [r for r in rows if isinstance(r, dict) and r.get("status") == "running"]
+        if not orphans:
+            return
+        for row in orphans:
+            row["status"] = "orphaned"
+        try:
+            path = self._registry_path()
+            secure_dir(path.parent)
+            private_write_text(path, json.dumps(rows), tmp=path.with_suffix(".tmp"))
+        except OSError:
+            pass
 
     # -- plumbing -----------------------------------------------------------
     #: The pool itself lives at module level (`shared_semaphore`) — one pool across
