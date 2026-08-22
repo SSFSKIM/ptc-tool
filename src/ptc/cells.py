@@ -33,13 +33,53 @@ def read_record(key: str, cell_id: int) -> CellRecord | None:
 READ_CHUNK_BYTES = 4_000_000
 
 
+def _truncated_tail(data: bytes) -> int:
+    """How many trailing bytes of `data` begin a UTF-8 character that is not all there.
+
+    Zero for a tail that is complete — and for one that is merely INVALID, since a byte no
+    lead can explain is not a character anybody is waiting for and holding it back would
+    stall the reader on a boundary that can never resolve. At most three, the longest tail
+    a UTF-8 sequence can leave behind.
+    """
+    for back in range(1, 4):
+        if back > len(data):
+            return 0
+        b = data[-back]
+        if b < 0x80:                        # ASCII: a character all by itself
+            return 0
+        if b >= 0xC0:                       # a lead byte, and it says how many it wants
+            need = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+            return back if need > back else 0
+        # 0x80..0xBF: a continuation byte — its lead is further left
+    return 0
+
+
 def read_since(path, offset: int, max_bytes: int = READ_CHUNK_BYTES) -> tuple[str, int]:
-    """A bounded slice of `path` from `offset`, with the offset just past what was read."""
+    """A bounded slice of `path` from `offset`, with the offset just past what was read.
+
+    A FULL read is one this chunking cut short, and the cut can land inside a multibyte
+    character. Decoded on its own that character became replacement glyphs in both halves
+    — permanently, and for nothing: every byte is still on disk and the caller resumes at
+    exactly the offset handed back. So a truncated trailing sequence is left for the next
+    read, which re-consumes it whole; at most three bytes, never the whole slice, so every
+    read still advances.
+
+    A SHORT read is at EOF, where a torn tail is the writer's in-progress state rather than
+    an artefact of ours. Holding it back would hide output that may never be completed, so
+    `errors="replace"` remains the honest rendering there — and the caller comes back to
+    the same offset when there is more.
+    """
     try:
         with open(path, "rb") as f:
-            f.seek(max(offset, 0))
+            start = max(offset, 0)
+            f.seek(start)
             data = f.read(max_bytes)
-            return data.decode(errors="replace"), f.tell()
+            end = len(data)
+            if end == max_bytes:
+                held = _truncated_tail(data)
+                if held < end:              # never back off the whole read: that is a
+                    end -= held             # cursor that never moves
+            return data[:end].decode(errors="replace"), start + end
     except OSError:
         return "", max(offset, 0)
 
