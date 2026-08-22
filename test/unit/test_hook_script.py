@@ -187,3 +187,35 @@ def test_hook_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
     assert not (tmp_path / "~").exists(), "a literal '~' directory was created"
     written = json.loads((rd / f"claude-{os.getpid()}.json").read_text())
     assert written["session_id"] == "sid-tilde"
+
+
+# --- r15 finding 3: the run file names a process incarnation, not just a pid -----------
+
+def test_the_runfile_carries_an_identity_the_package_side_reads_the_same_way(tmp_path,
+                                                                            monkeypatch):
+    """The hook and `ptc` each read this identity with their own copy of the same rule.
+
+    They have to: the hook runs stdlib-only under system Python before ~/.ptc/venv exists
+    and cannot import `ptc`. A comparison across two copies is only meaningful while both
+    answer the same thing for the same process, so that agreement is asserted here rather
+    than assumed — and with it the whole point of the field, which is that `discovery`
+    accepts the run file for the process that is really standing at that pid.
+    """
+    from ptc.discovery import resolve
+    from ptc.ownership import hook_birth_identity
+
+    m = _load_hook(monkeypatch)
+    monkeypatch.setattr(m, "find_claude_ancestor", lambda: os.getpid())
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"session_id":"11111111-2222-3333-4444-555555555555","cwd":"/w5"}'))
+    assert m.main() == 0
+
+    written = json.loads((tmp_path / "run" / f"claude-{os.getpid()}.json").read_text())
+    assert written["claude_birth"], "the run file names a pid with no incarnation behind it"
+    assert written["claude_birth"] == hook_birth_identity(os.getpid()), \
+        "the hook's identity read and the package's have drifted apart"
+
+    r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
+                proc_name=lambda pid: "claude")
+    assert r.source == "hook-runfile" and r.cwd == "/w5"

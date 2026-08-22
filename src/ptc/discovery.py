@@ -17,6 +17,12 @@ it must stay stdlib-only and cannot import `ptc`. Both walks use the same
 predicate — "claude" as a substring of `ps -o comm=`'s basename — so they
 resolve the same ancestor for the same process tree; see the spec Decision
 Log for the substring-vs-exact-match call and its wrapper-launcher caveat.
+
+The same two-copy structure, and the same obligation to keep the copies in
+step, extends to the process IDENTITY the two sides exchange through the run
+file: the hook writes it with its own stdlib reading (birth_identity) and
+this module re-reads it with ownership.hook_birth_identity, which exists to
+answer exactly what that copy answers.
 """
 import json
 import os as _os
@@ -25,6 +31,7 @@ import secrets
 import subprocess
 from dataclasses import dataclass
 
+from .ownership import hook_birth_identity
 from .paths import kernel_dir, private_write_text, run_dir, safe_key, secure_dir
 
 #: One nonce per adapter PROCESS, drawn once at import.
@@ -79,6 +86,29 @@ def _runfile_for(pid: int) -> dict | None:
         return None
 
 
+def _written_for_this_incarnation(pid: int, rf: dict) -> bool:
+    """Is this run file about the process standing at `pid` NOW, or about its predecessor?
+
+    A run file is named by pid, and the OS hands pids out again. The hook fails OPEN by
+    contract — a session start is never broken over it — so a NEW claude whose hook did not
+    run leaves the PREVIOUS session's file in place under its own pid, and the walk accepts
+    it: the new session attaches to the old session's kernel and inherits its namespace, its
+    cell log and its agents. Only the process's birth stamp separates the two, and the hook
+    records it beside the pid when it writes the file.
+
+    Two states are NOT rejections. A file with no stamp was written by an older PTC (run
+    files are rewritten on every SessionStart, so that window ages out on its own), and a
+    reading that FAILS is an unknown rather than evidence — the same rule identity gets
+    everywhere else in this package. Only a stamp that is present on both sides and differs
+    is a mismatch, and that is a pid this session must not key off.
+    """
+    recorded = rf.get("claude_birth")
+    if not recorded:
+        return True
+    current = hook_birth_identity(pid)
+    return current is None or current == recorded
+
+
 def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
             proc_name=_proc_name, proc_parent=_proc_parent) -> Resolved:
     env = _os.environ if env is None else env
@@ -91,7 +121,8 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
             break
         if "claude" in _os.path.basename(proc_name(pid) or ""):
             rf = _runfile_for(pid)
-            if rf and rf.get("session_id"):
+            if (rf and rf.get("session_id")
+                    and _written_for_this_incarnation(pid, rf)):
                 return Resolved(safe_key(rf["session_id"]), "hook-runfile",
                                 rf["session_id"], rf.get("cwd"), False)
             break

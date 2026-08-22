@@ -183,3 +183,62 @@ def test_resolve_defaults_env_to_os_environ(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "real-env-abc")
     r = resolve(ppid=1, proc_name=lambda pid: "", proc_parent=lambda pid: None)
     assert r.source == "env-claude-session" and r.claude_session_id == "real-env-abc"
+
+
+# --- r15 finding 3: a run file belongs to a process incarnation, not to a pid ----------
+
+def test_a_runfile_from_a_recycled_pid_is_not_this_session(monkeypatch, tmp_path):
+    """The hook fails OPEN — it must never break a session start — so a new `claude` whose
+    SessionStart hook did not run leaves the PREVIOUS session's run file standing under its
+    own pid once the OS hands that number round. The walk accepted it on the pid and the
+    comm name alone, and the new session attached to the old session's kernel: one Python
+    namespace, one cell log, one agent registry for two unrelated sessions. The stamp the
+    hook records beside the pid is what tells the two apart, and a file that names a
+    different incarnation is not evidence about this one — discovery falls to the next rung
+    rather than keying off it.
+    """
+    from ptc.discovery import _written_for_this_incarnation
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_runfile(tmp_path, os.getpid())
+    p = tmp_path / "run" / f"claude-{os.getpid()}.json"
+    rf = json.loads(p.read_text())
+    rf["claude_birth"] = "the process that held this pid before us"
+    p.write_text(json.dumps(rf))
+    assert not _written_for_this_incarnation(os.getpid(), rf)
+
+    r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
+                proc_name=lambda pid: "claude")
+    assert r.source == "env-ptc-session" and r.key == "fallback-key"
+
+
+def test_a_runfile_naming_this_incarnation_is_accepted(monkeypatch, tmp_path):
+    """The other side of the same read: a stamp that matches the process really standing
+    there is the run file's own proof, and discovery keys off it as it always has."""
+    from ptc.ownership import hook_birth_identity
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_runfile(tmp_path, os.getpid())
+    p = tmp_path / "run" / f"claude-{os.getpid()}.json"
+    rf = json.loads(p.read_text())
+    rf["claude_birth"] = hook_birth_identity(os.getpid())
+    assert rf["claude_birth"], "this platform gave no stdlib-readable birth identity"
+    p.write_text(json.dumps(rf))
+
+    r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
+                proc_name=lambda pid: "claude")
+    assert r.source == "hook-runfile"
+    assert r.claude_session_id == "11111111-2222-3333-4444-555555555555"
+
+
+def test_a_runfile_written_before_the_stamp_existed_is_still_accepted(monkeypatch,
+                                                                      tmp_path):
+    """Migration by absence, with no version field: a file an older PTC wrote carries no
+    stamp, and rejecting it would strand every session that had not restarted yet. The hook
+    rewrites the file on every SessionStart, so the window closes on its own."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_runfile(tmp_path, os.getpid())          # no claude_birth, as of today's files
+
+    r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
+                proc_name=lambda pid: "claude")
+    assert r.source == "hook-runfile"

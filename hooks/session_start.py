@@ -27,6 +27,47 @@ def parent_of(pid: int) -> tuple[int, str] | None:
     return None
 
 
+#: `ps -o lstart=` renders through the caller's timezone and LC_TIME, so the same process
+#: reads as a different string to a differently configured reader. It is pinned to one
+#: rendering, exactly as `ptc.ownership._ps` pins it — this string is written here and
+#: compared THERE, by processes that need not share either setting.
+_PINNED_ENV = {"TZ": "UTC", "LC_ALL": "C", "LANG": "C"}
+
+
+def birth_identity(pid: int) -> str | None:
+    """When the process at `pid` was born — the pid's incarnation, not just its number.
+
+    A run file names a pid, and pids come round again: a NEW claude whose own SessionStart
+    hook failed (this hook fails open, by contract) inherits the previous session's run
+    file and the adapter attaches it to the previous session's kernel — one namespace, one
+    cell log, one agent registry for two unrelated sessions. Recording the birth stamp
+    beside the pid is what lets `ptc.discovery` tell the two apart.
+
+    The package-side twin is `ptc.ownership.hook_birth_identity`, and the two readings are
+    only comparable while they come from the SAME source: Linux's `/proc/<pid>/stat` field
+    22, and elsewhere the pinned `ps -o lstart=` string. Keep them in step if either moves.
+    Field 22 is counted from after the LAST ')' because field 2 is the executable name in
+    parentheses and may contain both spaces and parentheses (the rule `ownership._stat_fields`
+    documents). None wherever the reading fails — silence is not a mismatch, and this hook
+    must never fail a session start over it.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        _, sep, rest = stat.rpartition(")")
+        parts = rest.split() if sep else []
+        return parts[19] if len(parts) > 19 else None
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5,
+                             env={**os.environ, **_PINNED_ENV})
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def find_claude_ancestor() -> int | None:
     """Nearest ancestor pid whose comm basename contains "claude", else None.
 
@@ -37,7 +78,9 @@ def find_claude_ancestor() -> int | None:
     The package-side twin of this walk lives at src/ptc/discovery.py (resolve()'s
     process-tree loop). The two cannot share a module: this hook runs stdlib-only under
     system Python, before ~/.ptc/venv exists, so it cannot `import ptc`. Keep the two
-    walks' "claude" substring-on-comm-basename predicate in sync if either one changes.
+    walks' "claude" substring-on-comm-basename predicate in sync if either one changes —
+    and the same obligation now covers the identity read the two sides compare across
+    (`birth_identity` here, `ptc.ownership.hook_birth_identity` there).
     """
     info = parent_of(os.getpid())
     for _ in range(12):
@@ -80,7 +123,8 @@ def _record() -> int:
     except OSError:
         pass
     tmp = rd / f".claude-{target}.tmp"
-    payload = json.dumps({"session_id": sid, "cwd": cwd, "written_at": time.time()})
+    payload = json.dumps({"session_id": sid, "cwd": cwd, "written_at": time.time(),
+                          "claude_birth": birth_identity(target)})
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write(payload)
     tmp.replace(rd / f"claude-{target}.json")

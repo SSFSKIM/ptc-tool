@@ -235,6 +235,28 @@ def proc_start_time(pid: int, *, pinned: bool = True) -> str | None:
     return _ps(pid, "lstart=", pinned=True)
 
 
+def hook_birth_identity(pid: int) -> str | None:
+    """The birth identity of `pid` as a STDLIB-ONLY reader can take it. None if unreadable.
+
+    Deliberately weaker than `proc_start_time` and deliberately not derived from it. The
+    SessionStart hook records this for the `claude` process it writes a run file for, and
+    `discovery.resolve` re-reads it to prove the run file it found belongs to the process
+    standing at that pid now rather than to whoever held the number before. The hook runs
+    under system Python before ~/.ptc/venv exists and cannot import this package, so it
+    carries its own copy of these readings (hooks/session_start.py); this is the
+    package-side twin, and the two must keep answering the same thing for the same process.
+
+    That is why libproc's microsecond stamp is absent even on macOS: two readings are only
+    comparable when they come from the SAME source, and no stdlib-only hook can produce
+    that one. What is left is Linux's `/proc/<pid>/stat` field 22 and, everywhere else, the
+    `ps -o lstart=` string under the same pinned rendering `_ps` gives every other caller.
+    """
+    if _ON_LINUX:
+        stat = _proc_stat(pid)
+        return _start_ticks(stat) if stat else None
+    return _ps(pid, "lstart=")
+
+
 def start_time_matches(pid: int, recorded: str | None) -> bool | None:
     """Is `pid` still the process whose birth identity was recorded as `recorded`?
 
