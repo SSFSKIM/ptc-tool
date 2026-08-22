@@ -143,9 +143,56 @@ async def _reap_foreground(proc, readers) -> None:
         pass
 
 
-async def _pump(stream, buf: list[bytes]) -> None:
+async def _pump(stream, buf) -> None:
     while chunk := await stream.read(65536):
         buf.append(chunk)
+
+
+#: Per stream, how much of a BACKGROUND command's output a handle keeps. A foreground
+#: command's buffers live exactly as long as its call, so its whole output is bounded by
+#: the timeout; a background handle's live as long as the KERNEL, and `yes` or a chatty
+#: server grows them until the kernel is OOM-killed. Generous enough that no realistic
+#: command notices — `read()`ing a produced file is the answer for anything larger.
+_BG_BUFFER_BYTES = 4_000_000
+
+
+class _Bounded:
+    """A byte buffer that keeps the head and the tail of a stream and elides the middle.
+
+    Both ends matter and for different reasons: a command's opening lines say what it
+    decided to do (and carry the failure that made it noisy), its last lines say where it
+    got to. What goes is the repetitive middle, and it goes visibly — the elision is
+    rendered into the output rather than silently closing the gap, so nobody reads a
+    truncated log as a complete one.
+    """
+
+    def __init__(self, limit: int):
+        self._head_max = limit // 2
+        self._tail_max = limit - self._head_max
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._elided = 0
+
+    def append(self, chunk: bytes) -> None:
+        room = self._head_max - len(self._head)
+        if room > 0:
+            self._head += chunk[:room]
+            chunk = chunk[room:]
+            if not chunk:
+                return
+        self._tail += chunk
+        excess = len(self._tail) - self._tail_max
+        if excess > 0:
+            del self._tail[:excess]
+            self._elided += excess
+
+    def value(self) -> bytes:
+        if not self._elided:
+            return bytes(self._head + self._tail)
+        return (bytes(self._head)
+                + f"\n[... {self._elided} bytes elided: a background handle keeps the "
+                  f"first and last {self._head_max} bytes of each stream ...]\n".encode()
+                + bytes(self._tail))
 
 
 class BashHandle:
@@ -153,13 +200,18 @@ class BashHandle:
     output() returns stdout captured so far (before or after completion).
     Its stdin is /dev/null (the kernel spawns background children detached,
     stdin=DEVNULL) — a command that tries to read stdin gets immediate EOF
-    rather than blocking."""
+    rather than blocking.
+
+    A handle lives as long as the kernel, so what it keeps is BOUNDED: past
+    `_BG_BUFFER_BYTES` per stream the middle is elided and the notice saying so is part
+    of the output. Redirect to a file and `read()` it when a command's whole stream
+    matters."""
 
     def __init__(self, proc, cmd: str):
         self._proc = proc
         self._cmd = cmd
-        self._out: list[bytes] = []
-        self._err: list[bytes] = []
+        self._out = _Bounded(_BG_BUFFER_BYTES)
+        self._err = _Bounded(_BG_BUFFER_BYTES)
         self._pump = asyncio.gather(_pump(proc.stdout, self._out),
                                      _pump(proc.stderr, self._err))
         # A background group survives the kernel unless somebody records it: it is its own
@@ -190,7 +242,9 @@ class BashHandle:
         return self._proc.returncode
 
     def output(self) -> str:
-        return b"".join(self._out).decode(errors="replace")
+        """stdout captured so far — with the middle elided, and a notice saying by how
+        much, once this stream has produced more than `_BG_BUFFER_BYTES`."""
+        return self._out.value().decode(errors="replace")
 
     async def wait(self) -> BashResult:
         await self._proc.wait()
@@ -198,7 +252,7 @@ class BashHandle:
         _retire(self._pgid)         # the watcher would too; this makes it observable to
                                     # whoever awaited, without a scheduling race
         return BashResult(self._proc.returncode, self.output(),
-                           b"".join(self._err).decode(errors="replace"), False)
+                           self._err.value().decode(errors="replace"), False)
 
     def kill(self) -> None:
         """SIGKILL the RECORDED group, and retire its row only once that group is empty.

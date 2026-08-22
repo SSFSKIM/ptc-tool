@@ -240,3 +240,38 @@ def test_killing_a_retired_handle_whose_pgid_was_recycled_signals_nobody(
 
     assert [s for s in signalled if s[1] != 0] == [], \
         f"kill() SIGKILLed a group the handle no longer owns: {signalled}"
+
+
+# --- r8 finding 9: a background handle's buffers are bounded --------------------------
+
+_CHATTY = "yes hello | head -n 1000000"          # 6 000 000 bytes, whole lines
+_CHATTY_BYTES = len("hello\n") * 1_000_000
+
+
+def test_a_chatty_background_command_keeps_a_bounded_buffer(tmp_path):
+    """A background handle lives as long as the KERNEL, and `_pump` appended every chunk
+    to a list for the process's whole lifetime: `yes`, or a long-running server writing
+    logs, grew the kernel until it was OOM-killed. Head and tail are kept, the middle goes,
+    and the elision is rendered into the output so nobody reads it as a complete log.
+    """
+    async def flow():
+        h = await shell.bash(_CHATTY, background=True)
+        return await h.wait(), h
+
+    r, h = asyncio.run(flow())
+
+    assert len(h._out._head) + len(h._out._tail) <= shell._BG_BUFFER_BYTES, \
+        "the handle retained more than its bound"
+    assert "bytes elided" in r.stdout, "output was truncated with no notice that it was"
+    assert r.stdout.startswith("hello\n"), "the opening of the stream was lost"
+    assert r.stdout.endswith("hello\n"), "the end of the stream was lost"
+    assert len(r.stdout) < _CHATTY_BYTES
+
+
+def test_a_chatty_foreground_command_still_returns_everything(tmp_path):
+    """The bound belongs to handles, not to `bash()`. A foreground command's buffers live
+    exactly as long as its call, so its output is already bounded by the timeout — and
+    silently eliding a result the caller is about to consume whole would be a regression.
+    """
+    r = asyncio.run(shell.bash(_CHATTY, timeout=120))
+    assert len(r.stdout) == _CHATTY_BYTES and "elided" not in r.stdout
