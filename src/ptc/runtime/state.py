@@ -14,6 +14,11 @@ class _State:
     last_activity: float = field(default_factory=time.time)
     cell_images: list = field(default_factory=list)
     cell_mutations: list = field(default_factory=list)
+    #: The kernel's own asyncio loop, captured by `bootstrap.install()`. ipykernel keeps it
+    #: RUNNING between cells — it is what serves ZMQ — which is the property that lets the
+    #: watchdog THREAD reach objects that live on it (`bootstrap._release_backends_now`).
+    #: None where install() ran with no loop under it.
+    loop: object | None = None
 
 
 STATE = _State()

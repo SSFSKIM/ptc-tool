@@ -2,6 +2,7 @@
 
 Invoked by the host as a bootstrap cell:  import ptc.runtime.bootstrap as _b; _b.install('<json>')
 """
+import asyncio
 import base64
 import json
 import os
@@ -215,6 +216,73 @@ def _is_idle(ttl: float) -> bool:
     return not _in_flight() and time.time() - STATE.last_activity > ttl
 
 
+#: Total grace the exit paths give the agent backends to let go of their children. Small on
+#: purpose: nothing may come between an expired kernel and its exit, and the group kill is
+#: still the guarantee — this is the chance to do BETTER than it, never a replacement.
+_BACKEND_RELEASE_S = 5.0
+
+
+async def _release_backends() -> None:
+    """Ask every live agent session to end its turn and release its child tree.
+
+    The group kill below reaps everything left in the KERNEL's process group, which is
+    where both backends deliberately leave their CLIs. What it cannot reach is a grandchild
+    that left the group: `codex app-server` spawns its shell-tool children through
+    `setsid()` (codex-rs/utils/pty/src/process_group.rs, `detach_from_tty`), and the
+    parent-death signal that would otherwise cover them is `prctl(PR_SET_PDEATHSIG)` —
+    Linux only, a no-op on macOS (codex-rs/core/src/spawn.rs). So on macOS a SIGKILLed
+    app-server can leave an in-flight shell command running with nobody left who can even
+    enumerate it.
+
+    Interrupting first is what avoids making one. Codex ends an interrupted turn through
+    its own cancellation path, which drops the tool call's `Child` — spawned
+    `kill_on_drop(true)` — and takes the direct tool process with it; closing the session
+    then lets the app-server shut down on stdin EOF, which is when it reaps its own tool
+    processes and stdio MCP servers (`codex_backend.CodexProc.close`). None of that happens
+    if the first thing the kernel does is SIGKILL the group.
+
+    Bounded and silent by the caller's design: a backend that will not let go must not keep
+    an expired kernel alive, and a teardown error has nobody left to report it to.
+    """
+    from ptc import runtime
+    namespace = getattr(runtime, "agent", None)
+    handles = list(getattr(namespace, "_handles", {}).values()) if namespace else []
+
+    async def release(h) -> None:
+        session = getattr(h, "_session", None)
+        if session is None:
+            return
+        for step in (session.interrupt, session.close):
+            try:
+                await step()
+            except Exception:               # noqa: BLE001 — teardown never raises
+                pass
+
+    await asyncio.gather(*(release(h) for h in handles), return_exceptions=True)
+
+
+def _release_backends_now(budget: float = _BACKEND_RELEASE_S) -> None:
+    """Run `_release_backends` from a thread that is not the kernel's event loop.
+
+    The watchdog is a plain daemon thread and the backends are asyncio objects belonging to
+    the kernel's own loop, so the work has to be handed BACK to that loop. ipykernel keeps
+    it running between cells — it is what serves ZMQ — which is what makes this reachable
+    at all; a loop that is gone or stopped is the residual named in `_reap_and_exit`, and
+    the honest move there is to skip rather than to block an exit on it.
+    """
+    loop = STATE.loop
+    if loop is None or not loop.is_running():
+        return
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_release_backends(), loop)
+    except RuntimeError:                    # the loop closed under us
+        return
+    try:
+        fut.result(budget)
+    except BaseException:                   # noqa: BLE001 — including the budget expiring
+        fut.cancel()
+
+
 def _reap_and_exit() -> None:
     """Die, taking the kernel's spawned children with us.
 
@@ -226,11 +294,23 @@ def _reap_and_exit() -> None:
     Guarded on leadership: a kernel that did not start its own group (an in-process
     test, a hand-launched ipykernel) would otherwise kill its parent's processes too.
 
-    Background `bash()` children are the exception the group kill cannot cover: each runs
-    in a session of its own, so they are reaped first, from the registry the shell keeps
-    (F4). That reap never raises — nothing may come between an expired kernel and its
-    exit, which happens while the flock is still held.
+    Two kinds of child the group kill cannot cover, in the order they are handled.
+    Background `bash()` children run in sessions of their own, so they are reaped first
+    from the registry the shell keeps (F4). And a codex shell-tool grandchild has left the
+    group by `setsid()` with no parent-death signal on macOS, so the backends are given a
+    bounded chance to end their turns properly first (`_release_backends`).
+
+    RESIDUAL, stated rather than papered over: that chance depends on the kernel's event
+    loop still running, which is how ipykernel normally sits between cells. If the loop is
+    dead or stopped the release is skipped and the detached grandchild survives this exit —
+    unreachable from here, and unreachable from the host side too (see
+    `ptc.kernel.kill_process_tree`). Neither reap raises: nothing may come between an
+    expired kernel and its exit, which happens while the flock is still held.
     """
+    try:
+        _release_backends_now()
+    except Exception:
+        pass
     try:
         from ptc import bgroups
         bgroups.reap(STATE.kernel_dir)
@@ -274,6 +354,13 @@ def install(config_json: str) -> str:
     STATE.key = cfg["key"]
     STATE.kernel_dir = Path(cfg["kernel_dir"])
     STATE.config = cfg
+    # The loop this cell is running on IS the kernel's loop, and ipykernel keeps it running
+    # between cells — it is what serves ZMQ. That is the only handle the watchdog THREAD
+    # has on anything asyncio owns (`_release_backends_now`).
+    try:
+        STATE.loop = asyncio.get_running_loop()
+    except RuntimeError:
+        STATE.loop = None
     # post_run_cell records this very cell, but pre_run_cell was not registered when it
     # started; without a stamp its duration_ms would be perf_counter() since boot.
     STATE.cell_started = time.perf_counter()

@@ -276,6 +276,23 @@ def kill_process_tree(pid: int) -> None:
     background `bash()` children get their own session (shell.py kills those itself).
     Guarded on leadership: if the pid does not lead its group, the group belongs to
     somebody else and killing it would reach unrelated processes, so kill only the pid.
+
+    RESIDUAL — what this kill provably does NOT reach, stated rather than papered over.
+    A `codex app-server` shell-tool child is spawned through `setsid()`
+    (codex-rs/utils/pty/src/process_group.rs, `detach_from_tty`), so it is in a session of
+    its own and outside this group; the parent-death signal that would otherwise cover it
+    is `prctl(PR_SET_PDEATHSIG)`, which is Linux-only and a no-op on macOS
+    (codex-rs/core/src/spawn.rs). On macOS, therefore, SIGKILLing the kernel and the
+    app-server with it leaves an in-flight shell tool command running indefinitely, and
+    this process cannot enumerate those grandchildren to signal them — nothing records
+    them, and they share no group, session or parent with anything we hold.
+
+    That gap is closed only from INSIDE the kernel, and only on the exits that run our own
+    code: `runtime.bootstrap._release_backends` interrupts the turns and closes the
+    backends before the kernel's own group kill, so codex gets to end its tool calls
+    through its own cancellation path. A hard kill from another process — `ptc kill`,
+    `ptc restart` — has no such moment and no reach here. NOTHING below pretends
+    otherwise; the honest statement is that those grandchildren survive it.
     """
     try:
         if os.getpgid(pid) == pid:
