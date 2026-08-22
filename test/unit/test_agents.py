@@ -16,7 +16,7 @@ from ptc.runtime.state import STATE
 class FakeSession:
     def __init__(self, task, o, *, sid: str | None = None, hang: bool = False,
                  fail: Exception | None = None, send_hang: bool = False,
-                 send_aborts: bool = False,
+                 send_aborts: bool = False, announce_early: bool = False,
                  close_hang: bool = False, ignore_interrupt: bool = False,
                  drain_s: float = 0.05):
         #: The real Session leaves this None until a ResultMessage is folded — a fake
@@ -24,6 +24,10 @@ class FakeSession:
         #: registry row goes wrong (T20 review I3). A resumed session keeps the id it
         #: resumed, so `sid` (the backend's `resume=`) wins when there is one.
         self.session_id = None
+        #: whoever wants to hear the id the moment the backend learns it, rather than at
+        #: settle — the registry, in production (r11 finding 5)
+        self.on_session_id = None
+        self._announce_early = announce_early
         self._sid = sid or f"fake-{task[:8]}"
         self._task = task
         self.sent: list[str] = []
@@ -39,7 +43,16 @@ class FakeSession:
         self._drain_s = drain_s
         self._aborted = asyncio.Event()
 
+    def _announce(self):
+        """What the real backend does on the SDK's init message: the id is known long
+        before the turn ends, and whoever is listening hears it then."""
+        self.session_id = self._sid
+        if self.on_session_id is not None:
+            self.on_session_id(self._sid)
+
     async def wait_result(self):
+        if self._announce_early:
+            self._announce()
         if self._fail is not None:
             raise self._fail
         if self._hang:
@@ -940,3 +953,31 @@ def test_a_turn_that_reports_failure_settles_the_handle_as_an_error(tmp_path):
         return await asyncio.wait_for(a.run("after"), 2)
     assert asyncio.run(flow()).text == "after"
     assert _row(tmp_path, "c3")["status"] == "error"
+
+
+# --- r11 finding 5: the row learns the child's id at capture time, not at settle -------
+
+def test_the_registry_learns_a_child_session_id_while_the_turn_is_still_running(tmp_path):
+    """`agents.json` is what survives this process; the id has to reach it while there is
+    still a process to write it.
+
+    The SDK issues the child's session id on its init message, turns before the stream
+    ends, but the row was only ever rewritten at settle. A kernel that died under a running
+    turn — or a turn that failed mid-stream — therefore left `status: running` and
+    `session_id: null` on disk for a child that had an id all along, so `agent.list()` after
+    the restart could see the row and still never resume what it named. The backend
+    announces the id as it arrives and the row is upserted then.
+    """
+    a = _agent(tmp_path, backend=FakeBackend(announce_early=True, hang=True))
+
+    async def flow() -> dict:
+        h = a.spawn("alpha", name="one")
+        await asyncio.sleep(0.1)              # announced; nowhere near settled
+        row = _row(tmp_path, "one")
+        await h.interrupt()                   # settle it so it does not outlive the loop
+        return row
+
+    row = asyncio.run(flow())
+    assert row["status"] == "running", "the turn must still have been in flight"
+    assert row["session_id"] == "fake-alpha", \
+        "a kernel death here leaves a row that can never name the child it spawned"

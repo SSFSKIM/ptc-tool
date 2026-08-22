@@ -95,6 +95,22 @@ def terminal_failure(m) -> str | None:
             + (f": {detail[:2000]}" if detail else ""))
 
 
+def message_session_id(m) -> str | None:
+    """The child's own session id, from whichever message shape happens to carry it.
+
+    The SDK announces it on the init SystemMessage (inside `.data`) and repeats it on the
+    ResultMessage; other shapes may carry it as a plain attribute. `_fold` reads the same
+    two places, but only once the stream has ENDED — this is the reading that can be taken
+    while it is still running, which is the only one a turn that dies mid-stream leaves
+    behind.
+    """
+    sid = getattr(m, "session_id", None)
+    if sid:
+        return sid
+    data = getattr(m, "data", None)
+    return data.get("session_id") if isinstance(data, dict) else None
+
+
 def _fold(messages: list, o: AgentOpts, t0: float) -> tuple[AgentResult, str | None]:
     """Collapse one turn's message stream into an AgentResult, plus the reason it FAILED.
 
@@ -155,7 +171,32 @@ class Session:
         #: a turn is in flight and its stream is still unread
         self._pending = pending
         self.session_id: str | None = None
+        #: Whoever wants the child's session id the moment this session learns it, rather
+        #: than when the turn settles — the agent registry, in production. Called at most
+        #: once per id, with the id. Set by the owner after `open_session` returns; nothing
+        #: here requires a listener.
+        self.on_session_id = None
         self._messages: list = []
+
+    def _learn_session_id(self, m) -> None:
+        """Bind the child's id from a message that carries one, and say so once.
+
+        The id is issued on the SDK's init message, turns before the stream ends, and used
+        to be assigned only after the async-for COMPLETED. A turn that failed mid-stream —
+        or a kernel that died under one — therefore left this None for a child whose id had
+        already been issued, and the transcript it is filed under, plus every resume of it,
+        became unreachable. Read it as it arrives; `_fold`'s terminal assignment stays as
+        the fallback for a stream that carried it nowhere else.
+        """
+        sid = message_session_id(m)
+        if not sid or sid == self.session_id:
+            return
+        self.session_id = sid
+        if self.on_session_id is not None:
+            try:
+                self.on_session_id(sid)
+            except Exception:      # noqa: BLE001 — a listener's bookkeeping never breaks a turn
+                pass
 
     async def _collect(self) -> AgentResult:
         t0 = time.time()
@@ -163,6 +204,7 @@ class Session:
         async for m in self._client.receive_response():
             batch.append(m)
             self._messages.append({"type": type(m).__name__, "repr": repr(m)[:500]})
+            self._learn_session_id(m)
         self._pending = False
         r, failure = _fold(batch, self._o, t0)
         # The id first: a failed turn is still filed under it, and `session_id` is what

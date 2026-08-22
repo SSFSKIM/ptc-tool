@@ -563,6 +563,14 @@ class _Agent:
             try:
                 async def _turn():
                     h._session = await self._backends[o.provider].open_session(task, o)
+                    # The row is what OUTLIVES this process, so it has to learn the child's
+                    # id while there is still a process to write it. The SDK issues that id
+                    # on its init message, turns before the stream ends; rewritten only at
+                    # settle, a kernel that died under a running turn left `running` and a
+                    # null session_id on disk for a child that had an id all along — visible
+                    # to `agent.list()` after the restart and resumable by nobody.
+                    h._session.on_session_id = lambda _sid: self._registry_update(
+                        h, "running", task_head=task)
                     self._registry_update(h, "running", task_head=task)
                     return await h._session.wait_result()
                 r = await self._guarded(_turn, o.timeout)

@@ -179,3 +179,69 @@ def test_a_session_turn_keeps_an_interrupted_partial(monkeypatch):
         return await s.wait_result()
 
     assert asyncio.run(flow()).text == "partial"
+
+
+# --- r11 finding 5: the child's session id is captured AS IT ARRIVES -------------------
+
+class _DyingClient(FakeClient):
+    """A turn that announces its session id on the SDK's init message and then dies."""
+
+    def __init__(self, options=None, messages=(), boom=None):
+        super().__init__(options=options)
+        self._messages = list(messages)
+        self._boom = boom or RuntimeError("the CLI died mid-stream")
+
+    async def receive_response(self):
+        for m in self._messages:
+            yield m
+        raise self._boom
+
+
+def test_a_turn_that_dies_mid_stream_still_kept_the_session_id_it_was_given(monkeypatch):
+    """The SDK announces the child's own session id on its init message, turns before the
+    stream ends — but `_fold` runs only once the async-for has COMPLETED, so a turn that
+    failed mid-stream (or a kernel that died under one) left `session_id` None on a child
+    whose id had already been issued. The transcript is filed under that id and a resume
+    needs it, so nothing anywhere could name the session again. Read it as it arrives.
+    """
+    from claude_agent_sdk import SystemMessage
+
+    msgs = [SystemMessage(subtype="init", data={"session_id": "sess-early"}),
+            AssistantMessage(content=[TextBlock(text="half")], model="sonnet")]
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient",
+                        lambda options=None: _DyingClient(options, msgs))
+
+    async def flow():
+        s = await claude_backend.open_session("go", AgentOpts())
+        with pytest.raises(RuntimeError, match="died mid-stream"):
+            await s.wait_result()
+        return s
+
+    assert asyncio.run(flow()).session_id == "sess-early"
+
+
+def test_the_session_id_is_announced_to_its_listener_as_it_arrives(monkeypatch):
+    """`on_session_id` is how the REGISTRY hears about the id without waiting for settle —
+    the row is written by whoever is listening, at capture time, so a kernel that dies under
+    a running turn still leaves a row naming a resumable child.
+
+    Both halves are pinned by the message count the listener sees: it fires on the FIRST of
+    the three messages, and the ResultMessage repeating the same id does not fire it again.
+    """
+    from claude_agent_sdk import SystemMessage
+
+    msgs = [SystemMessage(subtype="init", data={"session_id": "sess-1"}),
+            AssistantMessage(content=[TextBlock(text="working")], model="sonnet"),
+            _result(is_error=False, text="done")]
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient",
+                        lambda options=None: _StreamingClient(options, msgs))
+    heard: list = []
+
+    async def flow():
+        s = await claude_backend.open_session("go", AgentOpts())
+        s.on_session_id = lambda sid: heard.append((sid, len(s.messages())))
+        await s.wait_result()
+
+    asyncio.run(flow())
+    assert heard == [("sess-1", 1)], \
+        f"announced once, on the first message that carried it — not at settle: {heard}"

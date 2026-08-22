@@ -482,6 +482,11 @@ class Session:
         self._o = o
         self._first = first
         self.session_id = thread_id
+        #: The other backend announces its child's id mid-stream and its owner listens for
+        #: it (`claude_backend.Session.on_session_id`). A codex thread id is handed over by
+        #: `newThread` before this object exists, so there is never anything to announce —
+        #: the attribute exists so both backends answer the same contract.
+        self.on_session_id = None
         self._messages: list[dict] = []
 
     async def _turn(self, text: str) -> AgentResult:
