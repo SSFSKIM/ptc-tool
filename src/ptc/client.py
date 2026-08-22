@@ -19,7 +19,12 @@ from .cells import (
 )
 from .kernel import kernel_alive
 from .lock import submit_lock
-from .ownership import UnknownOwner, read_owner, settled_owner_state
+from .ownership import (
+    UnknownOwner,
+    read_owner,
+    settled_owner_state,
+    start_time_matches,
+)
 from .paths import Config, kernel_dir, private_write_text, secure_dir
 from .venv import venv_python  # noqa: F401  (imported for kernel spawn parity)
 
@@ -601,7 +606,20 @@ class KernelClient:
             time.sleep(0.2)
 
     def interrupt(self) -> None:
-        """interrupt_request on the control channel, then SIGINT after a 2 s grace."""
+        """interrupt_request on the control channel, then SIGINT after a 2 s grace.
+
+        The fallback signals the kernel this call ENTERED on, or nothing at all. It used to
+        re-read the owner fresh and signal whatever pid stood there: a restart landing
+        inside the grace redirects the SIGINT onto the REPLACEMENT — quite possibly
+        part-way into a new cell — for a cell it never ran, and the cell this call meant to
+        stop died with its kernel anyway. So the whole incarnation is captured up front
+        (`Owner` compares pid, birth identity, epoch, nonce and spawn stamp, and each is
+        written once per kernel) and the fallback fires only when the record still names
+        it AND the pid's identity confirms it. Unknown is not a target either: an
+        unreadable identity is how a recycled pid looks, and that process is somebody
+        else's to interrupt.
+        """
+        entry = read_owner(self.key)
         try:
             # No heartbeat: hb_channel.start() spawns a thread that creates its socket
             # only once it is scheduled, and this client is torn down moments later —
@@ -626,7 +644,8 @@ class KernelClient:
                 return
             time.sleep(0.1)
         o = read_owner(self.key)
-        if o:
+        if o is not None and o == entry and start_time_matches(o.pid,
+                                                              o.proc_start_time) is True:
             try:
                 os.kill(o.pid, signal.SIGINT)
             except OSError:
