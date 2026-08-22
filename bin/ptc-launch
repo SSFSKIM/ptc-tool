@@ -21,7 +21,13 @@ HOME = (Path(_RAW_HOME).expanduser().resolve() if _RAW_HOME
 VENV = HOME / "venv"
 PY = VENV / "bin" / "python"
 STAMP = VENV / ".ptc-version"
-PKG = Path(__file__).resolve().parent.parent.parent      # plugin/bin/ptc-launch -> ptc/
+#: The package root, which is ALSO the plugin root — `.claude-plugin/plugin.json` sits
+#: beside `pyproject.toml`. That is not tidiness: a marketplace install caches only the
+#: directory holding the manifest, so with the Python package one level outside it, the
+#: three files `payload()` hashes were simply absent on every installed copy and this
+#: script raised FileNotFoundError before MCP startup. `test_plugin_packaging` pins the
+#: containment structurally so the package can never escape the plugin root again.
+PKG = Path(__file__).resolve().parent.parent             # bin/ptc-launch -> ptc/
 
 
 def payload() -> dict:

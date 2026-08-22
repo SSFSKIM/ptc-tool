@@ -4,7 +4,7 @@ the ptc kernel, unprompted?
 Requires PTC_LIVE=1 and a `claude` CLI logged in on subscription auth (no ANTHROPIC_API_KEY
 — that would silently flip billing to metered API, see the spec's trust-model section).
 Reuses the T11/T13 probe pattern (test/spikes/s3_hook_discovery.py): `claude -p
---plugin-dir <plugin>`, stream-json capture, JSON-parsed tool_use blocks rather than raw
+--plugin-dir <ptc>`, stream-json capture, JSON-parsed tool_use blocks rather than raw
 string search, and a launch env stripped of CLAUDE_CODE_SESSION_ID/CLAUDECODE so the nested
 session isn't keyed to the outer (agent-driven) one — a real user's terminal has neither var.
 
@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 PKG = Path(__file__).resolve().parent.parent.parent
-PLUGIN = PKG / "plugin"
+PLUGIN = PKG        # the package IS the plugin root
 live = pytest.mark.skipif(os.environ.get("PTC_LIVE") != "1", reason="PTC_LIVE=1 required")
 
 CLEAN_ENV = {k: v for k, v in os.environ.items()

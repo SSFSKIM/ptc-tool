@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 PKG = Path(__file__).resolve().parent.parent.parent
-LAUNCH = PKG / "plugin" / "bin" / "ptc-launch"
+LAUNCH = PKG / "bin" / "ptc-launch"
 
 
 def _seed_existing_venv(home: Path) -> None:

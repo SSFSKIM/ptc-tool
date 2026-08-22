@@ -1,4 +1,4 @@
-"""Provision ~/.ptc/venv with uv. Stamp payload is shared with plugin/bin/ptc-launch."""
+"""Provision ~/.ptc/venv with uv. Stamp payload is shared with bin/ptc-launch."""
 import hashlib
 import json
 import os

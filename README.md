@@ -13,7 +13,7 @@ and agent handles survive across tool calls, turns, compaction, and `claude --re
 ## Install
 
     cd ptc/ && uv run ptc setup          # provision ~/.ptc/venv (one-time)
-    claude --plugin-dir ./plugin         # dev install
+    claude --plugin-dir .                # dev install — the package IS the plugin root
 
 On a warm `uv` cache the launcher can provision the venv inside Claude Code's 30 s MCP
 startup window on its own; running `ptc setup` once first is what makes a cold cache safe.
@@ -28,7 +28,7 @@ Recommended settings (`~/.claude/settings.json`) for prompt-free use:
 
 Those long names are not a typo. A plugin-provided MCP server's tools are named
 `mcp__plugin_<plugin>_<server>__<tool>`; only a **directly** registered server
-(`claude mcp add ptc -- <plugin>/bin/ptc-launch`) gets the short `mcp__ptc__*` form. Note
+(`claude mcp add ptc -- <ptc>/bin/ptc-launch`) gets the short `mcp__ptc__*` form. Note
 also that plugin MCP tools arrive **deferred** — the model loads them through ToolSearch
 before the first call, which is why the skill prints the long name verbatim.
 
@@ -95,7 +95,7 @@ cell id.
 
 ## Codex (documented, untested)
 
-    codex mcp add ptc -- /abs/path/to/ptc/plugin/bin/ptc-launch
+    codex mcp add ptc -- /abs/path/to/ptc/bin/ptc-launch
 
 This works because the adapter is plain stdio MCP, but no acceptance test exercises it.
 Session keying degrades to explicit `session=` / `PTC_SESSION`; when PTC cannot key off a

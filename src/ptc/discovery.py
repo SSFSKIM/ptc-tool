@@ -11,7 +11,7 @@ SessionStart.
 
 This module's process-tree walk (_proc_name/_proc_parent/the walk loop in
 resolve) is a deliberate duplicate of find_claude_ancestor() in
-plugin/hooks/session_start.py, not a shared import: the hook runs under
+hooks/session_start.py, not a shared import: the hook runs under
 system Python, before ~/.ptc/venv exists and independent of this package, so
 it must stay stdlib-only and cannot import `ptc`. Both walks use the same
 predicate — "claude" as a substring of `ps -o comm=`'s basename — so they

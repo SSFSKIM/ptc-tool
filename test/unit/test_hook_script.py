@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PLUGIN = Path(__file__).resolve().parent.parent.parent / "plugin"
+PLUGIN = Path(__file__).resolve().parent.parent.parent        # the package IS the plugin root
 HOOK = PLUGIN / "hooks" / "session_start.py"
 
 

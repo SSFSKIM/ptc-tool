@@ -1,9 +1,14 @@
-"""The plugin's checked-in manifests and its stdlib-only launcher.
+"""The plugin's checked-in manifests, its stdlib-only launcher, and what the plugin root
+has to CONTAIN.
 
 `bin/ptc-launch` is what a clean profile runs before `ptc` exists anywhere: it must be
 executable, importable without the venv, and stamp the venv with a payload byte-identical
 to `ptc.venv.stamp_payload()` — otherwise launcher and library each think the other's
 venv is stale and re-provision on every start.
+
+The package IS the plugin root: `.claude-plugin/plugin.json` sits beside `pyproject.toml`,
+`uv.lock` and `src/ptc`. See `test_the_plugin_root_contains_everything_the_launcher_hashes`
+for why that containment is the load-bearing fact and not a layout preference.
 """
 import ast
 import importlib.util
@@ -14,7 +19,7 @@ from pathlib import Path
 
 from ptc.venv import stamp_payload
 
-PLUGIN = Path(__file__).resolve().parent.parent.parent / "plugin"
+PLUGIN = Path(__file__).resolve().parent.parent.parent        # the package IS the plugin root
 LAUNCH = PLUGIN / "bin" / "ptc-launch"
 
 
@@ -72,6 +77,33 @@ def test_launcher_is_stdlib_only():
                  else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
         for name in names:
             assert name.split(".")[0] in sys.stdlib_module_names, name
+
+
+def test_the_plugin_root_contains_everything_the_launcher_hashes():
+    """A marketplace install caches the PLUGIN ROOT and nothing above it.
+
+    The plugin root is the directory holding `.claude-plugin/plugin.json` — that is the
+    whole of what a marketplace (or `--plugin-dir`) install copies. With the Python package
+    one level outside it, `pyproject.toml`, `uv.lock` and `src/ptc` were simply not present
+    on any installed copy: `payload()` raised FileNotFoundError on the first line the
+    launcher ran, before MCP startup, so the shipped install mode could never start at all.
+    Dev installs pointed at the checkout kept working, which is what hid it.
+
+    So the rule is containment, asked of the launcher's OWN paths rather than of a layout:
+    every file it hashes, and the package it syncs, must live INSIDE the directory that
+    holds the manifest. Structural on purpose — a future move that walks the package back
+    out of the plugin root fails here instead of at a user's first session.
+    """
+    root = next(p for p in [PLUGIN, *PLUGIN.parents]
+                if (p / ".claude-plugin" / "plugin.json").exists())
+    pkg = _load_launcher().PKG
+
+    for name in ("pyproject.toml", "uv.lock", "src/ptc"):
+        target = (pkg / name).resolve()
+        assert target.exists(), f"the launcher hashes {name}, which is not there"
+        assert root.resolve() in target.parents, (
+            f"{name} lives outside the plugin root {root} — a marketplace install would "
+            "cache the manifest and leave it behind")
 
 
 def test_plugin_manifest():
