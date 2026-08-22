@@ -33,6 +33,31 @@ def stamp_payload() -> dict:
             "lock_sha": sha("uv.lock"), "pkg": str(PKG_ROOT)}
 
 
+def build_identity() -> str | None:
+    """Which BUILD of the shared venv a process is running from; None where there is none.
+
+    The provisioners write `stamp_payload()` to `venv/.ptc-version` at the end of every
+    provision and `--clear` the whole directory at the start of the next one, so this
+    string changes exactly when the venv under a running kernel has been REPLACED. That is
+    the question `ensure_kernel` asks before attaching to a long-lived kernel, and it is
+    not the same question `stamp_current()` asks: the live payload changes the moment the
+    package sources do, whether or not anybody has rebuilt anything, and recycling a
+    kernel whose venv is still standing would throw a namespace away for nothing.
+
+    Hashed rather than kept whole — meta.json wants an identity, not a copy of a payload
+    carrying an absolute path. None where no stamp exists at all: a dev run, a hand-made
+    venv, a test fixture, or the instants a provision spends between the clear and the new
+    stamp. None of those is an upgrade. (A rebuild that lands on the SAME payload — a
+    repair of a corrupted venv — is invisible here, as it is to every other reading of the
+    stamp.)
+    """
+    try:
+        text = (venv_dir() / ".ptc-version").read_text()
+    except OSError:
+        return None
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def stamp_current() -> bool:
     stamp = venv_dir() / ".ptc-version"
     if not (venv_python().exists() and stamp.exists()):
