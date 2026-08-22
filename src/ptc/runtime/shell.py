@@ -221,12 +221,14 @@ async def _pump(stream, buf) -> None:
         buf.append(chunk)
 
 
-#: Per stream, how much of a BACKGROUND command's output a handle keeps. A foreground
-#: command's buffers live exactly as long as its call, so its whole output is bounded by
-#: the timeout; a background handle's live as long as the KERNEL, and `yes` or a chatty
-#: server grows them until the kernel is OOM-killed. Generous enough that no realistic
-#: command notices — `read()`ing a produced file is the answer for anything larger.
-_BG_BUFFER_BYTES = 4_000_000
+#: Per stream, how much of a command's output PTC keeps in memory — the same bound
+#: foreground and background. A background handle's buffers live as long as the KERNEL,
+#: which is the obvious case; a foreground command's live only as long as its call, but
+#: `yes` reaches gigabytes inside the 120 s timeout and OOM-kills the persistent kernel
+#: long before the timeout could end it, so "bounded by the call" was never a bound at all.
+#: Generous enough that no realistic command notices — `read()`ing a produced file is the
+#: answer for anything larger.
+_OUTPUT_BUFFER_BYTES = 4_000_000
 
 
 class _Bounded:
@@ -263,8 +265,8 @@ class _Bounded:
         if not self._elided:
             return bytes(self._head + self._tail)
         return (bytes(self._head)
-                + f"\n[... {self._elided} bytes elided: a background handle keeps the "
-                  f"first and last {self._head_max} bytes of each stream ...]\n".encode()
+                + f"\n[... {self._elided} bytes elided: PTC keeps the first and last "
+                  f"{self._head_max} bytes of each stream ...]\n".encode()
                 + bytes(self._tail))
 
 
@@ -276,15 +278,15 @@ class BashHandle:
     rather than blocking.
 
     A handle lives as long as the kernel, so what it keeps is BOUNDED: past
-    `_BG_BUFFER_BYTES` per stream the middle is elided and the notice saying so is part
+    `_OUTPUT_BUFFER_BYTES` per stream the middle is elided and the notice saying so is part
     of the output. Redirect to a file and `read()` it when a command's whole stream
     matters."""
 
     def __init__(self, proc, cmd: str):
         self._proc = proc
         self._cmd = cmd
-        self._out = _Bounded(_BG_BUFFER_BYTES)
-        self._err = _Bounded(_BG_BUFFER_BYTES)
+        self._out = _Bounded(_OUTPUT_BUFFER_BYTES)
+        self._err = _Bounded(_OUTPUT_BUFFER_BYTES)
         self._pump = asyncio.gather(_pump(proc.stdout, self._out),
                                      _pump(proc.stderr, self._err))
         # A background group survives the kernel unless somebody records it: it is its own
@@ -324,7 +326,7 @@ class BashHandle:
 
     def output(self) -> str:
         """stdout captured so far — with the middle elided, and a notice saying by how
-        much, once this stream has produced more than `_BG_BUFFER_BYTES`."""
+        much, once this stream has produced more than `_OUTPUT_BUFFER_BYTES`."""
         return self._out.value().decode(errors="replace")
 
     async def wait(self) -> BashResult:
@@ -419,19 +421,23 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
     # A kill landing mid-`bash()` therefore left the command and its descendants running
     # after the kernel was gone. The row lives exactly as long as the call.
     pgid = _register(proc, cmd)
-    out: list[bytes] = []
-    err: list[bytes] = []
+    # Bounded on the same terms as a handle's, and for a reason the old "a foreground
+    # call's buffers die with the call" argument missed: `yes` fills memory in seconds, so
+    # the 120 s timeout bounds nothing the kernel survives. Head and tail with the elision
+    # rendered between them — the identical `_Bounded`, so the two result shapes read the
+    # same to whoever gets one.
+    out, err = _Bounded(_OUTPUT_BUFFER_BYTES), _Bounded(_OUTPUT_BUFFER_BYTES)
     readers = asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err))
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout)
         await readers
-        return BashResult(proc.returncode, b"".join(out).decode(errors="replace"),
-                           b"".join(err).decode(errors="replace"), False)
+        return BashResult(proc.returncode, out.value().decode(errors="replace"),
+                           err.value().decode(errors="replace"), False)
     except asyncio.TimeoutError:
         _killpg_or_kill(proc)
         await readers
-        return BashResult(None, b"".join(out).decode(errors="replace"),
-                           b"".join(err).decode(errors="replace"), True)
+        return BashResult(None, out.value().decode(errors="replace"),
+                           err.value().decode(errors="replace"), True)
     except BaseException:
         # Cancellation — a cell interrupt, a task torn down — or any other failure. It
         # bypasses the timeout handler above, so kill the group here, settle the readers,

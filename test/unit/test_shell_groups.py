@@ -323,7 +323,7 @@ def test_a_daemonizer_whose_leader_exits_before_registration_is_still_reapable(
             pass
 
 
-# --- r8 finding 9: a background handle's buffers are bounded --------------------------
+# --- r8 finding 9 / r12 finding 3: every command's buffers are bounded -----------------
 
 _CHATTY = "yes hello | head -n 1000000"          # 6 000 000 bytes, whole lines
 _CHATTY_BYTES = len("hello\n") * 1_000_000
@@ -341,7 +341,7 @@ def test_a_chatty_background_command_keeps_a_bounded_buffer(tmp_path):
 
     r, h = asyncio.run(flow())
 
-    assert len(h._out._head) + len(h._out._tail) <= shell._BG_BUFFER_BYTES, \
+    assert len(h._out._head) + len(h._out._tail) <= shell._OUTPUT_BUFFER_BYTES, \
         "the handle retained more than its bound"
     assert "bytes elided" in r.stdout, "output was truncated with no notice that it was"
     assert r.stdout.startswith("hello\n"), "the opening of the stream was lost"
@@ -349,13 +349,35 @@ def test_a_chatty_background_command_keeps_a_bounded_buffer(tmp_path):
     assert len(r.stdout) < _CHATTY_BYTES
 
 
-def test_a_chatty_foreground_command_still_returns_everything(tmp_path):
-    """The bound belongs to handles, not to `bash()`. A foreground command's buffers live
-    exactly as long as its call, so its output is already bounded by the timeout — and
-    silently eliding a result the caller is about to consume whole would be a regression.
+def test_a_chatty_foreground_command_keeps_a_bounded_buffer(tmp_path, monkeypatch):
+    """This asserted the opposite until r12: "a foreground command's buffers live exactly
+    as long as its call, so the timeout already bounds them". It does not bound them at
+    all — `yes` writes gigabytes in seconds and OOM-kills the persistent kernel long
+    before 120 s elapse, taking every session on that key with it. The bound is the same
+    one a handle gets, and the buffer OBJECT is the same, so both result shapes carry
+    head, elision notice and tail and read alike.
+
+    The buffers themselves are what is asserted: they are local to the `bash()` call, so a
+    recording subclass is what reaches them — measuring the returned text alone would pass
+    just as well against an unbounded list that happened to be truncated on the way out.
     """
+    made: list = []
+
+    class _Recording(shell._Bounded):
+        def __init__(self, limit):
+            super().__init__(limit)
+            made.append(self)
+
+    monkeypatch.setattr(shell, "_Bounded", _Recording)
     r = asyncio.run(shell.bash(_CHATTY, timeout=120))
-    assert len(r.stdout) == _CHATTY_BYTES and "elided" not in r.stdout
+
+    assert made, "the foreground path never used the bounded buffer"
+    assert all(len(b._head) + len(b._tail) <= shell._OUTPUT_BUFFER_BYTES for b in made), \
+        [(len(b._head), len(b._tail)) for b in made]
+    assert "bytes elided" in r.stdout, "output was truncated with no notice that it was"
+    assert r.stdout.startswith("hello\n"), "the opening of the stream was lost"
+    assert r.stdout.endswith("hello\n"), "the end of the stream was lost"
+    assert len(r.stdout) < _CHATTY_BYTES
 
 
 # --- r12 finding 2: an unregistered handle never re-derives a group --------------------
