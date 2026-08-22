@@ -183,6 +183,13 @@ class BashResult:
 
 
 def _killpg_or_kill(proc) -> None:
+    """Kill a FOREGROUND command's group, deriving it from the leader.
+
+    Sound only where the leader is live by construction — the timeout and cancellation
+    paths, which are still inside the `bash()` call that spawned it and have not waited on
+    it. A caller holding a possibly-reaped pid must not come here: a reaped pid is one the
+    OS can hand out again, so the lookup would resolve a stranger's group (`kill()`).
+    """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (OSError, ProcessLookupError):
@@ -346,8 +353,19 @@ class BashHandle:
         identity no longer holds signals no group at all; if its own leader is somehow still
         alive it is reached by pid, which can only ever be the process this handle spawned.
         """
-        if self._pgid is None:              # never registered: the leader was already gone
-            _killpg_or_kill(self._proc)
+        if self._pgid is None:
+            # Never registered, which registration only concludes after PROVING the group
+            # empty (`_register`). So there is no group to reach, and re-deriving one from
+            # the leader's pid is worse than useless: that leader has been reaped, its pid
+            # is free for the OS to hand out again, and `killpg(getpgid(pid), SIGKILL)`
+            # would then SIGKILL a STRANGER's group. Only the child itself is still safe to
+            # name, and only while it is UN-reaped — the transport is holding the zombie,
+            # which is exactly what keeps its pid from being recycled.
+            if self._proc.returncode is None:
+                try:
+                    self._proc.kill()
+                except (OSError, ProcessLookupError):
+                    pass
             return
         if not bgroups.signalable(self._row):
             if self._proc.returncode is None:

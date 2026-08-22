@@ -356,3 +356,59 @@ def test_a_chatty_foreground_command_still_returns_everything(tmp_path):
     """
     r = asyncio.run(shell.bash(_CHATTY, timeout=120))
     assert len(r.stdout) == _CHATTY_BYTES and "elided" not in r.stdout
+
+
+# --- r12 finding 2: an unregistered handle never re-derives a group --------------------
+
+def _no_group_calls(monkeypatch) -> list:
+    """Record every group-level call `kill()` makes. On the unregistered branch there must
+    be none at all: the only safe question left is about the child itself."""
+    calls: list = []
+    real_getpgid, real_killpg = os.getpgid, os.killpg
+    monkeypatch.setattr(os, "getpgid", lambda pid: calls.append(("getpgid", pid))
+                        or real_getpgid(pid))
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append(("killpg", pgid, sig))
+                        or real_killpg(pgid, sig))
+    return calls
+
+
+def test_killing_an_unregistered_handle_never_re_derives_a_group(tmp_path, monkeypatch):
+    """`_pgid is None` means registration already PROVED the group empty. The leader has
+    since been reaped, so its pid is free for the OS to hand out again — and `killpg(
+    getpgid(pid), SIGKILL)` on it resolves a STRANGER's group and kills that instead. A
+    handle in this state owns nothing anybody can still signal, and asks nothing.
+    """
+    async def flow():
+        monkeypatch.setattr(shell, "_register", lambda proc, cmd: None)
+        h = await shell.bash("echo done", background=True)
+        await h.wait()
+        return h
+
+    h = asyncio.run(flow())
+    assert h._pgid is None and h.poll() is not None
+    calls = _no_group_calls(monkeypatch)
+
+    h.kill()
+
+    assert calls == [], f"kill() went looking for a group on a recycled pid: {calls}"
+
+
+def test_killing_an_unregistered_handle_still_ends_its_own_child(tmp_path, monkeypatch):
+    """The other half: while the child is UN-REAPED its pid cannot be recycled — the
+    transport holds the zombie — so signalling it directly reaches this handle's own
+    process and nobody else's. That is what makes the direct kill safe where the group
+    lookup is not, and dropping the group lookup must not turn kill() into a no-op."""
+    async def flow():
+        monkeypatch.setattr(shell, "_register", lambda proc, cmd: None)
+        h = await shell.bash("sleep 300", background=True)
+        await asyncio.sleep(0.1)
+        return h
+
+    h = asyncio.run(flow())
+    assert h._pgid is None and h.poll() is None
+    calls = _no_group_calls(monkeypatch)
+
+    h.kill()
+
+    assert calls == [], f"kill() went looking for a group on a live child: {calls}"
+    assert _gone(h.pid), "the handle's own child survived its kill()"
