@@ -214,3 +214,28 @@ def test_settle_dead_still_reports_kernel_died_when_nothing_was_archived(monkeyp
 
     assert out.record.error["ename"] == "KernelDied"
     assert "half a line" in out.output
+
+
+def test_a_huge_archived_log_is_read_in_bounded_slices(monkeypatch, tmp_path):
+    """Archived settles are explicitly uncapped by the renderer, and this read the WHOLE
+    file before that truncation ever ran — a verbose multi-gigabyte cell would exhaust the
+    CLI or MCP adapter it settled in. The slice is bounded like every other log read, the
+    cursor comes back pointing just past it, and `log_path` still names the full file.
+    """
+    from ptc.cells import READ_CHUNK_BYTES, default_offset
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    tail = "y" * 4096
+    _archive(tmp_path, "a5", 1, "x" * READ_CHUNK_BYTES + tail, None)
+
+    kc = KernelClient("a5")
+    first = kc._archived(1)
+    # the archive note is appended to every settle; the LOG is what is under test here
+    served = first.output.split("\n[cell ")[0]
+    assert len(served) == READ_CHUNK_BYTES and set(served) == {"x"}, \
+        "the whole file was read before the renderer ever truncated it"
+    assert first.log_path.exists(), "the full log is no longer reachable"
+    assert default_offset("a5", 1) == READ_CHUNK_BYTES
+
+    second = kc._archived(1, default_offset("a5", 1))
+    assert second.output.split("\n[cell ")[0] == tail

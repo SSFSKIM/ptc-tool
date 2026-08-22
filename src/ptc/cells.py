@@ -26,16 +26,27 @@ def read_record(key: str, cell_id: int) -> CellRecord | None:
         return None
 
 
-def read_output_since(key: str, cell_id: int, offset: int,
-                      max_bytes: int = 4_000_000) -> tuple[str, int]:
-    p = cells_dir(key) / f"{cell_id}.log"
+#: Most output any one read hands back. A cell log has no size bound of its own — a chatty
+#: cell writes gigabytes — and the caller is a CLI or an MCP adapter that would have to hold
+#: the whole thing in memory before the renderer truncated it to a few thousand characters.
+#: The cursor comes back pointing just past what WAS read, so the rest is still reachable.
+READ_CHUNK_BYTES = 4_000_000
+
+
+def read_since(path, offset: int, max_bytes: int = READ_CHUNK_BYTES) -> tuple[str, int]:
+    """A bounded slice of `path` from `offset`, with the offset just past what was read."""
     try:
-        with open(p, "rb") as f:
+        with open(path, "rb") as f:
             f.seek(max(offset, 0))
             data = f.read(max_bytes)
             return data.decode(errors="replace"), f.tell()
     except OSError:
         return "", max(offset, 0)
+
+
+def read_output_since(key: str, cell_id: int, offset: int,
+                      max_bytes: int = READ_CHUNK_BYTES) -> tuple[str, int]:
+    return read_since(cells_dir(key) / f"{cell_id}.log", offset, max_bytes)
 
 
 def current_cell(key: str) -> int | None:

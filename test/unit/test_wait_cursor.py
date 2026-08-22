@@ -101,3 +101,18 @@ def test_an_explicit_cursor_is_still_the_cross_process_contract(monkeypatch, tmp
 
     out = KernelClient("c3").wait_cell(2, timeout_s=10, since=len("one\n"))
     assert out.output == "two\n"
+
+
+def test_an_immediately_completed_exec_advances_the_cursor(monkeypatch, tmp_path):
+    """A cell that finishes inside the exec yield has its output handed straight to the
+    caller — but only the Running exit saved the offset, so the sidecar stayed unseeded and
+    a later `wait(cell_id=…)` with no `since` from the same adapter replayed the whole cell.
+    `since=-1` means "resume after what this adapter last served", whichever exit served it.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _seed("c5", 3, "all of it\n")
+
+    kc = KernelClient("c5")
+    done = kc._follow(3, timeout_s=5)
+    assert isinstance(done, Completed) and "all of it" in done.output
+    assert kc.wait_cell(3, timeout_s=5).output == "", "the cursorless wait replayed the cell"

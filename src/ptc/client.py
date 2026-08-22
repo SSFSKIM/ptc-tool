@@ -12,6 +12,7 @@ from .cells import (
     default_offset,
     read_output_since,
     read_record,
+    read_since,
     save_offset,
 )
 from .kernel import kernel_alive
@@ -146,6 +147,13 @@ class KernelClient:
             rec = read_record(self.key, cell_id)
             if rec is not None:
                 out, off = read_output_since(self.key, cell_id, 0)
+                # Same rule as the Running exit below, and it applies to a cell that
+                # finished inside the yield just as much: this output HAS been handed to
+                # the caller. Dropping the offset here left the sidecar unseeded, so a
+                # later `wait(cell_id=…)` with no `since` from this same adapter replayed
+                # the whole cell — while `since=-1` is documented as "resume after what
+                # this adapter last served".
+                save_offset(self.key, cell_id, off)
                 return Completed(cell_id, rec, out)
             if not live_log.exists():
                 # Another client restarted the kernel under this cell: its log and its
@@ -378,14 +386,20 @@ class KernelClient:
 
     def _archived(self, cell_id: int, offset: int = 0) -> Completed | None:
         """A cell id from a previous kernel epoch (F3): settle it from the archive,
-        resuming at the caller's cursor so an already-delivered log is not replayed."""
+        resuming at the caller's cursor so an already-delivered log is not replayed.
+
+        Bounded like every other log read (`read_since`), and for the same reason: an
+        archived log has no size of its own — a verbose cell leaves gigabytes behind — and
+        this ran in a CLI or an MCP adapter that would hold all of it before the renderer
+        truncated it to a few thousand characters. The cursor returns pointing just past
+        what was read and `log_path` names the file, so the rest stays reachable.
+        """
         for d in sorted(kernel_dir(self.key).glob("cells-prev-*"), reverse=True):
             log = d / f"{cell_id}.log"
             if not log.exists():
                 continue
-            raw = log.read_bytes()
-            text = raw[max(offset, 0):].decode(errors="replace")
-            save_offset(self.key, cell_id, len(raw))
+            text, new_off = read_since(log, offset)
+            save_offset(self.key, cell_id, new_off)
             try:
                 rec = json.loads((d / f"{cell_id}.json").read_text())
                 rec.setdefault("error", None)
