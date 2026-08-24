@@ -1,6 +1,10 @@
 {
   "name": "ptc",
-  "description": "Programmatic Tool Calling — a persistent per-session IPython kernel with Claude-Code-equivalent tools as Python functions",
+  "description": "Programmatic Tool Calling \u2014 a persistent per-session IPython kernel with Claude-Code-equivalent tools as Python functions",
   "version": "0.1.0",
-  "author": {"name": "SSFSKIM"}
+  "author": {
+    "name": "SSFSKIM"
+  },
+  "homepage": "https://github.com/SSFSKIM/ptc-tool",
+  "license": "MIT"
 }

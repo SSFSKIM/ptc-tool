@@ -1,0 +1,22 @@
+{
+  "name": "ptc-tool",
+  "description": "Programmatic Tool Calling for Claude Code \u2014 one program in, one small answer out",
+  "owner": {
+    "name": "SSFSKIM",
+    "email": "supremekim17@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "ptc",
+      "description": "Programmatic Tool Calling \u2014 a persistent per-session IPython kernel with Claude-Code-equivalent tools as Python functions",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "SSFSKIM",
+        "email": "supremekim17@gmail.com"
+      },
+      "homepage": "https://github.com/SSFSKIM/ptc-tool",
+      "license": "MIT"
+    }
+  ]
+}

@@ -12,8 +12,13 @@ and agent handles survive across tool calls, turns, compaction, and `claude --re
 
 ## Install
 
-    cd ptc/ && uv run ptc setup          # provision ~/.ptc/venv (one-time)
-    claude --plugin-dir .                # dev install — the package IS the plugin root
+    /plugin marketplace add SSFSKIM/ptc-tool     # inside Claude Code
+    /plugin install ptc@ptc-tool
+
+Or from a checkout (dev install — the package IS the plugin root):
+
+    cd ptc-tool/ && uv run ptc setup     # provision ~/.ptc/venv (one-time)
+    claude --plugin-dir .
 
 On a warm `uv` cache the launcher can provision the venv inside Claude Code's 30 s MCP
 startup window on its own; running `ptc setup` once first is what makes a cold cache safe.
