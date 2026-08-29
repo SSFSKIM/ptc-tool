@@ -693,12 +693,20 @@ class KernelClient:
                     buf = (buf + text)[-READ_CHUNK_BYTES:]
                     scan_off = new_off
                     m = pattern.search(buf)
-                    if m:
+                    if m and read_record(self.key, cell_id) is None:
                         # This output HAS been handed to the caller, so the cursor moves
                         # with it — the same rule every other return here follows.
                         save_offset(self.key, cell_id, scan_off)
                         return Running(cell_id, buf, scan_off,
                                        matched=m.group(0)[:MATCHED_MAX_CHARS])
+                    if m:
+                        # The cell settled between this loop's record check and the read
+                        # above. Completion supersedes the scan, so the match is dropped
+                        # and the loop's own top settles the cell from the entry cursor:
+                        # returning a matched Running here would hide the status, the
+                        # result and the error the cell actually finished with, and tell
+                        # the caller to keep waiting on something that is over.
+                        continue
                     # More may be waiting behind this read: drain the log at full speed
                     # rather than a chunk per 0.2 s poll. Only a read that came back empty
                     # means there is nothing to do but wait.

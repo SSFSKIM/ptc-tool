@@ -176,6 +176,31 @@ def test_the_match_is_capped_where_it_is_taken(monkeypatch, tmp_path):
         f"a 606-character match came back {len(out.matched)} characters long"
 
 
+def test_a_cell_that_settles_during_the_scan_still_completes(monkeypatch, tmp_path):
+    """The record is read at the top of the loop and the scan reads the log after it, so a
+    settle landing between the two made a FINISHED cell come back as a matched Running —
+    with no status, no result and no error, and the caller told to keep waiting on a cell
+    that was already over. Completion supersedes the scan, so the record is re-read before
+    a match is returned and the loop's own top settles the cell from the entry cursor."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _running_cell("uc", 3, "MARKER\n")
+
+    import ptc.client as client_mod
+    real = client_mod.read_output_since
+
+    def settles_behind_the_read(*a, **kw):
+        out = real(*a, **kw)
+        _settle("uc", 3)          # the kernel finished while we were reading its log
+        return out
+
+    monkeypatch.setattr(client_mod, "read_output_since", settles_behind_the_read)
+
+    out = KernelClient("uc").wait_cell(3, timeout_s=10, until="MARKER")
+
+    assert isinstance(out, Completed), f"a settled cell came back as a matched Running: {out}"
+    assert "MARKER" in out.output
+
+
 def test_the_scan_only_sees_output_this_caller_has_not_been_served(monkeypatch, tmp_path):
     """`until=` reads through the caller's own cursor, so a marker already delivered by an
     earlier wait does not re-fire — the trigger is about what is NEW."""
