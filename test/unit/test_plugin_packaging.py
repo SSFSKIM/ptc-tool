@@ -112,8 +112,13 @@ def test_plugin_manifest():
 
 
 def test_mcp_manifest_points_at_the_launcher():
-    cfg = json.loads((PLUGIN / ".mcp.json").read_text())
+    """The server is declared INLINE in plugin.json, not in a root `.mcp.json`: the package
+    root is also the repo root, so a root `.mcp.json` doubles as PROJECT MCP config for any
+    session opened in the checkout — where `${CLAUDE_PLUGIN_ROOT}` never expands and every
+    session greets its owner with a phantom ENOENT server."""
+    cfg = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     assert cfg["mcpServers"]["ptc"]["command"] == "${CLAUDE_PLUGIN_ROOT}/bin/ptc-launch"
+    assert not (PLUGIN / ".mcp.json").exists(), "root .mcp.json would shadow as project config"
     assert LAUNCH.exists()
 
 

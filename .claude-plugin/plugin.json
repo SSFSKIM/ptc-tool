@@ -6,5 +6,10 @@
     "name": "SSFSKIM"
   },
   "homepage": "https://github.com/SSFSKIM/ptc-tool",
-  "license": "MIT"
+  "license": "MIT",
+  "mcpServers": {
+    "ptc": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ptc-launch"
+    }
+  }
 }
