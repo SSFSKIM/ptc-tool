@@ -31,12 +31,13 @@ user should see and approve step by step.
   to wait for afterwards.
 - If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
   queues silently.
-- To be notified instead of re-calling `wait`: run the blocking CLI wait —
-  `PTC_YIELD_S=3600 ptc wait <cell_id>` — with your native background Bash, with the yield
-  budget sized above the expected runtime. The harness's background-task notification then
-  lands when the cell settles (exit 0 success · 1 raised · 130 interrupted). If the budget
-  elapses first, the wait exits 0 but its output says `running` — read the output, don't
-  trust the exit code alone, and re-arm another background wait.
+- To be notified instead of re-calling `wait`: call `wait` once with `timeout_s` above
+  the cell's expected runtime. A call still running at ~2 minutes is moved to a background
+  task automatically and the cell's result arrives as a task notification when it settles —
+  keep working meanwhile. If the budget elapses first, the result says `running` — re-arm.
+  (Host without MCP auto-backgrounding: run the blocking CLI wait —
+  `PTC_YIELD_S=3600 ptc wait <cell_id>` — in a background Bash instead; read its output,
+  not just the exit code, since a `running` yield also exits 0.)
 - Run a project's code in the project's own environment (its venv, its npm scripts) via
   `bash(...)`; never install project dependencies into the kernel.
 

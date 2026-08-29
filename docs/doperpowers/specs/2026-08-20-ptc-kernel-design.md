@@ -1772,6 +1772,15 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   Evidence: r13 finding 1; commit 6996c5c64e; fabricated zombie stat line RED test + live macOS probe in the r13 fix report.
   Date: 2026-08-23.
 
+- Observation: Claude Code auto-backgrounds an in-flight MCP tool call at ~2 minutes
+  (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`, default 120000) and delivers the tool's full
+  result verbatim as a task notification when it completes — measured live, not just read
+  from docs: `wait(cell_id=2, timeout_s=3600)` over a 150 s cell was moved to a background
+  task at exactly 120 s and the notification carried `[cell 2 · ok · 150.0s]`. This makes
+  the async-PTC pattern a single long-budget `wait` call; the background-Bash + blocking
+  CLI wait composition demotes to a fallback for hosts without MCP auto-backgrounding.
+  Evidence: live probe 2026-08-24, session 56c9ce21; SKILL.md doctrine rewritten same day.
+
 ## Outcomes & Retrospective
 
 Written 2026-08-22 at finish.
@@ -1879,3 +1888,4 @@ round, supports stopping.
   entry above.
 - 2026-08-24: residual 9 closed — standalone repo `SSFSKIM/ptc-tool` published (subtree split, tree-identical), single-plugin marketplace.json added there, live `claude plugin marketplace add` + `install` + fresh-session `exec` all verified from the marketplace cache. Decision Log gains the standalone-repo entry; the monorepo copy stays the dev workspace.
 - 2026-08-24: spec and plan moved from the codex_somersault monorepo (`ptc-surface/docs/doperpowers/`) into this standalone repo, following the code. Historical `ptc-surface/ptc/...` paths and commit hashes in this document refer to the monorepo layout and history at campaign time; in this repo the package root is the repo root, and the pre-split history lives in the monorepo.
+- 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
