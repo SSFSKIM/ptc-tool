@@ -16,7 +16,7 @@ import time
 import pytest
 
 from ptc.cells import READ_CHUNK_BYTES, default_offset
-from ptc.client import Completed, KernelClient, Running
+from ptc.client import MATCHED_MAX_CHARS, Completed, KernelClient, Running
 from ptc.ownership import Owner, proc_start_time, write_owner
 from ptc.paths import cells_dir, kernel_dir, secure_dir
 
@@ -158,6 +158,22 @@ def test_the_drain_cannot_outlive_the_budget(monkeypatch, tmp_path):
     assert len(reads) <= 2, (
         f"the drain read {len(reads)} chunks past an expired deadline — one scan read, "
         "then the deadline branch's own read, is the whole of what a spent budget allows")
+
+
+def test_the_match_is_capped_where_it_is_taken(monkeypatch, tmp_path):
+    """`matched` names the EVENT — it is not a payload channel; the output window carries
+    the data. A greedy pattern (`.*MARKER`, `(?s)^.*done`) otherwise hands the whole window
+    back a second time through a field every renderer treats as a short label, and the
+    caller pays for it twice. Capping it where it is taken bounds render, to_dict and the
+    CLI's JSON at once, rather than asking three call sites to remember."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _running_cell("ub", 2, b"." * (2 * READ_CHUNK_BYTES) + b"x" * 600 + b"MARKER")
+
+    out = KernelClient("ub").wait_cell(2, timeout_s=10, until=r"x{600}MARKER")
+
+    assert isinstance(out, Running) and out.matched, out
+    assert len(out.matched) == MATCHED_MAX_CHARS, \
+        f"a 606-character match came back {len(out.matched)} characters long"
 
 
 def test_the_scan_only_sees_output_this_caller_has_not_been_served(monkeypatch, tmp_path):

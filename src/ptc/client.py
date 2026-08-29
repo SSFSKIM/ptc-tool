@@ -78,6 +78,11 @@ class NotFound:
 #: one this submission should be sending to.
 _READY_S = 20.0
 
+#: Longest `matched` a `wait_cell(until=…)` return carries. `matched` identifies the EVENT;
+#: it is not a payload channel — the output window carries the data. Capped here, at the
+#: source, so every renderer downstream is bounded by construction.
+MATCHED_MAX_CHARS = 512
+
 
 def _epoch_ended_record() -> dict:
     """The settle for a cell whose kernel epoch ended before it did (F3)."""
@@ -626,7 +631,8 @@ class KernelClient:
           * only NEW output is scanned — output this caller has already been served (its
             cursor) is behind the scan, so a marker delivered by an earlier wait does not
             re-fire;
-          * the first match wins, and the returned `Running` carries it in `matched`;
+          * the first match wins, and the returned `Running` carries it in `matched`,
+            clipped to `MATCHED_MAX_CHARS` — it names the event, it does not carry data;
           * the search window is the last `READ_CHUNK_BYTES` of output, so a match spanning
             more than one window is not guaranteed to be seen;
           * completion supersedes the scan: a cell that settles first returns Completed as
@@ -691,7 +697,8 @@ class KernelClient:
                         # This output HAS been handed to the caller, so the cursor moves
                         # with it — the same rule every other return here follows.
                         save_offset(self.key, cell_id, scan_off)
-                        return Running(cell_id, buf, scan_off, matched=m.group(0))
+                        return Running(cell_id, buf, scan_off,
+                                       matched=m.group(0)[:MATCHED_MAX_CHARS])
                     # More may be waiting behind this read: drain the log at full speed
                     # rather than a chunk per 0.2 s poll. Only a read that came back empty
                     # means there is nothing to do but wait.
