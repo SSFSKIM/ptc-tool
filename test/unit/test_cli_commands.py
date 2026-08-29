@@ -378,6 +378,26 @@ def test_wait_reports_the_same_codes_as_exec(monkeypatch, capsys, status, code):
     capsys.readouterr()
 
 
+def test_wait_that_returned_on_a_pattern_is_a_successful_wait(monkeypatch, capsys):
+    """`--until` returns early, on the cell's output rather than on the budget — but the
+    cell WAS submitted and is still running, so it exits like any other Running (0), and
+    both output forms carry what matched."""
+    from ptc import client
+    from ptc.client import Running
+
+    monkeypatch.setattr(cli, "_pick_session", lambda e: ("k9", None,
+                                                         type("R", (), {"cwd": None,
+                                                                        "claude_session_id": None})()))
+    monkeypatch.setattr(client.KernelClient, "wait_cell",
+                        lambda self, *a, **kw: Running(7, "BOOM\n", 5, matched="BOOM"))
+
+    assert cli.main(["wait", "7", "-s", "k9", "--until", "BOOM"]) == 0
+    assert "matched" in capsys.readouterr().out
+
+    assert cli.main(["wait", "7", "-s", "k9", "--until", "BOOM", "--json"]) == 0
+    assert _json_out(capsys)["matched"] == "BOOM"
+
+
 def test_the_interrupted_exit_code_is_documented_in_help():
     """An exit code nobody can look up is a private convention, not a contract — the same
     rule `EXIT_BUSY` is held to."""

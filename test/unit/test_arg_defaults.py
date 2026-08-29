@@ -13,7 +13,7 @@ import pytest
 
 import ptc.cli as cli
 import ptc.mcp as mcp_mod
-from ptc.client import Busy
+from ptc.client import Busy, Running
 from ptc.discovery import Resolved
 
 
@@ -65,6 +65,45 @@ def test_cli_omitted_timeout_takes_the_environment(seen, monkeypatch, capsys):
 
     assert cli.main(["exec", "-t", "2", "1"]) == cli.EXIT_BUSY
     assert seen["timeout_s"] == 2.0, "an explicit -t must still win"
+
+
+@pytest.fixture
+def waited(monkeypatch, tmp_path):
+    """Capture what `wait_cell` is called with, from either adapter."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    captured: dict = {}
+
+    def fake_wait(self, cell_id, timeout_s, since=-1, until=None):
+        captured.update(cell_id=cell_id, timeout_s=timeout_s, since=since, until=until)
+        return Running(cell_id, "", 0)
+
+    for mod in (cli, mcp_mod):
+        monkeypatch.setattr(mod.KernelClient, "wait_cell", fake_wait, raising=False)
+    return captured
+
+
+def test_mcp_wait_threads_the_until_pattern_through(waited, monkeypatch):
+    """`until=` is only useful if it reaches the client: the adapter is where a wait turns
+    from a timeout into an event trigger."""
+    asyncio.run(mcp_mod.wait_tool(cell_id=4, session="w1", until=r"PAIR DISAGREE"))
+    assert (waited["cell_id"], waited["until"]) == (4, r"PAIR DISAGREE")
+
+
+def test_mcp_wait_without_a_pattern_still_asks_for_none(waited, monkeypatch):
+    asyncio.run(mcp_mod.wait_tool(cell_id=4, session="w1"))
+    assert waited["until"] is None and waited["since"] == -1
+
+
+def test_cli_wait_threads_the_until_pattern_through(waited, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_pick_session",
+                        lambda explicit: ("k9", None, Resolved("k9", "explicit", None, None, False)))
+
+    assert cli.main(["wait", "4", "--until", "PAIR DISAGREE"]) == 0
+    assert (waited["cell_id"], waited["until"]) == (4, "PAIR DISAGREE")
+
+    assert cli.main(["wait", "4"]) == 0
+    assert waited["until"] is None, "an omitted --until must not invent a pattern"
+    capsys.readouterr()
 
 
 def test_cli_exec_carries_the_resolved_metadata_into_the_kernel(seen, monkeypatch, capsys):

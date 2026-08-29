@@ -229,7 +229,7 @@ loaded. Five tools:
 | tool | params | behavior |
 |---|---|---|
 | `exec` | `code: str` (required), `session?: str`, `timeout_s: int = 300`, `max_output_chars: int = 12000` | Run a cell. The idle-check **and** submit happen under the per-key submit `flock` (all local clients share it), so exactly one client wins: the winner submits and streams until done or `timeout_s`, then returns the finished result or yields `status: running` + `cell_id` + partial output + `next_offset`; every loser gets `status: busy` + the running `cell_id` + guidance (`wait`, `interrupt`, or resubmit later). Nothing is ever silently queued. |
-| `wait` | `cell_id: int`, `session?`, `timeout_s: int = 300`, `max_output_chars: int = 12000`, `since: int = -1` | Return output produced after offset `since` in `cells/<id>.log` (default `-1` = the offset this adapter last served, else 0), plus the cell's state from the terminal record. Returns `next_offset` — a caller-held cursor, so retries are idempotent and two waiters cannot consume each other's output. Completion (status, result repr, error, duration, images) comes from `cells/<id>.json`, so a **fresh adapter** can settle a cell it never started. May yield again. |
+| `wait` | `cell_id: int`, `session?`, `timeout_s: int = 300`, `max_output_chars: int = 12000`, `since: int = -1`, `until?: str` | Return output produced after offset `since` in `cells/<id>.log` (default `-1` = the offset this adapter last served, else 0), plus the cell's state from the terminal record. Returns `next_offset` — a caller-held cursor, so retries are idempotent and two waiters cannot consume each other's output. Completion (status, result repr, error, duration, images) comes from `cells/<id>.json`, so a **fresh adapter** can settle a cell it never started. May yield again. `until` is a Python regex that makes the wait an **event**: it returns `status: running` with `matched` as soon as NEW output first matches, rather than at settle — a long budget plus `until=` turns the completion notification into a trigger. First match wins; the window is one bounded read; completion supersedes the scan; an uncompilable pattern is a tool error. |
 | `interrupt` | `session?` | `interrupt_request` on the control channel, then SIGINT after 2 s if still busy. Returns the interrupted cell's tail. |
 | `restart` | `session?` | Shut down + respawn + re-bootstrap. States plainly that the namespace was lost and child agents remain resumable via `agent.list()`. |
 | `kernels` | — | List known kernels: key, pid, alive?, cwd, last-used, depth. |
@@ -246,7 +246,9 @@ edited src/a.py (+3/−1) · wrote notes/out.md · ran: npm test · spawned agen
 ```
 
 - Header states cell id, status (`ok | error | running | busy | interrupted`), duration, and —
-  when keying is degraded (fallback 5) — a `[keying: adapter-local]` note.
+  when keying is degraded (fallback 5) — a `[keying: adapter-local]` note. A wait that returned
+  early on its `until=` pattern reads `running · matched`, and its guidance line quotes what
+  matched and says the cell is still running.
 - **Truncation**: head+tail slices totaling `max_output_chars`, elision marker
   `… [truncated N chars — full output: ~/.ptc/kernels/<S>/cells/14.log]`. `max_output_chars`
   is clamped server-side to 50 000; an aggregate response budget (~4 MB text+images) bounds the
@@ -277,7 +279,7 @@ adapter (same client library, same result shaping, text output).
 ```
 ptc setup                       # provision/refresh ~/.ptc/venv
 ptc exec [-s KEY] [-t SECS] [--json] [CODE | -]   # run a cell (CODE arg, or stdin with -)
-ptc wait  -s KEY CELL_ID [-t SECS] [--json]       # --json: the machine-readable result object
+ptc wait  -s KEY CELL_ID [-t SECS] [--since N] [--until REGEX] [--json]   # --json: the machine-readable result object
 ptc interrupt [-s KEY]
 ptc restart   [-s KEY]
 ptc list                        # kernels + last-used + alive

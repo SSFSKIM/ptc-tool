@@ -1,12 +1,14 @@
 """Jupyter-wire client. One instance per operation is fine; all durable state is on disk."""
 import json
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .cells import (
+    READ_CHUNK_BYTES,
     CellRecord,
     current_cell,
     default_offset,
@@ -46,6 +48,10 @@ class Running:
     cell_id: int
     output: str
     next_offset: int
+    #: What `wait_cell(until=…)` matched, when the wait returned because the cell's new
+    #: output first satisfied that pattern rather than because the budget ran out. Last
+    #: field with a default, so every other construction of a Running is unchanged.
+    matched: str | None = None
 
 
 @dataclass
@@ -609,11 +615,40 @@ class KernelClient:
             return False
         return isinstance(data, dict) and data.get("cell_id") == cell_id
 
-    def wait_cell(self, cell_id: int, timeout_s: float,
-                  since: int = -1) -> Completed | Running | NotFound:
+    def wait_cell(self, cell_id: int, timeout_s: float, since: int = -1,
+                  until: str | None = None) -> Completed | Running | NotFound:
+        """Wait for cell `cell_id`, up to `timeout_s`, resuming at `since`.
+
+        `until` is a Python regex that turns the wait into an EVENT: it returns as soon as
+        the cell's new output first matches, instead of at settle or at the budget. What it
+        promises, and what it does not:
+
+          * only NEW output is scanned — output this caller has already been served (its
+            cursor) is behind the scan, so a marker delivered by an earlier wait does not
+            re-fire;
+          * the first match wins, and the returned `Running` carries it in `matched`;
+          * the search window is the last `READ_CHUNK_BYTES` of output, so a match spanning
+            more than one window is not guaranteed to be seen;
+          * completion supersedes the scan: a cell that settles first returns Completed as
+            usual, even when the pattern occurs in its output;
+          * a pattern that can match the empty string never fires on no output.
+
+        A pattern that will not compile raises `re.error` out of this call before any disk
+        work — the wait simply never happened.
+        """
+        # Compiled at ENTRY: an unusable pattern must not become a failure discovered
+        # part-way through a poll loop that has already advanced somebody's cursor.
+        pattern = re.compile(until) if until is not None else None
         implicit = since < 0
         offset = default_offset(self.key, cell_id) if implicit else since
         deadline = time.monotonic() + timeout_s
+        # Scan state, and it is purely LOCAL: `scan_off` runs ahead of `offset` reading the
+        # log for the pattern, and nothing else in this loop consults either of them.
+        # `buf` is the rolling window the pattern is searched in — bounded to one read's
+        # worth so a long-running cell's scan cannot grow without limit, and carried across
+        # reads so a marker split by a read boundary is still seen whole.
+        buf = ""
+        scan_off = offset
         while True:
             rec = read_record(self.key, cell_id)
             if rec is not None:
@@ -646,6 +681,21 @@ class KernelClient:
                     return NotFound(cell_id)
             if self._kernel_known_dead():
                 return self._settle_dead(cell_id, offset, implicit=implicit)
+            if pattern is not None:
+                text, new_off = read_output_since(self.key, cell_id, scan_off)
+                if text:
+                    buf = (buf + text)[-READ_CHUNK_BYTES:]
+                    scan_off = new_off
+                    m = pattern.search(buf)
+                    if m:
+                        # This output HAS been handed to the caller, so the cursor moves
+                        # with it — the same rule every other return here follows.
+                        save_offset(self.key, cell_id, scan_off)
+                        return Running(cell_id, buf, scan_off, matched=m.group(0))
+                    # More may be waiting behind this read: drain the log at full speed
+                    # rather than a chunk per 0.2 s poll. Only a read that came back empty
+                    # means there is nothing to do but wait.
+                    continue
             if time.monotonic() >= deadline:
                 text, new_off = read_output_since(self.key, cell_id, offset)
                 save_offset(self.key, cell_id, new_off)

@@ -40,6 +40,8 @@ user should see and approve step by step.
   task automatically and the cell's result arrives as a task notification when it settles —
   keep working meanwhile. If the budget elapses first, the result says `running` — re-arm.
   (The MCP tools take `timeout_s=`; the in-kernel `bash()` takes `timeout=`.)
+  Add `until=r"..."` to be woken at an EVENT instead of at settle: the wait returns the
+  moment new output first matches that regex, so the notification carries the matching tail.
   (Host without MCP auto-backgrounding: run the blocking CLI wait —
   `PTC_YIELD_S=3600 ptc wait <cell_id>` — in a background Bash instead; read its output,
   not just the exit code, since a `running` yield also exits 0.)

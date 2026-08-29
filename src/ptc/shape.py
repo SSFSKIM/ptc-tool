@@ -140,6 +140,15 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             "submit the code again; nothing is running under it.", [])
     if isinstance(outcome, Running):
         body = _truncate(outcome.output, config.max_output_chars, log_path / f"{outcome.cell_id}.log")
+        # A matched Running came back EARLY, on the caller's `until=` pattern rather than
+        # on its budget — a different event, and the reader cannot act on it without being
+        # told which one it was and what fired.
+        if outcome.matched is not None:
+            return Rendered(
+                f"{_header(outcome.cell_id, 'running · matched', None, degraded)}\n{body}\n"
+                f"[the until= pattern matched {outcome.matched!r} — the cell is STILL "
+                f"RUNNING: call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
+                "for more output, or interrupt() to stop]", [])
         return Rendered(
             f"{_header(outcome.cell_id, 'running', None, degraded)}\n{body}\n"
             f"[still running — call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
@@ -178,7 +187,9 @@ def to_dict(outcome, key: str) -> dict:
         return {"status": "not_found", "cell_id": outcome.cell_id}
     if isinstance(outcome, Running):
         return {"status": "running", "cell_id": outcome.cell_id,
-                "output": outcome.output, "next_offset": outcome.next_offset}
+                "output": outcome.output, "next_offset": outcome.next_offset,
+                # what an `until=` pattern matched, None when the wait ended on its budget
+                "matched": outcome.matched}
     r = outcome.record
     return {"status": r.status, "cell_id": outcome.cell_id, "duration_ms": r.duration_ms,
             "output": outcome.output, "result_repr": r.result_repr, "error": r.error,

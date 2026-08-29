@@ -21,7 +21,7 @@ BLOCK_S = 1.0
 def test_interrupt_dispatches_while_a_wait_is_in_flight(monkeypatch):
     entered = threading.Event()
 
-    def slow_wait(self, cell_id, timeout_s, since):
+    def slow_wait(self, cell_id, timeout_s, since, until=None):
         entered.set()
         time.sleep(BLOCK_S)                      # a blocking client call, as in real life
         return Completed(cell_id, CellRecord("ok", 1, None, None, [], []), "done\n")

@@ -34,6 +34,33 @@ def test_render_running_busy_and_degraded():
     assert "busy" in b.text and "9" in b.text and "[keying: adapter-local]" in b.text
 
 
+def test_render_running_that_matched_a_pattern_says_what_fired():
+    """`wait(until=…)` returns a Running that came back EARLY, on a pattern rather than on
+    the budget. The header has to say so and the guidance has to quote what matched —
+    otherwise the reader cannot tell an event from a timeout, and the one fact the wait was
+    armed for is the one fact missing."""
+    cfg = Config.from_env(env={})
+    r = render(Running(5, "…\nPAIR DISAGREE\n", 77, matched="PAIR DISAGREE"), "k", cfg)
+
+    assert "[cell 5 · running · matched]" in r.text
+    assert "PAIR DISAGREE" in r.text
+    assert "STILL RUNNING" in r.text and "wait(cell_id=5, since=77)" in r.text
+    assert "interrupt()" in r.text
+
+    # the ordinary Running render is untouched
+    plain = render(Running(5, "partial", 77), "k", cfg)
+    assert "matched" not in plain.text
+
+
+def test_to_dict_running_carries_the_match():
+    """The JSON-facing twin: a `--json` or MCP caller needs the same distinction, and the
+    key is present either way so `d["matched"] is None` is a legible answer."""
+    d = to_dict(Running(5, "out", 77, matched="BOOM"), "k")
+    assert d == {"status": "running", "cell_id": 5, "output": "out",
+                 "next_offset": 77, "matched": "BOOM"}
+    assert to_dict(Running(5, "out", 77), "k")["matched"] is None
+
+
 def test_footer_and_error():
     ms = [{"kind": "edit", "path": "src/a.py", "added": 3, "removed": 1},
           {"kind": "write", "path": "out.md", "added": 10},

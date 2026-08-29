@@ -23,9 +23,11 @@ summaries; output truncates with a full-log path. Pre-bound: read, write, edit,
 bash, agent, llm, web_fetch, web_search, history, workflow, asyncio (all Python;
 async ones are awaited at top level). Tools: exec, wait, interrupt, restart, kernels.
 If a cell yields `running`, use wait(cell_id); if the kernel is busy, wait or
-interrupt — nothing queues. Pass session="<id>" explicitly if results ever look like
-a different session's namespace, or if this client does not set a session id of its
-own (the header then reads `keying: adapter-local`).
+interrupt — nothing queues. wait also takes until="<python regex>", returning as
+soon as new output first matches instead of at settle. Pass session="<id>"
+explicitly if results ever look like a different session's namespace, or if this
+client does not set a session id of its own (the header then reads
+`keying: adapter-local`).
 """
 
 server = MCPServer("ptc", instructions=INSTRUCTIONS)
@@ -132,11 +134,13 @@ async def exec_tool(code: str, session: str | None = None,
 async def wait_tool(cell_id: int, session: str | None = None,
                     timeout_s: float | None = None,
                     max_output_chars: int | None = None,
-                    since: int = -1) -> list:
+                    since: int = -1, until: str | None = None) -> list:
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
+    # A pattern that will not compile raises out of here, and the MCP layer renders a tool
+    # error: the caller asked for something impossible and needs to be told, not defaulted.
     outcome = await asyncio.to_thread(KernelClient(r.key).wait_cell, cell_id,
-                                      timeout_s=cfg.yield_s, since=since)
+                                      timeout_s=cfg.yield_s, since=since, until=until)
     return _content(render(outcome, r.key, cfg, degraded=r.degraded))
 
 

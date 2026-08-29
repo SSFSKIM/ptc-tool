@@ -82,6 +82,9 @@ def _run(argv=None) -> int:
     com("setup")
     sp = com("exec"); sp.add_argument("code")
     sp = com("wait"); sp.add_argument("cell_id", type=int); sp.add_argument("--since", type=int, default=-1)
+    sp.add_argument("--until", default=None, metavar="REGEX",
+                    help="return as soon as new output matches this Python regex, "
+                         "rather than waiting for the cell to settle")
     com("interrupt"); com("restart"); com("list"); com("doctor")
     sp = com("kill"); sp.add_argument("--all", action="store_true",
                                       help="kill every known kernel, not just one")
@@ -192,7 +195,8 @@ def _run(argv=None) -> int:
                              claude_session_id=resolved.claude_session_id, config=cfg)
         outcome = KernelClient(key).exec_cell(code, timeout_s=cfg.yield_s, config=cfg)
     else:  # wait
-        outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=cfg.yield_s, since=a.since)
+        outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=cfg.yield_s,
+                                              since=a.since, until=a.until)
         info = None
     if a.json:
         d = to_dict(outcome, key)
