@@ -1,6 +1,7 @@
 """async shell for the kernel. %%bash magic remains available alongside."""
 import asyncio
 import os
+import shlex
 import signal
 import time
 from dataclasses import dataclass
@@ -400,10 +401,16 @@ class BashHandle:
         _retire(self._pgid)
 
 
-async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
-                background: bool = False):
+async def bash(cmd: str | list[str] | tuple[str, ...], timeout: float = 120.0, cwd=None,
+                env=None, background: bool = False):
     """Run `cmd` in a shell. Returns a BashResult, or (if background=True) a
     BashHandle for a detached process whose output can be polled/awaited.
+
+    Given a LIST (or tuple) of arguments, the program is run directly, WITHOUT a shell:
+    each element reaches it verbatim, so nothing has to survive a second round of quoting
+    — use it whenever an argument would otherwise need escaping (prompts, regexes, `--`
+    payloads, anything interpolated from a Python variable). No pipes, redirection,
+    globbing or `&&` there; those need the string form.
 
     env, if given, is MERGED over the parent's environment (os.environ),
     not a wholesale replacement as with plain subprocess/asyncio.create_subprocess_*
@@ -412,20 +419,26 @@ async def bash(cmd: str, timeout: float = 120.0, cwd=None, env=None,
     On timeout, output already produced before the kill is preserved in the
     returned BashResult (code=None, timed_out=True) rather than dropped.
     """
-    audit.append("bash", command=cmd[:200])
-    proc = await asyncio.create_subprocess_shell(
-        cmd, cwd=cwd, env={**os.environ, **(env or {})},
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True)
+    argv = list(cmd) if isinstance(cmd, (list, tuple)) else None
+    # One rendering of the command for everything that only ever DESCRIBES it — the audit
+    # line, the registry row, the handle. `shlex.join` is the argv's shell-equivalent, so a
+    # reader of either can copy it, and every downstream consumer keeps taking a str.
+    label = shlex.join(argv) if argv is not None else cmd
+    audit.append("bash", command=label[:200])
+    spawn = dict(cwd=cwd, env={**os.environ, **(env or {})},
+                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                 start_new_session=True)
+    proc = (await asyncio.create_subprocess_exec(*argv, **spawn) if argv is not None
+            else await asyncio.create_subprocess_shell(cmd, **spawn))
     if background:
-        return BashHandle(proc, cmd)
+        return BashHandle(proc, label)
 
     # A foreground command is its own session too, so the kernel's own group kill misses it
     # — and while it was absent from the registry, `ptc kill`/`restart` and the TTL watchdog
     # missed it as well: bgroups.reap is the only channel to a HOST that never saw this pid.
     # A kill landing mid-`bash()` therefore left the command and its descendants running
     # after the kernel was gone. The row lives exactly as long as the call.
-    pgid = _register(proc, cmd)
+    pgid = _register(proc, label)
     # Bounded on the same terms as a handle's, and for a reason the old "a foreground
     # call's buffers die with the call" argument missed: `yes` fills memory in seconds, so
     # the 120 s timeout bounds nothing the kernel survives. Head and tail with the elision
