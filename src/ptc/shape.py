@@ -119,10 +119,16 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
             which = _BUSY_TEXT.get(outcome.reason, "cell {id} is still running").format(id=outcome.cell_id)
         else:
             which = _BUSY_TEXT_NO_ID.get(outcome.reason, "a just-submitted cell is being admitted")
+        # The named cell is whatever is holding a SHARED kernel — often another caller's,
+        # never this one's submission (nothing was queued). Pointing wait() at that cell as
+        # a source of output invited the reader to adopt another caller's result as theirs.
         return Rendered(
             f"[kernel busy{' · [keying: adapter-local]' if degraded else ''}] "
             f"{which}. "
-            + (f"Use wait(cell_id={outcome.cell_id}) for its output, " if has_id else "")
+            + (f"That cell may belong to another caller of this shared kernel: its output is "
+               f"that cell's, not the result of what you just tried to run — "
+               f"wait(cell_id={outcome.cell_id}) tells you when the kernel frees, and "
+               "collects that output only for the cell's own submitter. " if has_id else "")
             + "interrupt() to stop it, or resubmit after it finishes. Nothing was queued.", [])
     if isinstance(outcome, NotFound):
         # Said plainly, because the alternative is a caller waiting on an id that will
