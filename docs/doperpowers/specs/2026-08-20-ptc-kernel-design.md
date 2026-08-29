@@ -1288,6 +1288,22 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   comparable.
   Date/Author: 2026-08-24 / Claude (approved by owner)
 
+- Decision: `wait` gains `until=` — a Python regex that turns a wait into an EVENT (issue #1
+  item 1, the Monitor counterpart). Design: a pure overlay on the poll loop with purely local
+  scan state, invisible to every other outcome until it fires; the search window is a
+  front-trimmable list of (byte_start, text) chunks holding at least one full read, so
+  boundary-straddling matches are seen and what the window drops is NAMED (`window_start`)
+  rather than silently skipped; `matched` is capped at source (512 chars — it names the
+  event, the output window carries the data); completion supersedes the scan and is
+  re-checked immediately before a match returns; the drain honors the caller's budget.
+  Rejected: returning everything scanned (unbounded memory/response), advancing the cursor
+  only chunk-by-chunk (degenerates the event into ~25 round trips per 100 MB), and a
+  kernel-side event channel (a new host→model channel for what a read-side scan answers).
+  One codex round on the branch found 3 real defects (window skip, unbounded matched,
+  terminal-record race) — all fixed same day; the budget-starvation drain bug was caught by
+  controller review before codex saw it.
+  Date/Author: 2026-08-30 / Claude (feature requested by owner)
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -1905,3 +1921,4 @@ round, supports stopping.
 - 2026-08-24: spec and plan moved from the codex_somersault monorepo (`ptc-surface/docs/doperpowers/`) into this standalone repo, following the code. Historical `ptc-surface/ptc/...` paths and commit hashes in this document refer to the monorepo layout and history at campaign time; in this repo the package root is the repo root, and the pre-split history lives in the monorepo.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
+- 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
