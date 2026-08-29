@@ -52,6 +52,12 @@ class Running:
     #: output first satisfied that pattern rather than because the budget ran out. Last
     #: field with a default, so every other construction of a Running is unchanged.
     matched: str | None = None
+    #: Where `output` BEGINS, in bytes, when that is later than the offset this wait
+    #: started scanning from — i.e. when the bounded match window dropped output it had
+    #: read past. None whenever the output covers everything from the caller's cursor,
+    #: which is every Running but a matched one on a chatty cell. The renderers say so,
+    #: because `since=next_offset` resumes after the window and cannot reach that span.
+    window_start: int | None = None
 
 
 @dataclass
@@ -633,8 +639,11 @@ class KernelClient:
             re-fire;
           * the first match wins, and the returned `Running` carries it in `matched`,
             clipped to `MATCHED_MAX_CHARS` — it names the event, it does not carry data;
-          * the search window is the last `READ_CHUNK_BYTES` of output, so a match spanning
-            more than one window is not guaranteed to be seen;
+          * the search window holds at least the most recent `READ_CHUNK_BYTES` of output,
+            so a match spanning more than that is not guaranteed to be seen. On a chatty
+            cell the window drops output it has already read past, and the returned
+            `window_start` then names the byte its `output` begins at — the dropped span is
+            still in the log, reachable with an explicit `since=`;
           * completion supersedes the scan: a cell that settles first returns Completed as
             usual, even when the pattern occurs in its output;
           * a pattern that can match the empty string never fires on no output.
@@ -650,10 +659,17 @@ class KernelClient:
         deadline = time.monotonic() + timeout_s
         # Scan state, and it is purely LOCAL: `scan_off` runs ahead of `offset` reading the
         # log for the pattern, and nothing else in this loop consults either of them.
-        # `buf` is the rolling window the pattern is searched in — bounded to one read's
-        # worth so a long-running cell's scan cannot grow without limit, and carried across
-        # reads so a marker split by a read boundary is still seen whole.
-        buf = ""
+        #
+        # The window is the searched text, kept as the (byte_start, text) chunks it arrived
+        # in and trimmed from the FRONT by whole chunks. It stays bounded — a long-running
+        # cell's scan cannot grow without limit — and the pattern is searched across the
+        # whole concatenation, so a marker split by a read boundary is still seen. Keeping
+        # the chunks rather than one rolling string is what makes the window HONEST: what it
+        # dropped is named in `window_start`, where trimming a string discarded output that
+        # had been read and could then be reached by no documented route at all
+        # (`since=next_offset` resumes after the window, never before it).
+        window: list[tuple[int, str]] = []
+        window_chars = 0
         scan_off = offset
         while True:
             rec = read_record(self.key, cell_id)
@@ -690,15 +706,29 @@ class KernelClient:
             if pattern is not None:
                 text, new_off = read_output_since(self.key, cell_id, scan_off)
                 if text:
-                    buf = (buf + text)[-READ_CHUNK_BYTES:]
+                    window.append((scan_off, text))
+                    window_chars += len(text)
                     scan_off = new_off
-                    m = pattern.search(buf)
+                    # Drop a leading chunk only while what remains is still a full read's
+                    # worth: the window then always holds at least the most recent
+                    # READ_CHUNK_BYTES of output — which is what keeps a match straddling a
+                    # read boundary findable — and never more than that plus one chunk.
+                    while (len(window) > 1
+                           and window_chars - len(window[0][1]) >= READ_CHUNK_BYTES):
+                        window_chars -= len(window.pop(0)[1])
+                    body = "".join(t for _, t in window)
+                    m = pattern.search(body)
                     if m and read_record(self.key, cell_id) is None:
                         # This output HAS been handed to the caller, so the cursor moves
                         # with it — the same rule every other return here follows.
                         save_offset(self.key, cell_id, scan_off)
-                        return Running(cell_id, buf, scan_off,
-                                       matched=m.group(0)[:MATCHED_MAX_CHARS])
+                        return Running(cell_id, body, scan_off,
+                                       matched=m.group(0)[:MATCHED_MAX_CHARS],
+                                       # only when the window really did drop something:
+                                       # a start equal to where the scan began is the
+                                       # whole story, and needs no note
+                                       window_start=(window[0][0]
+                                                     if window[0][0] > offset else None))
                     if m:
                         # The cell settled between this loop's record check and the read
                         # above. Completion supersedes the scan, so the match is dropped

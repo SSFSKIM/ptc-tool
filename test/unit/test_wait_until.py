@@ -160,6 +160,31 @@ def test_the_drain_cannot_outlive_the_budget(monkeypatch, tmp_path):
         "then the deadline branch's own read, is the whole of what a spent budget allows")
 
 
+def test_a_window_that_dropped_output_says_where_its_own_output_begins(monkeypatch,
+                                                                       tmp_path):
+    """The match window is bounded, so a chatty cell's early output falls out of it — and
+    a `Running` whose `output` silently began somewhere after the caller's cursor was a
+    lie by omission. Those bytes were read, never shown, and unreachable by the route the
+    render itself recommends: `wait(since=next_offset)` resumes AFTER the window. The
+    window therefore reports the byte its own output starts at.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _running_cell("ua", 1, b"." * (3 * READ_CHUNK_BYTES) + b"MARKER")
+
+    out = KernelClient("ua").wait_cell(1, timeout_s=10, until="MARKER")
+
+    assert isinstance(out, Running) and out.matched == "MARKER", out
+    assert len(out.output) <= 2 * READ_CHUNK_BYTES, "the window grew without bound"
+    assert out.next_offset == 3 * READ_CHUNK_BYTES + len("MARKER")
+    assert out.window_start > 0, "output began mid-log and claimed to start at the cursor"
+    # the log is ASCII, so bytes and characters agree: what came back really is exactly
+    # the span [window_start, next_offset) — nothing claimed that was not delivered
+    assert out.window_start + len(out.output) == out.next_offset
+
+    from ptc.shape import to_dict
+    assert to_dict(out, "ua")["window_start"] == out.window_start
+
+
 def test_the_match_is_capped_where_it_is_taken(monkeypatch, tmp_path):
     """`matched` names the EVENT — it is not a payload channel; the output window carries
     the data. A greedy pattern (`.*MARKER`, `(?s)^.*done`) otherwise hands the whole window

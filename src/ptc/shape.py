@@ -144,11 +144,23 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
         # on its budget — a different event, and the reader cannot act on it without being
         # told which one it was and what fired.
         if outcome.matched is not None:
-            return Rendered(
-                f"{_header(outcome.cell_id, 'running · matched', None, degraded)}\n{body}\n"
+            lines = [_header(outcome.cell_id, 'running · matched', None, degraded), body]
+            # The scan's window is bounded, so on a chatty cell it begins AFTER the
+            # caller's cursor. Said plainly, because the guidance line below recommends
+            # `since=next_offset` — which resumes past the window and can never reach the
+            # dropped span. `is not None` and not truthiness: byte 0 is a real offset.
+            if outcome.window_start is not None:
+                lines.append(
+                    f"[output before byte {outcome.window_start} is not shown: it was "
+                    "read past to keep the match window bounded. It is still in the log — "
+                    f"re-read it with wait(cell_id={outcome.cell_id}, "
+                    f"since=<your earlier cursor>), or open "
+                    f"{log_path / f'{outcome.cell_id}.log'}]")
+            lines.append(
                 f"[the until= pattern matched {outcome.matched!r} — the cell is STILL "
                 f"RUNNING: call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
-                "for more output, or interrupt() to stop]", [])
+                "for more output, or interrupt() to stop]")
+            return Rendered("\n".join(lines), [])
         return Rendered(
             f"{_header(outcome.cell_id, 'running', None, degraded)}\n{body}\n"
             f"[still running — call wait(cell_id={outcome.cell_id}, since={outcome.next_offset}) "
@@ -189,7 +201,10 @@ def to_dict(outcome, key: str) -> dict:
         return {"status": "running", "cell_id": outcome.cell_id,
                 "output": outcome.output, "next_offset": outcome.next_offset,
                 # what an `until=` pattern matched, None when the wait ended on its budget
-                "matched": outcome.matched}
+                "matched": outcome.matched,
+                # where `output` begins when the bounded match window dropped output the
+                # scan had read past; None when it covers everything from the cursor
+                "window_start": outcome.window_start}
     r = outcome.record
     return {"status": r.status, "cell_id": outcome.cell_id, "duration_ms": r.duration_ms,
             "output": outcome.output, "result_repr": r.result_repr, "error": r.error,

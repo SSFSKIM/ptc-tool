@@ -52,12 +52,28 @@ def test_render_running_that_matched_a_pattern_says_what_fired():
     assert "matched" not in plain.text
 
 
+def test_a_match_window_that_dropped_output_says_so():
+    """The scan's window is bounded, so on a chatty cell it starts AFTER the caller's
+    cursor: output was read past and is not in this reply. `wait(since=next_offset)` — the
+    line right below it — resumes after the window, so without a word here those bytes are
+    silently unreachable by the route the render itself recommends."""
+    cfg = Config.from_env(env={})
+    r = render(Running(5, "tail\n", 900, matched="M", window_start=800), "k", cfg)
+
+    assert "800" in r.text and "not shown" in r.text
+    assert "cells/5.log" in r.text, "the elided span must stay reachable"
+
+    # nothing dropped: the window began at the caller's own cursor, so there is no note
+    whole = render(Running(5, "tail\n", 900, matched="M"), "k", cfg)
+    assert "not shown" not in whole.text
+
+
 def test_to_dict_running_carries_the_match():
     """The JSON-facing twin: a `--json` or MCP caller needs the same distinction, and the
     key is present either way so `d["matched"] is None` is a legible answer."""
     d = to_dict(Running(5, "out", 77, matched="BOOM"), "k")
     assert d == {"status": "running", "cell_id": 5, "output": "out",
-                 "next_offset": 77, "matched": "BOOM"}
+                 "next_offset": 77, "matched": "BOOM", "window_start": None}
     assert to_dict(Running(5, "out", 77), "k")["matched"] is None
 
 
