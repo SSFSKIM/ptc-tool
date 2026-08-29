@@ -1781,6 +1781,19 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   CLI wait composition demotes to a fallback for hosts without MCP auto-backgrounding.
   Evidence: live probe 2026-08-24, session 56c9ce21; SKILL.md doctrine rewritten same day.
 
+- Observation: the first full-migration dogfooding session surfaced a result-misattribution
+  trap that was pure RENDER, not attribution: the submission path holds the submit lock from
+  busy-check to current.json publish, so a cell id can never bind to the wrong submission —
+  but the Busy text said "Use wait(cell_id=N) for its output", and on a kernel shared with
+  subagents the caller waited on a cell it never submitted and adopted another caller's
+  result as its own. Same session: Python-string→shell double-escaping silently broke an
+  inline prompt (empty output, exit ok), and `timeout_s` (MCP) vs `timeout` (in-kernel bash)
+  had to be recovered via `inspect.signature`.
+  Evidence: live feedback 2026-08-30; fixed in 5954301 (Busy render names whose cell it may
+  be), 5f61ff5 (`bash()` argv-list form — no shell, one parser), 64e7f6f (SKILL.md shared-
+  kernel/session isolation, argv-form, timeout-vocabulary doctrine). The Monitor-counterpart
+  gap (no mid-run event stream, only completion) is issue #1 on the repo.
+
 ## Outcomes & Retrospective
 
 Written 2026-08-22 at finish.
@@ -1889,3 +1902,4 @@ round, supports stopping.
 - 2026-08-24: residual 9 closed — standalone repo `SSFSKIM/ptc-tool` published (subtree split, tree-identical), single-plugin marketplace.json added there, live `claude plugin marketplace add` + `install` + fresh-session `exec` all verified from the marketplace cache. Decision Log gains the standalone-repo entry; the monorepo copy stays the dev workspace.
 - 2026-08-24: spec and plan moved from the codex_somersault monorepo (`ptc-surface/docs/doperpowers/`) into this standalone repo, following the code. Historical `ptc-surface/ptc/...` paths and commit hashes in this document refer to the monorepo layout and history at campaign time; in this repo the package root is the repo root, and the pre-split history lives in the monorepo.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
+- 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
