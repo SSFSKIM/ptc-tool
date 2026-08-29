@@ -695,7 +695,15 @@ class KernelClient:
                     # More may be waiting behind this read: drain the log at full speed
                     # rather than a chunk per 0.2 s poll. Only a read that came back empty
                     # means there is nothing to do but wait.
-                    continue
+                    #
+                    # The drain is inside the caller's budget like everything else. A cell
+                    # that writes faster than the scan reads — a print firehose — never
+                    # runs out of chunks, so an unconditional continue held the wait for as
+                    # long as the WRITER chose rather than for the time the caller asked
+                    # for. An expired deadline falls through to the branch below instead,
+                    # which answers from the entry cursor exactly as an unscanned wait does.
+                    if time.monotonic() < deadline:
+                        continue
             if time.monotonic() >= deadline:
                 text, new_off = read_output_since(self.key, cell_id, offset)
                 save_offset(self.key, cell_id, new_off)

@@ -129,6 +129,37 @@ def test_a_pattern_that_matches_the_empty_string_never_fires_on_no_output(monkey
     assert out.output == ""
 
 
+def test_the_drain_cannot_outlive_the_budget(monkeypatch, tmp_path):
+    """A cell can write faster than the scan reads it — a print firehose — and the drain
+    consumed every chunk available before it ever looked at the clock. The wait then ran
+    past the budget its caller asked for, with no bound but the writer's appetite. The
+    deadline is checked between chunks, and an expired one falls through to the ordinary
+    deadline branch: the plain Running an unscanned wait would have returned.
+
+    `timeout_s=0` is that state at its sharpest — the budget is already spent on entry, so
+    exactly one chunk may be processed and no more.
+    """
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _running_cell("u9", 8, b"." * (3 * READ_CHUNK_BYTES))
+
+    import ptc.client as client_mod
+    real = client_mod.read_output_since
+    reads = []
+
+    def counted(*a, **kw):
+        reads.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(client_mod, "read_output_since", counted)
+
+    out = KernelClient("u9").wait_cell(8, timeout_s=0, until="NEVER")
+
+    assert isinstance(out, Running) and out.matched is None, out
+    assert len(reads) <= 2, (
+        f"the drain read {len(reads)} chunks past an expired deadline — one scan read, "
+        "then the deadline branch's own read, is the whole of what a spent budget allows")
+
+
 def test_the_scan_only_sees_output_this_caller_has_not_been_served(monkeypatch, tmp_path):
     """`until=` reads through the caller's own cursor, so a marker already delivered by an
     earlier wait does not re-fire — the trigger is about what is NEW."""
