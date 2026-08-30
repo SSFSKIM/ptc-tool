@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parent.parent.parent        # the package IS the plugin root
@@ -307,6 +308,29 @@ def test_pre_hook_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
     assert not (tmp_path / "~").exists(), "a literal '~' directory was created"
     written = json.loads((tmp_path / ".ptc-alt" / "run" / "tooluse-t2.json").read_text())
     assert written["agent_id"] == "a2"
+
+
+def test_session_start_gcs_orphaned_tooluse_mappings(tmp_path, monkeypatch):
+    """A mapping is consumed by the adapter call it describes — unless that call never
+    reached the adapter (PreToolUse denied it, the adapter died mid-call). Those orphans
+    are never read by anyone, so the next SessionStart sweeps the aged ones out; a mapping
+    written moments ago may still be racing its own call and is left alone."""
+    run = tmp_path / "run"
+    run.mkdir(parents=True)
+    old, fresh = run / "tooluse-old.json", run / "tooluse-fresh.json"
+    for f in (old, fresh):
+        f.write_text('{"agent_id": "agent_7"}')
+    two_hours_ago = time.time() - 7200
+    os.utime(old, (two_hours_ago, two_hours_ago))
+
+    m = _load_hook(monkeypatch)
+    monkeypatch.setattr(m, "find_claude_ancestor", lambda: os.getpid())
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s-6","cwd":"/w6"}'))
+    assert m.main() == 0
+
+    assert not old.exists()
+    assert fresh.exists()
 
 
 def test_pre_hook_is_stdlib_only():

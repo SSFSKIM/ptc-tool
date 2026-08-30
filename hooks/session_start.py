@@ -136,6 +136,14 @@ def _record() -> int:
             f.unlink(missing_ok=True)
         except PermissionError:
             pass
+    # The PreToolUse hook's mappings, whose adapter call never came to collect them: the
+    # call was denied, or the adapter died holding it. Nobody will ever read these.
+    for f in rd.glob("tooluse-*.json"):
+        try:
+            if time.time() - f.stat().st_mtime > 3600:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
     return 0
 
 
