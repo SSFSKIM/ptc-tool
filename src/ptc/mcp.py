@@ -94,7 +94,14 @@ def _tool_use_id(ctx) -> str | None:
     the adapter's half of that correlation. None on any missing piece — fail-open."""
     try:
         meta = ctx.request_context.meta
-        return (meta.model_dump() if meta is not None else {}).get("claudecode/toolUseId")
+        if meta is None:
+            return None
+        # `RequestParamsMeta` is a TypedDict, so `meta` is a plain dict at runtime. Reading
+        # it as a pydantic model (`.model_dump()`) raised into the belt below on every live
+        # call, and the whole correlation was inert in production while the fakes above it
+        # — which had that method — passed.
+        v = meta.get("claudecode/toolUseId")
+        return v if isinstance(v, str) else None
     except Exception:
         return None
 

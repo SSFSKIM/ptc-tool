@@ -21,9 +21,10 @@ from ptc.kernel import kill_kernel
 
 def _ctx(tool_use_id: str) -> Context:
     """A Context shaped like the one `_handle_call_tool` builds: the host's per-call
-    `claudecode/toolUseId` sitting in the request's `_meta`."""
-    meta = types.SimpleNamespace(model_dump=lambda: {"claudecode/toolUseId": tool_use_id})
-    return Context(request_context=types.SimpleNamespace(meta=meta))
+    `claudecode/toolUseId` sitting in the request's `_meta`, which the SDK models as a
+    TypedDict — a plain dict at runtime."""
+    return Context(request_context=types.SimpleNamespace(
+        meta={"claudecode/toolUseId": tool_use_id}))
 
 
 def test_a_subagents_call_gets_a_kernel_the_parents_call_cannot_see(ptc_home, monkeypatch):
