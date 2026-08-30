@@ -1357,6 +1357,21 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   Evidence: `prime-agent/packages/coding-agent/src/core/tools/ipython.ts` (schema, no timeout),
   `src/core/kernel/index.ts` (`DEFAULT_MAX_OUTPUT_CHARS = 65536`), `docs/rlm.md`.
 
+- Observation: a subagent's MCP calls are indistinguishable to the SERVER but fully named
+  to the HOOKS — measured with a probe server + PreToolUse probe (2026-08-31, item-2
+  design spike). Over one shared stdio connection, every `tools/call`'s `_meta` carries
+  only `progress_token` and a per-call `claudecode/toolUseId`; no caller identity (docs
+  concur: "MCP servers cannot distinguish subagent calls"). But PreToolUse fires for both
+  parent and subagent calls with the SAME `tool_use_id` the server sees in `_meta`, plus
+  `agent_id` (stable across one subagent's calls; absent on main-thread calls) and
+  `agent_type` — and the hook completed 5–7 ms BEFORE the server handler ran on every
+  probe call, gated structurally by PreToolUse's ability to deny. SessionStart does not
+  fire for subagents (SubagentStart/Stop exist instead), so run-file keying alone can
+  never separate them.
+  Evidence: probe run 23af3816 — hook log {tool_use_id: toolu_017Jm…, agent_id:
+  a26ca2bac487ddfc8, agent_type: general-purpose} vs server log
+  {claudecode/toolUseId: toolu_017Jm…}, Δt +0.005 s; parent calls agent_id=None.
+
 - Observation: Claude Code's MCP defaults are unusually PTC-friendly: tool timeout ≈ 27.8 h
   (`DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000`) and a 25 000-token output cap — long cells
   cannot be killed by the host, and our 12k-char cap sits far under the ceiling.
@@ -1924,6 +1939,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-08-31 (item-2 design spike): measured how subagent MCP calls reach the server (probe server logging `_meta` + a PreToolUse probe logging hook input, headless session with a dispatched subagent). Surprises & Discoveries gains the finding that grounds the auto-keying design: hooks see `agent_id`/`tool_use_id` before the server sees the matching `claudecode/toolUseId`. Design presented to owner; not yet implemented.
 
 - 2026-08-31 (second feedback triage, v0.1.7): unawaited-coroutine render note shipped (test-pinned in test_shape.py); SKILL.md gains the file-ledger hazard, display-to-perceive, and durable-pid lines; Decision Log records the full triage including the two factually-off claims and the structural items left to the harness seam.
 
