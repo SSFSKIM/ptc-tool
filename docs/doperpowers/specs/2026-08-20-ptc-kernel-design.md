@@ -1896,6 +1896,8 @@ round, supports stopping.
 
 ## Revision Notes
 
+- 2026-08-31 (skill pointer, v0.1.5): the always-on instructions digest now ends with a scoped pointer at the ptc:ptc skill ("for anything beyond quick calls — agent fan-out, llm, web, workflow — invoke it first"), restoring the skill's two-stage disclosure through the one channel that never defers. Owner's suggestion, completing the three-channel decision below; pinned by test_instructions_point_at_the_skill.
+
 - 2026-08-31 (doctrine channels, v0.1.4): live feedback showed agents skipping the skill; investigation found all five MCP tool descriptions shipped empty (`fn.__doc__` is the description; none had docstrings). Call-time contracts (await trap, timeout naming, session isolation, since/until, auto-background) now ride the tool descriptions; instructions digest and skill unchanged. Decision Log entry added; test/unit/test_mcp_descriptions.py pins the contract tokens.
 
 - 2026-08-23 (r16, campaign close): round 16 confirmed all three findings (1 P1). Confirmed-dead kernels reap their recorded process group under the existence gate (1efe150061); interrupt binds to the cell captured at entry (647a30bd7b); kernel-lifetime config travels with the kernel — Decision Log entry (3dc369e16b). Extended campaign r10–r16 declared converged; addendum at the end of Outcomes & Retrospective.

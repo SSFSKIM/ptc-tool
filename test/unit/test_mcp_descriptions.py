@@ -37,3 +37,13 @@ def test_wait_description_defines_until_and_since():
     text = _descriptions()["wait"]
     assert "until" in text and "since" in text
     assert "regex" in text, "until= takes a Python regex; the schema type alone says str"
+
+
+def test_instructions_point_at_the_skill():
+    """The always-on channel names where the deep doctrine lives. Server instructions are
+    injected into the system prompt even when the tools themselves are deferred (observed
+    live), so this is the one place a caller who never browses skills is still told that
+    ptc:ptc exists and when to open it."""
+    from ptc.mcp import INSTRUCTIONS
+    assert "ptc:ptc" in INSTRUCTIONS
+    assert "skill" in INSTRUCTIONS.lower()

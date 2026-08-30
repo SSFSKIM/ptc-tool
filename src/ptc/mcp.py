@@ -28,6 +28,9 @@ soon as new output first matches instead of at settle. Pass session="<id>"
 explicitly if results ever look like a different session's namespace, or if this
 client does not set a session id of its own (the header then reads
 `keying: adapter-local`).
+Tool descriptions carry only the call-time contracts; for anything beyond quick
+calls — agent fan-out, llm, web, workflow — invoke the ptc:ptc skill first: it is
+the full API doctrine.
 """
 
 server = MCPServer("ptc", instructions=INSTRUCTIONS)
@@ -127,8 +130,8 @@ async def exec_tool(code: str, session: str | None = None,
     which skips the shell so quoting layers never stack. One session key is one kernel:
     parallel callers (subagents included) must each pass their own session="<name>" or
     they contend for it and see each other's cells. A `running` yield means use the wait
-    tool; `busy` means another cell is still running — nothing queues. The ptc skill
-    documents the full agent/llm/web/workflow API."""
+    tool; `busy` means another cell is still running — nothing queues. The ptc:ptc skill
+    documents the full agent/llm/web/workflow API — invoke it before using those."""
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
     info = await asyncio.to_thread(ensure_kernel, r.key, cwd=r.cwd,
