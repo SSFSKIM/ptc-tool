@@ -1320,6 +1320,18 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   tools they arrive via ToolSearch immediately before use — just-in-time by construction).
   Date/Author: 2026-08-31 / Claude (question raised by owner from live-usage feedback)
 
+- Decision: the `ran:` footer stays always-on, shrunk to a 48-char fingerprint with
+  consecutive identical commands collapsed to a count; the durable audit.jsonl entry grows
+  200→2000 chars so a faithful record exists where the fingerprint cannot serve. Rejected
+  (live feedback recommended both): dropping the footer by default — it is the visibility
+  half of the "audit instead of guard rails" decision above, and the transcript only shows
+  the command when it was a LITERAL (a `bash(cmd)` whose cmd was built in Python surfaces
+  nowhere else); and emitting it only on out-of-band retrieval — retrieval-mode-dependent
+  output shape is its own cost to a caller parsing results. The feedback's ergonomic
+  charge was accepted as stated: several 80-char `ran:` echoes per cell were the worst
+  token-to-information ratio in the output format.
+  Date/Author: 2026-08-31 / Claude (adjudicating forwarded live-usage feedback)
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -1895,6 +1907,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-08-31 (footer fingerprint, v0.1.6): live feedback charged the `ran:` footer with duplication; adjudicated against the audit-visibility design intent — kept always-on, per-entry clip 80→48 chars, consecutive identical commands collapse to `(×N)`, durable audit.jsonl command record 200→2000 chars. Decision Log entry records the two rejected recommendations.
 
 - 2026-08-31 (skill pointer, v0.1.5): the always-on instructions digest now ends with a scoped pointer at the ptc:ptc skill ("for anything beyond quick calls — agent fan-out, llm, web, workflow — invoke it first"), restoring the skill's two-stage disclosure through the one channel that never defers. Owner's suggestion, completing the three-channel decision below; pinned by test_instructions_point_at_the_skill.
 

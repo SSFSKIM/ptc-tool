@@ -60,3 +60,17 @@ def test_argv_list_backgrounds_into_a_handle_that_settles():
     r = asyncio.run(flow())
     assert r.code == 0, r.stderr
     assert r.stdout == _HOSTILE
+
+
+def test_audit_keeps_a_faithful_command_up_to_2000_chars(tmp_path):
+    """The footer clips render-side to a 48-char fingerprint, which makes audit.jsonl the
+    place a reader verifies EXACTLY what ran — so the durable record must outlast the
+    fingerprint. 2000 chars covers real commands; the cap still bounds a megabyte heredoc
+    a cell might build in Python."""
+    import json
+
+    r = asyncio.run(shell.bash(["true", "x" * 3000]))
+    assert r.code == 0
+
+    rows = [json.loads(ln) for ln in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert len(rows[-1]["command"]) == 2000, "the record was cut to the old 200-char length"

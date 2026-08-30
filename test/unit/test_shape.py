@@ -89,6 +89,36 @@ def test_footer_and_error():
     assert "[cell 2 · error" in r.text and "ValueError: bad" in r.text
 
 
+# --- live-usage round 2: the footer is a fingerprint, audit.jsonl is the record ---------
+
+def test_bash_footer_entries_are_short_fingerprints():
+    """The footer's job is a skimmable trace of what the cell DID, not a transcript of it:
+    long pipelines were echoing 80 chars apiece and a cell of several bash() calls spent
+    the worst token-to-information ratio in the whole output format on it. 48 chars names
+    the command; audit.jsonl holds the faithful copy."""
+    long_cmd = "pgrep -lf 'swift-build|swiftc|VitreaReference' | head -5; echo ---; tail -c 600"
+    f = footer_line([{"kind": "bash", "command": long_cmd}])
+    entry = f.split(" · ")[0]
+    assert entry.startswith("ran: pgrep")
+    assert len(entry) <= len("ran: ") + 48
+    assert entry.endswith("…"), "a clipped command must say it was clipped"
+
+
+def test_consecutive_identical_bash_commands_collapse():
+    """A retry loop is one fact, not five entries."""
+    ms = [{"kind": "bash", "command": "npm test"}] * 3 + \
+         [{"kind": "bash", "command": "npm run build"}]
+    f = footer_line(ms)
+    assert f == "ran: npm test (×3) · ran: npm run build"
+
+
+def test_nonadjacent_repeats_do_not_collapse():
+    """Only a run of the same command is one fact — A, B, A is three."""
+    ms = [{"kind": "bash", "command": "a"}, {"kind": "bash", "command": "b"},
+          {"kind": "bash", "command": "a"}]
+    assert footer_line(ms) == "ran: a · ran: b · ran: a"
+
+
 # --- self-review extension: Busy carries (cell_id, reason) since T6 — "running",
 # "pending-unconfirmed", "lock-held". None/-1 mean no real id is known; the three
 # reasons must render distinct guidance and never fabricate an id (client.py docs

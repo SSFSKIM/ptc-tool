@@ -51,6 +51,19 @@ def _clip(line: str, budget: int) -> str:
     return line if len(line) <= budget else line[:max(budget - 1, 0)] + "…"
 
 
+def _runs(mutations: list) -> list[tuple[dict, int]]:
+    """Consecutive identical bash commands are one fact — a retry loop is a count, not a
+    stack of entries. Only adjacent repeats collapse: A, B, A stays three."""
+    out: list[tuple[dict, int]] = []
+    for m in mutations:
+        if (out and m.get("kind") == "bash" and out[-1][0].get("kind") == "bash"
+                and out[-1][0].get("command") == m.get("command")):
+            out[-1] = (out[-1][0], out[-1][1] + 1)
+        else:
+            out.append((m, 1))
+    return out
+
+
 def footer_line(mutations: list, budget: int | None = None) -> str | None:
     """The mutation footer, optionally bounded to `budget` characters.
 
@@ -59,14 +72,17 @@ def footer_line(mutations: list, budget: int | None = None) -> str | None:
     "… and N more mutations" — never a partial entry, so what is shown is always true.
     """
     parts = []
-    for m in mutations:
+    for m, n in _runs(mutations):
         k = m.get("kind")
         if k == "edit":
             parts.append(f"edited {m.get('path')} (+{m.get('added', 0)}/−{m.get('removed', 0)})")
         elif k == "write":
             parts.append(f"wrote {m.get('path')}")
         elif k == "bash":
-            parts.append(f"ran: {m.get('command', '')[:80]}")
+            # A 48-char fingerprint: the footer says what the cell DID; audit.jsonl beside
+            # the kernel holds the faithful command for a reader verifying exactly what ran.
+            parts.append(f"ran: {_clip(m.get('command', ''), 48)}"
+                         + (f" (×{n})" if n > 1 else ""))
         elif k == "agent":
             parts.append(f"spawned agent \"{m.get('name', '?')}\"")
     if not parts:
