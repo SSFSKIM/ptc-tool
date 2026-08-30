@@ -33,10 +33,12 @@ next native Edit of it will demand a fresh Read — prefer one lane per file wit
   to wait for afterwards.
 - If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
   queues silently.
-- One session key is one kernel, so parallel callers contend for it: if subagents (or any
-  other caller running alongside you) also use ptc, give each its own `session="<name>"`.
-  And a `busy` that names a cell you did not submit means that cell belongs to another
-  caller — its output is theirs, never your result.
+- One session key is one kernel. Subagents you dispatch are keyed to kernels of their own
+  automatically (the plugin's PreToolUse hook names the caller to the adapter), so they
+  do not contend with you; to deliberately SHARE your kernel with one, pass your own
+  `session=` key in its prompt. Other parallel callers (another window, a bare CLI) still
+  need their own `session="<name>"`. And a `busy` that names a cell you did not submit
+  means that cell belongs to another caller — its output is theirs, never your result.
 - To be notified instead of re-calling `wait`: call `wait` once with `timeout_s` above
   the cell's expected runtime. A call still running at ~2 minutes is moved to a background
   task automatically and the cell's result arrives as a task notification when it settles —
