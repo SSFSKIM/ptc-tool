@@ -7,7 +7,12 @@ CLAUDE_CODE_SESSION_ID env -> adapter-local (degraded fallback, a fresh key
 per adapter process). Hook-runfile outranks the env rungs because
 CLAUDE_CODE_SESSION_ID is inherited at process start and can go stale across
 a `--resume`, while the run-file is rewritten fresh by the hook every
-SessionStart.
+SessionStart. On top of whichever rung answered sits one overlay: a call whose
+`tool_use_id` the PreToolUse hook filed a caller identity against was made by a
+harness subagent — those ride their parent's connection and would otherwise
+share its kernel — so the resolved key gains a `--sub-<agent_id>` suffix. Every
+missing or untrusted piece of that mapping falls back to the base key
+unchanged, and an explicit `session=` outranks the overlay entirely.
 
 This module's process-tree walk (_proc_name/_proc_parent/the walk loop in
 resolve) is a deliberate duplicate of find_claude_ancestor() in
@@ -109,8 +114,62 @@ def _written_for_this_incarnation(pid: int, rf: dict) -> bool:
     return current is None or current == recorded
 
 
+#: The two ids the PreToolUse hook and this module exchange, held to the same shape on
+#: both sides. `hooks/pre_tool_use.py` refuses to WRITE anything outside them; this is the
+#: reading half, because what arrives here comes from the request `_meta` and from a file,
+#: not from the hook's own hand: the call id is spliced into a path and the agent id into a
+#: kernel directory name. Neither is sanitized into a legal one — a value that is not
+#: already a plain name means "no mapping", which is the behavior with no hook at all.
+_TOOL_USE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _consume_tooluse(tool_use_id: str) -> dict | None:
+    """Read and DELETE the hook's mapping for one call.
+
+    The mapping describes a single tool call, so it is spent on first read whether or not
+    it parsed — a file that is garbage now is garbage on the next call too, and leaving it
+    would only grow the directory. Missing, unreadable and unparseable are all one answer.
+    """
+    if not tool_use_id or not _TOOL_USE_ID.fullmatch(tool_use_id):
+        return None
+    p = run_dir() / f"tooluse-{tool_use_id}.json"
+    try:
+        raw = p.read_text()
+    except OSError:
+        return None
+    finally:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
-            proc_name=_proc_name, proc_parent=_proc_parent) -> Resolved:
+            proc_name=_proc_name, proc_parent=_proc_parent, *,
+            tool_use_id: str | None = None) -> Resolved:
+    """The session key for one call, plus the subagent overlay described in the module
+    docstring. `explicit` outranks the overlay and does not consume the mapping: passing
+    `session=` is exactly how a subagent asks to SHARE a kernel, and the orphan it leaves
+    behind is the SessionStart hook's to collect."""
+    base = _base_resolve(explicit, ppid, env, proc_name, proc_parent)
+    if explicit or not tool_use_id:
+        return base
+    mapping = _consume_tooluse(tool_use_id) or {}
+    agent_id = mapping.get("agent_id")
+    if not agent_id or not _AGENT_ID.fullmatch(str(agent_id)):
+        return base
+    return Resolved(safe_key(f"{base.key}--sub-{agent_id}"), base.source + "+subagent",
+                    base.claude_session_id, base.cwd, base.degraded)
+
+
+def _base_resolve(explicit: str | None = None, ppid: int | None = None, env=None,
+                  proc_name=_proc_name, proc_parent=_proc_parent) -> Resolved:
     env = _os.environ if env is None else env
     if explicit:
         sid = explicit if _UUIDISH.match(explicit) else None

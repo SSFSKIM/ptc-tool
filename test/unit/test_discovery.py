@@ -242,3 +242,151 @@ def test_a_runfile_written_before_the_stamp_existed_is_still_accepted(monkeypatc
     r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
                 proc_name=lambda pid: "claude")
     assert r.source == "hook-runfile"
+
+
+# --- the subagent overlay: a caller of its own gets a kernel of its own ----------------
+#
+# Harness subagents call the server over their parent's stdio connection, so every rung
+# below resolves them to the parent's key and they contend for one kernel. The PreToolUse
+# hook leaves `tool_use_id -> agent_id` beside the run files; the adapter passes the id it
+# read from `_meta` and this overlay suffixes whatever the base rungs resolved. Fail-open
+# throughout: no mapping, or any mapping this side will not trust, is today's behavior.
+
+def _write_mapping(home, tuid, agent_id, agent_type="general-purpose"):
+    rd = home / "run"
+    rd.mkdir(parents=True, exist_ok=True)
+    p = rd / f"tooluse-{tuid}.json"
+    p.write_text(json.dumps({"agent_id": agent_id, "agent_type": agent_type,
+                             "written_at": 1}))
+    return p
+
+
+def _base_env_resolve(**kw):
+    """The env-ptc-session rung, which gives a base key that is the same on every run."""
+    return resolve(ppid=1, env={"PTC_SESSION": "base-key"},
+                   proc_name=lambda pid: "", proc_parent=lambda pid: None, **kw)
+
+
+def test_a_mapped_call_is_keyed_to_the_agent_that_made_it(monkeypatch, tmp_path):
+    """Without this, the subagent's exec landed in the parent's kernel: one namespace and
+    one cell log for two callers, each seeing the other's cells. The mapping is CONSUMED —
+    it describes one call, and the id it is filed under is reused by nobody."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    mapping = _write_mapping(tmp_path, "toolu_1", "agent_7")
+
+    r = _base_env_resolve(tool_use_id="toolu_1")
+
+    assert r.key == "base-key--sub-agent_7"
+    assert r.source == "env-ptc-session+subagent"
+    assert r.claude_session_id is None and not r.degraded
+    assert not mapping.exists(), "the mapping outlived the call it described"
+
+
+def test_an_unmapped_call_resolves_exactly_as_it_did_before(monkeypatch, tmp_path):
+    """The main thread writes no mapping, so its key must be byte-identical to the one the
+    same call produced before the overlay existed — including when no id is passed at all."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    plain = _base_env_resolve()
+    unmapped = _base_env_resolve(tool_use_id="toolu_never_written")
+
+    assert plain.key == unmapped.key == "base-key"
+    assert plain.source == unmapped.source == "env-ptc-session"
+
+
+def test_an_explicit_session_outranks_the_overlay_and_leaves_the_mapping(monkeypatch,
+                                                                        tmp_path):
+    """`session=` is how a subagent DELIBERATELY shares its parent's kernel, so the overlay
+    must not undo it. The mapping stays behind untouched — expiry is the GC's job, and this
+    path has no business spending a mapping it did not use."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    mapping = _write_mapping(tmp_path, "toolu_1", "agent_7")
+
+    r = resolve(explicit="shared-key", env={}, tool_use_id="toolu_1")
+
+    assert r.key == "shared-key" and r.source == "explicit"
+    assert mapping.exists()
+
+
+def test_two_agents_on_one_session_get_two_kernels_under_one_prefix(monkeypatch, tmp_path):
+    """The whole point: sibling subagents must not collide with each other either, while
+    the shared prefix keeps their kernels legible as belonging to this session."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_mapping(tmp_path, "toolu_1", "agent_7")
+    _write_mapping(tmp_path, "toolu_2", "agent_8")
+
+    a = _base_env_resolve(tool_use_id="toolu_1")
+    b = _base_env_resolve(tool_use_id="toolu_2")
+
+    assert a.key != b.key
+    assert a.key.startswith("base-key--sub-") and b.key.startswith("base-key--sub-")
+
+
+def test_a_tool_use_id_that_is_not_a_name_reads_nothing(monkeypatch, tmp_path):
+    """The id arrives from `_meta` and is spliced into a filename. A traversal attempt is
+    not sanitized into a lookup — it resolves to the base key and touches nothing."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    decoy = tmp_path / "run" / "evil.json"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_text("{}")
+    keep = _write_mapping(tmp_path, "toolu_1", "agent_7")
+
+    for hostile in ("../evil", "run/evil", "toolu 1", "t" * 129, ""):
+        r = _base_env_resolve(tool_use_id=hostile)
+        assert r.key == "base-key" and r.source == "env-ptc-session", hostile
+
+    assert decoy.exists() and keep.exists()
+
+
+def test_a_mapping_naming_an_unusable_agent_is_dropped_not_sanitized(monkeypatch, tmp_path):
+    """The agent id becomes part of a kernel DIRECTORY name. A value this side will not take
+    at face value falls back to the base key rather than being mapped into some near-miss
+    name — but the file is still consumed, because it is spent either way."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    for tuid, agent in (("toolu_1", "a/../b"), ("toolu_2", "agent 8"), ("toolu_3", "a" * 65),
+                        ("toolu_4", ""), ("toolu_5", None)):
+        mapping = _write_mapping(tmp_path, tuid, agent)
+        r = _base_env_resolve(tool_use_id=tuid)
+        assert r.key == "base-key" and r.source == "env-ptc-session", agent
+        assert not mapping.exists(), agent
+
+
+def test_a_garbled_mapping_is_consumed_and_ignored(monkeypatch, tmp_path):
+    """A file that does not parse is garbage either way: the call keys as it would with no
+    mapping at all, and the file does not stay around to be re-read on the next call."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    rd = tmp_path / "run"
+    rd.mkdir(parents=True)
+    p = rd / "tooluse-toolu_1.json"
+    p.write_text("{not json")
+
+    r = _base_env_resolve(tool_use_id="toolu_1")
+
+    assert r.key == "base-key" and r.source == "env-ptc-session"
+    assert not p.exists()
+
+
+def test_a_degraded_base_still_carries_the_suffix_and_stays_degraded(monkeypatch, tmp_path):
+    """The overlay sits on top of whatever rung answered, adapter-local included — that is
+    the rung a caller with no session id of its own lands on, and it needs the separation
+    most. `degraded` is the base's fact about how the SESSION was named; a suffix does not
+    repair it."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_mapping(tmp_path, "toolu_1", "agent_7")
+
+    r = resolve(ppid=1, env={}, proc_name=lambda pid: "", proc_parent=lambda pid: None,
+                tool_use_id="toolu_1")
+
+    assert r.degraded and r.source == "adapter-local+subagent"
+    assert r.key.startswith(f"adapter-{os.getpid()}-") and r.key.endswith("--sub-agent_7")
+
+
+def test_the_subagent_key_is_a_legal_kernel_directory_name(monkeypatch, tmp_path):
+    """Everything downstream (kernel_dir, the recursive kill on restart) requires a key that
+    is a single safe name, and the suffix is built from a host-supplied id."""
+    from ptc.paths import kernel_dir
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_mapping(tmp_path, "toolu_1", "agent_7")
+    r = _base_env_resolve(tool_use_id="toolu_1")
+
+    assert safe_key(r.key) == r.key and kernel_dir(r.key).name == r.key
