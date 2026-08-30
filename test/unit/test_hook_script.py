@@ -18,6 +18,7 @@ from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parent.parent.parent        # the package IS the plugin root
 HOOK = PLUGIN / "hooks" / "session_start.py"
+PRE_HOOK = PLUGIN / "hooks" / "pre_tool_use.py"
 
 
 def _load_hook(monkeypatch):
@@ -219,3 +220,100 @@ def test_the_runfile_carries_an_identity_the_package_side_reads_the_same_way(tmp
     r = resolve(ppid=os.getpid(), env={"PTC_SESSION": "fallback-key"},
                 proc_name=lambda pid: "claude")
     assert r.source == "hook-runfile" and r.cwd == "/w5"
+
+
+# --- the PreToolUse hook: naming the CALLER of an MCP call -----------------------------
+#
+# A harness subagent's tool calls arrive over the same stdio connection as its parent's, so
+# `_meta` alone cannot tell the two apart and both resolve to one kernel. The hook sees what
+# the server cannot — `agent_id` — and leaves it beside the call's `tool_use_id` for the
+# adapter to pick up. Same discipline as the SessionStart hook: stdlib-only, always rc 0.
+
+def _run_pre_hook(home, payload, *, text=True):
+    return subprocess.run(["python3", str(PRE_HOOK)], input=payload, capture_output=True,
+                          text=text, env={**os.environ, "PTC_HOME": str(home)}, timeout=20)
+
+
+def test_pre_hook_records_the_subagent_behind_a_tool_call(tmp_path):
+    """The mapping the adapter reads: the caller's agent identity, filed under the call's
+    own tool_use_id. Owner-only, like every other PTC state file — this names who is calling
+    what, and under the common 022 umask the default would be world-readable."""
+    r = _run_pre_hook(tmp_path, json.dumps({
+        "tool_use_id": "toolu_abc123", "agent_id": "agent_7", "agent_type": "general-purpose"}))
+    assert r.returncode == 0, r.stderr
+
+    f = tmp_path / "run" / "tooluse-toolu_abc123.json"
+    written = json.loads(f.read_text())
+    assert written["agent_id"] == "agent_7"
+    assert written["agent_type"] == "general-purpose"
+    assert isinstance(written["written_at"], float)
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert stat.S_IMODE(f.parent.stat().st_mode) & 0o077 == 0
+
+
+def test_pre_hook_writes_nothing_for_a_main_thread_call(tmp_path):
+    """The main thread's calls carry no agent_id and are the common path: no mapping means
+    the adapter resolves exactly as it does today, and the hook costs zero I/O to say so."""
+    for payload in ({"tool_use_id": "toolu_abc123"},
+                    {"tool_use_id": "toolu_abc123", "agent_id": None},
+                    {"tool_use_id": "toolu_abc123", "agent_id": ""}):
+        r = _run_pre_hook(tmp_path, json.dumps(payload))
+        assert r.returncode == 0, r.stderr
+    assert not list(tmp_path.rglob("tooluse-*.json"))
+
+
+def test_pre_hook_refuses_ids_that_are_not_names(tmp_path):
+    """These ids come from the host, and they become a path component on this side and a
+    kernel directory name on the other. An id that is not a plain name is not sanitized into
+    one — nothing is written at all, and the call keys the way it keys today."""
+    for tuid in ("../evil", "toolu/abc", "toolu abc", "", "t" * 129):
+        r = _run_pre_hook(tmp_path, json.dumps({"tool_use_id": tuid, "agent_id": "agent_7"}))
+        assert r.returncode == 0, (tuid, r.stderr)
+    for agent in ("a/../b", "agent 7", "a" * 65):
+        r = _run_pre_hook(tmp_path, json.dumps({"tool_use_id": "toolu_ok", "agent_id": agent}))
+        assert r.returncode == 0, (agent, r.stderr)
+    assert not list(tmp_path.rglob("*.json")), "a dirty id was written somewhere"
+    assert not (tmp_path.parent / "evil.json").exists()
+
+
+def test_pre_hook_never_fails_a_tool_call(tmp_path):
+    """PreToolUse can DENY the call it fires for, so this hook's rc is load-bearing: any
+    stdin it cannot make sense of must still exit 0 and write nothing."""
+    for payload in (b"", b"not json", b"{}", b"5", b"\xff\xfe not utf-8"):
+        r = _run_pre_hook(tmp_path, payload, text=False)
+        assert r.returncode == 0, (payload, r.stderr)
+    assert not list(tmp_path.rglob("tooluse-*.json"))
+
+
+def test_pre_hook_survives_unwritable_ptc_home(tmp_path):
+    """PTC_HOME is a file, so run/ cannot be made — the tool call still goes through."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("")
+    r = _run_pre_hook(blocked, json.dumps({"tool_use_id": "t1", "agent_id": "a1"}))
+    assert r.returncode == 0, r.stderr
+
+
+def test_pre_hook_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
+    """The third copy of the PTC_HOME rule (launcher, SessionStart hook, this one): with
+    `PTC_HOME=~/.ptc-alt` a literal `~` directory means the adapter reads the expanded home
+    and finds no mapping — the correlation silently never happens."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    r = subprocess.run(["python3", str(PRE_HOOK)],
+                       input=json.dumps({"tool_use_id": "t2", "agent_id": "a2"}),
+                       capture_output=True, text=True, timeout=20,
+                       env={**os.environ, "HOME": str(tmp_path), "PTC_HOME": "~/.ptc-alt"})
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "~").exists(), "a literal '~' directory was created"
+    written = json.loads((tmp_path / ".ptc-alt" / "run" / "tooluse-t2.json").read_text())
+    assert written["agent_id"] == "a2"
+
+
+def test_pre_hook_is_stdlib_only():
+    """It runs on every ptc tool call, before ~/.ptc/venv is guaranteed to exist."""
+    tree = ast.parse(PRE_HOOK.read_text())
+    for node in ast.walk(tree):
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+        for name in names:
+            assert name.split(".")[0] in sys.stdlib_module_names, name

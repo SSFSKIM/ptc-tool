@@ -13,6 +13,7 @@ for why that containment is the load-bearing fact and not a layout preference.
 import ast
 import importlib.util
 import json
+import re
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -128,6 +129,28 @@ def test_hooks_manifest_registers_session_start():
     assert entries[0]["type"] == "command"
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py" in entries[0]["command"]
     assert (PLUGIN / "hooks" / "session_start.py").exists()
+
+
+def test_hooks_manifest_registers_pre_tool_use_for_both_tool_name_forms():
+    """The PreToolUse hook is the only thing that can name a subagent caller to the adapter,
+    and a matcher that misses the installed tool names simply never fires — the correlation
+    is then absent with no error anywhere. The same server answers to two names: plugin
+    installs prefix it (`mcp__plugin_ptc_ptc__exec`) and a hand-added server does not
+    (`mcp__ptc__wait`), so both have to match the matcher actually shipped in the manifest.
+    """
+    cfg = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
+    entry = cfg["hooks"]["PreToolUse"][0]
+    hook = entry["hooks"][0]
+    assert hook["type"] == "command"
+    assert "${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py" in hook["command"]
+    assert (PLUGIN / "hooks" / "pre_tool_use.py").exists()
+
+    matcher = re.compile(entry["matcher"])
+    for name in ("mcp__plugin_ptc_ptc__exec", "mcp__ptc__wait", "mcp__ptc__interrupt",
+                 "mcp__plugin_ptc_ptc__restart", "mcp__ptc__kernels"):
+        assert matcher.fullmatch(name), f"{name} would never fire the hook"
+    for name in ("mcp__plugin_ptc_ptc__execute", "mcp__other__exec", "Bash"):
+        assert not matcher.fullmatch(name), f"{name} must not fire the hook"
 
 
 # --- r7 finding 4: PTC_HOME is expanded here the way the package expands it -----------
