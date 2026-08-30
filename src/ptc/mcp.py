@@ -117,6 +117,18 @@ def _cfg(timeout_s: float | None, max_output_chars: int | None) -> Config:
 async def exec_tool(code: str, session: str | None = None,
                     timeout_s: float | None = None,
                     max_output_chars: int | None = None) -> list:
+    """Run Python in this session's persistent IPython kernel. Variables, imports, and
+    handles survive across calls, turns, and compaction — assign large results to variables
+    and print compact summaries; output truncates with a path to the full log. Pre-bound:
+    read, write, edit, bash, agent, llm, web_fetch, web_search, history, workflow. The
+    async ones (bash, agent.*, llm, web_*) are coroutines: without `await` a call silently
+    returns a coroutine object instead of running. In-kernel bash() takes timeout= in
+    SECONDS (this tool takes timeout_s=) and accepts an argv list — bash(["cmd", arg]) —
+    which skips the shell so quoting layers never stack. One session key is one kernel:
+    parallel callers (subagents included) must each pass their own session="<name>" or
+    they contend for it and see each other's cells. A `running` yield means use the wait
+    tool; `busy` means another cell is still running — nothing queues. The ptc skill
+    documents the full agent/llm/web/workflow API."""
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
     info = await asyncio.to_thread(ensure_kernel, r.key, cwd=r.cwd,
@@ -135,6 +147,13 @@ async def wait_tool(cell_id: int, session: str | None = None,
                     timeout_s: float | None = None,
                     max_output_chars: int | None = None,
                     since: int = -1, until: str | None = None) -> list:
+    """Collect a running cell's result, or follow it until it settles. since=-1 (default)
+    resumes after what this caller was last served; an explicit byte offset re-reads from
+    there. Set timeout_s above the cell's expected runtime: a call still in flight at ~2
+    minutes is auto-backgrounded by the host and the full result arrives as a task
+    notification — one long wait beats polling. until="<python regex>" returns EARLY the
+    moment new output first matches (the match rides back in `matched`, capped at 512
+    chars; the cell keeps running) — a cell that completes always supersedes a match."""
     r = await asyncio.to_thread(_resolve, session)
     cfg = _cfg(timeout_s, max_output_chars)
     # A pattern that will not compile raises out of here, and the MCP layer renders a tool
@@ -168,6 +187,8 @@ def _interrupt_and_settle(key: str):
 
 
 async def interrupt_tool(session: str | None = None) -> list:
+    """Stop the running cell and return that cell's own output tail — after this there is
+    nothing left to wait for. A no-op (with a note) when nothing is running."""
     r = await asyncio.to_thread(_resolve, session)
     ack = f"[interrupt sent to kernel {r.key}]"
     outcome = await asyncio.to_thread(_interrupt_and_settle, r.key)
@@ -182,6 +203,8 @@ async def interrupt_tool(session: str | None = None) -> list:
 
 
 async def restart_tool(session: str | None = None) -> list:
+    """Kill and respawn the kernel: the Python namespace (variables, imports, handles) is
+    lost. Child agent sessions survive on disk — agent.list() then agent.resume(sid)."""
     r = await asyncio.to_thread(_resolve, session)
     # The stored metadata first, exactly as the CLI restart path does it. Only the
     # hook-runfile rung resolves a cwd at all: an explicit `session=`, either env rung and
@@ -201,6 +224,8 @@ async def restart_tool(session: str | None = None) -> list:
 
 
 async def kernels_tool() -> list:
+    """List every live kernel: key, pid, alive, depth, last-used, cwd — what exists before
+    choosing a session= value."""
     rows = await asyncio.to_thread(list_kernels)
     import datetime
     def _ts(v):

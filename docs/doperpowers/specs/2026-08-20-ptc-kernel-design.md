@@ -1304,6 +1304,22 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   controller review before codex saw it.
   Date/Author: 2026-08-30 / Claude (feature requested by owner)
 
+- Decision: doctrine is delivered over THREE channels by delivery guarantee, and the
+  call-time contracts moved into the tool descriptions. Server `instructions` stays the
+  always-on discovery digest (in the system prompt whenever the server connects); each
+  tool's `description` (the SDK ships `fn.__doc__` — previously EMPTY for all five tools)
+  now carries what a caller must know at call time: the missed-`await` coroutine trap, the
+  in-kernel `timeout=` vs tool `timeout_s=` naming split, per-caller `session=` isolation,
+  `since`/`until` semantics, auto-background behavior; the skill remains the deep doctrine
+  (agent/llm/web/workflow API, worked examples), read on demand. Rejected: packaging the
+  whole skill into the MCP description — a context tax on every session including ones that
+  never touch ptc, duplicating API detail that only matters once someone is writing kernel
+  code (at which point the skill and the in-kernel docstrings are available); and rejected
+  leaving things as they were — subagents never invoke the skill, so tool descriptions are
+  the only channel guaranteed to reach every caller before its first call (for deferred
+  tools they arrive via ToolSearch immediately before use — just-in-time by construction).
+  Date/Author: 2026-08-31 / Claude (question raised by owner from live-usage feedback)
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -1879,6 +1895,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-08-31 (doctrine channels, v0.1.4): live feedback showed agents skipping the skill; investigation found all five MCP tool descriptions shipped empty (`fn.__doc__` is the description; none had docstrings). Call-time contracts (await trap, timeout naming, session isolation, since/until, auto-background) now ride the tool descriptions; instructions digest and skill unchanged. Decision Log entry added; test/unit/test_mcp_descriptions.py pins the contract tokens.
 
 - 2026-08-23 (r16, campaign close): round 16 confirmed all three findings (1 P1). Confirmed-dead kernels reap their recorded process group under the existence gate (1efe150061); interrupt binds to the cell captured at entry (647a30bd7b); kernel-lifetime config travels with the kernel — Decision Log entry (3dc369e16b). Extended campaign r10–r16 declared converged; addendum at the end of Outcomes & Retrospective.
 
