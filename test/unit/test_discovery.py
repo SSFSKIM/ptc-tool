@@ -252,18 +252,18 @@ def test_a_runfile_written_before_the_stamp_existed_is_still_accepted(monkeypatc
 # read from `_meta` and this overlay suffixes whatever the base rungs resolved. Fail-open
 # throughout: no mapping, or any mapping this side will not trust, is today's behavior.
 
-def _write_mapping(home, tuid, agent_id, agent_type="general-purpose"):
+def _write_mapping(home, tuid, agent_id, agent_type="general-purpose", **extra):
     rd = home / "run"
     rd.mkdir(parents=True, exist_ok=True)
     p = rd / f"tooluse-{tuid}.json"
     p.write_text(json.dumps({"agent_id": agent_id, "agent_type": agent_type,
-                             "written_at": 1}))
+                             "written_at": 1, **extra}))
     return p
 
 
-def _base_env_resolve(**kw):
+def _base_env_resolve(env=None, **kw):
     """The env-ptc-session rung, which gives a base key that is the same on every run."""
-    return resolve(ppid=1, env={"PTC_SESSION": "base-key"},
+    return resolve(ppid=1, env=env or {"PTC_SESSION": "base-key"},
                    proc_name=lambda pid: "", proc_parent=lambda pid: None, **kw)
 
 
@@ -378,6 +378,33 @@ def test_a_degraded_base_still_carries_the_suffix_and_stays_degraded(monkeypatch
 
     assert r.degraded and r.source == "adapter-local+subagent"
     assert r.key.startswith(f"adapter-{os.getpid()}-") and r.key.endswith("--sub-agent_7")
+
+
+def test_a_subagent_kernel_is_spawned_in_the_subagents_own_directory(monkeypatch, tmp_path):
+    """A subagent can be working somewhere else entirely — worktree isolation gives it its
+    own checkout — and the hook records the directory the call was made from. Without it the
+    kernel starts in the PARENT's cwd and every relative path the subagent writes lands in
+    the wrong tree."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    _write_mapping(tmp_path, "toolu_1", "agent_7", cwd="/work/tree-a")
+
+    r = _base_env_resolve(env={"PTC_SESSION": "base-key", "PTC_CWD": "/parent/dir"},
+                          tool_use_id="toolu_1")
+
+    assert r.cwd == "/work/tree-a"
+
+
+def test_a_mapping_with_no_usable_cwd_keeps_the_bases(monkeypatch, tmp_path):
+    """The cwd is one more thing the hook may not have had, and it comes off a file. Absent
+    or not an absolute path, the base rung's answer stands — the same fail-open the agent id
+    gets, and the behavior of every caller that shares its parent's directory."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    env = {"PTC_SESSION": "base-key", "PTC_CWD": "/parent/dir"}
+    for tuid, cwd in (("toolu_1", None), ("toolu_2", "relative/dir"), ("toolu_3", 17),
+                      ("toolu_4", "")):
+        _write_mapping(tmp_path, tuid, "agent_7", **({} if cwd is None else {"cwd": cwd}))
+        r = _base_env_resolve(env=env, tool_use_id=tuid)
+        assert r.cwd == "/parent/dir", cwd
 
 
 def test_the_subagent_key_is_a_legal_kernel_directory_name(monkeypatch, tmp_path):

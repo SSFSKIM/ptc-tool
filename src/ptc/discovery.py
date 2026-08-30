@@ -10,9 +10,10 @@ a `--resume`, while the run-file is rewritten fresh by the hook every
 SessionStart. On top of whichever rung answered sits one overlay: a call whose
 `tool_use_id` the PreToolUse hook filed a caller identity against was made by a
 harness subagent — those ride their parent's connection and would otherwise
-share its kernel — so the resolved key gains a `--sub-<agent_id>` suffix. Every
-missing or untrusted piece of that mapping falls back to the base key
-unchanged, and an explicit `session=` outranks the overlay entirely.
+share its kernel — so the resolved key gains a `--sub-<agent_id>` suffix, and
+the kernel is spawned in the caller's own directory when the mapping names one.
+Every missing or untrusted piece of that mapping falls back to what the base
+rung answered, and an explicit `session=` outranks the overlay entirely.
 
 This module's process-tree walk (_proc_name/_proc_parent/the walk loop in
 resolve) is a deliberate duplicate of find_claude_ancestor() in
@@ -164,8 +165,12 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
     agent_id = mapping.get("agent_id")
     if not agent_id or not _AGENT_ID.fullmatch(str(agent_id)):
         return base
+    # The caller's own directory when the hook recorded one it could spawn in — a subagent
+    # under worktree isolation works in a checkout the parent's cwd knows nothing about.
+    sub_cwd = mapping.get("cwd")
+    cwd = sub_cwd if isinstance(sub_cwd, str) and _os.path.isabs(sub_cwd) else base.cwd
     return Resolved(safe_key(f"{base.key}--sub-{agent_id}"), base.source + "+subagent",
-                    base.claude_session_id, base.cwd, base.degraded)
+                    base.claude_session_id, cwd, base.degraded)
 
 
 def _base_resolve(explicit: str | None = None, ppid: int | None = None, env=None,

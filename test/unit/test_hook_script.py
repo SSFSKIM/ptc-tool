@@ -252,6 +252,25 @@ def test_pre_hook_records_the_subagent_behind_a_tool_call(tmp_path):
     assert stat.S_IMODE(f.parent.stat().st_mode) & 0o077 == 0
 
 
+def test_pre_hook_records_the_directory_the_call_was_made_from(tmp_path):
+    """A subagent under worktree isolation works in a checkout of its own, and this is the
+    only place that directory is visible — the adapter spawns the subagent's kernel there
+    instead of in the parent's cwd. A cwd that is not an absolute path is not a directory
+    anyone can spawn in, so it is omitted and the parent's stands."""
+    r = _run_pre_hook(tmp_path, json.dumps({
+        "tool_use_id": "toolu_cwd", "agent_id": "agent_7", "cwd": "/work/tree-a"}))
+    assert r.returncode == 0, r.stderr
+    written = json.loads((tmp_path / "run" / "tooluse-toolu_cwd.json").read_text())
+    assert written["cwd"] == "/work/tree-a"
+
+    for bad in ("relative/dir", "", 17, None):
+        r = _run_pre_hook(tmp_path, json.dumps({
+            "tool_use_id": "toolu_bad", "agent_id": "agent_7", "cwd": bad}))
+        assert r.returncode == 0, (bad, r.stderr)
+        written = json.loads((tmp_path / "run" / "tooluse-toolu_bad.json").read_text())
+        assert "cwd" not in written, bad
+
+
 def test_pre_hook_writes_nothing_for_a_main_thread_call(tmp_path):
     """The main thread's calls carry no agent_id and are the common path: no mapping means
     the adapter resolves exactly as it does today, and the hook costs zero I/O to say so."""

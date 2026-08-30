@@ -53,8 +53,16 @@ def _record() -> int:
     except OSError:
         pass
     tmp = rd / f".tooluse-{tuid}.tmp"
-    payload = json.dumps({"agent_id": agent, "agent_type": data.get("agent_type"),
-                          "written_at": time.time()})
+    record = {"agent_id": agent, "agent_type": data.get("agent_type"),
+              "written_at": time.time()}
+    # A subagent can be working in a directory of its own (worktree isolation), and this is
+    # the only place the adapter can learn it — otherwise its kernel spawns in the parent's
+    # cwd. Unlike the ids above this is a JSON value, not a path component, so the only
+    # question is whether it names a directory anything could be spawned in.
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        record["cwd"] = cwd
+    payload = json.dumps(record)
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write(payload)
     tmp.replace(rd / f"tooluse-{tuid}.json")
