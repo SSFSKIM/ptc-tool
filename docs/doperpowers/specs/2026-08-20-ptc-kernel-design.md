@@ -1349,6 +1349,28 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   tracker as design candidates, not silent scope.
   Date/Author: 2026-08-31 / Claude (adjudicating the second forwarded live-usage report)
 
+- Decision: subagent callers are auto-keyed to kernels of their own (issue #1 item 2),
+  via hook-correlated identity: the plugin's PreToolUse hook files
+  `run/tooluse-<tool_use_id>.json` naming the caller's `agent_id` (and cwd), and the
+  adapter reads the same id back out of the request `_meta`'s `claudecode/toolUseId`,
+  consuming the mapping and suffixing the resolved key `--sub-<agent_id>`. Default ON;
+  explicit `session=` outranks the overlay (deliberate sharing) and does not consume;
+  every missing piece fails open to today's behavior; orphaned mappings are swept by
+  SessionStart after an hour. A subagent's kernel carries `claude_session_id=None` — a
+  sidechain has no resumable transcript id, and inheriting the parent's silently routed
+  `history()`/`agent.fork()` to the parent's conversation (review finding, adopted over
+  the design's original "acceptable" call). Rejected: adapter-only identity (measured:
+  `_meta` carries none; docs concur), transcript scraping (undocumented format on the
+  hot path plus a write-timing race), SubagentStart env injection (one server process —
+  per-call env cannot exist), doctrine-only (three live incidents). Review: one codex
+  round found 3 real defects, headlined by the correlation being INERT on live calls —
+  the brief's own helper snippet read `_meta` as a pydantic model when the SDK ships a
+  TypedDict, and both test fakes had faithfully copied the wrong shape; the corrected
+  fakes reproduced the exact incident (parent reading the subagent's namespace) red
+  before the fix. Known seam, tracker-logged: the CLI resolves without the overlay, so a
+  subagent must not mix MCP exec with CLI wait.
+  Date/Author: 2026-08-31 / Claude (design approved by owner; v0.2.0)
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -1939,6 +1961,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-08-31 (subagent auto-keying, v0.2.0): item 2 shipped — PreToolUse hook + `_meta` toolUseId correlation keys each harness subagent to its own `--sub-<agent_id>` kernel, default on, fail-open, `session=` now the deliberate-sharing switch. Decision Log entry carries the design, the rejected alternatives, the codex round (3 confirmed findings, headlined by the TypedDict inertness bug the brief itself injected), and the CLI-wait seam left on the tracker. 29 new tests; suite 516 passed.
 
 - 2026-08-31 (item-2 design spike): measured how subagent MCP calls reach the server (probe server logging `_meta` + a PreToolUse probe logging hook input, headless session with a dispatched subagent). Surprises & Discoveries gains the finding that grounds the auto-keying design: hooks see `agent_id`/`tool_use_id` before the server sees the matching `claudecode/toolUseId`. Design presented to owner; not yet implemented.
 
