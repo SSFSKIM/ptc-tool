@@ -48,7 +48,9 @@ next native Edit of it will demand a fresh Read — prefer one lane per file wit
   moment new output first matches that regex, so the notification carries the matching tail.
   (Host without MCP auto-backgrounding: run the blocking CLI wait —
   `PTC_YIELD_S=3600 ptc wait <cell_id>` — in a background Bash instead; read its output,
-  not just the exit code, since a `running` yield also exits 0.)
+  not just the exit code, since a `running` yield also exits 0. Subagents: never this
+  fallback — the CLI resolves to the parent's kernel, not your auto-keyed one; re-arm
+  the MCP wait instead.)
 - Run a project's code in the project's own environment (its venv, its npm scripts) via
   `bash(...)`; never install project dependencies into the kernel.
 
