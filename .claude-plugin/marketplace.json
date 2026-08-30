@@ -9,7 +9,7 @@
     {
       "name": "ptc",
       "description": "Programmatic Tool Calling \u2014 a persistent per-session IPython kernel with Claude-Code-equivalent tools as Python functions",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "source": "./",
       "author": {
         "name": "SSFSKIM",

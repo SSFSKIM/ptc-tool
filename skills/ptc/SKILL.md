@@ -18,8 +18,10 @@ look like another session's namespace, pass `session="${CLAUDE_SESSION_ID}"` exp
 
 Use the kernel when the work is programmatic: reading and filtering many files, computing
 over data, or iterating with state across steps. Use native tools instead for: a single
-known edit (native Edit), reading images/PDFs/notebooks (native Read), and anything the
-user should see and approve step by step.
+known edit (native Edit), reading PDFs/notebooks (native Read), and anything the
+user should see and approve step by step. The harness also only tracks files it touches
+natively: a file you rewrite through the kernel leaves the harness's copy stale, so the
+next native Edit of it will demand a fresh Read — prefer one lane per file within a task.
 
 ## Working discipline
 
@@ -65,6 +67,14 @@ layers would stack — a Python string interpolated into a shell command is pars
 `%%bash` cells also work: `%%bash` must be the FIRST line of the cell; each `%%bash` cell
 is a throw-away subshell (its `cd`/`export` do not persist) — use `%cd` and
 `os.environ["VAR"] = ...` for state that should carry to later cells.
+
+To SEE an image with your own eyes — a screenshot, a capture, a plot — publish it:
+
+    from IPython.display import Image, display
+    display(Image("captures/cal-01.png"))   # up to two images ride back with the result
+
+The pixels arrive in your perception like a native Read of the file. PDFs and notebooks
+still need native Read.
 
 ## Agents
 
@@ -195,7 +205,10 @@ it, so it is a deliberate one-shot, never a loop body.
   wrappers such as `call_skill(...)` or `run_subagent(...)`.
 - The kernel is your notebook, not the project's runtime.
 - A kernel restart loses variables and handles, but not agent sessions: the on-disk
-  registry survives, so `agent.list()` then `agent.resume(sid)` reopens a child.
+  registry survives, so `agent.list()` then `agent.resume(sid)` reopens a child. Expiry
+  does the same silently (idle TTL, a plugin upgrade rebuilding the venv), and a live
+  subprocess handle is unrecoverable — when a cell starts a process you will babysit
+  across turns, write its pid and log path to disk in that same cell.
 
 ## Worked examples
 

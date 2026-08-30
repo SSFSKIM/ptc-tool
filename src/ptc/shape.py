@@ -200,6 +200,10 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
                              trailing_budget(cap))
     res_line = (_clip(f"→ result: {rec.result_repr}", trailing_budget(cap))
                 if rec.result_repr is not None else None)
+    if rec.result_repr is not None and rec.result_repr.startswith("<coroutine object "):
+        # `bash(...)` without `await` settles `ok` with exactly this repr and nothing else
+        # to distinguish it from a successful quiet cell — the silent form of the trap.
+        res_line += "\n[an unawaited coroutine: nothing ran — re-run the call with await]"
     trailing = sum(len(x) for x in (f, err_line, res_line) if x)
     body = _truncate(outcome.output, cap - trailing, full_log)
     if body:

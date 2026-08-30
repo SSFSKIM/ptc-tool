@@ -1332,6 +1332,23 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   token-to-information ratio in the output format.
   Date/Author: 2026-08-31 / Claude (adjudicating forwarded live-usage feedback)
 
+- Decision: triage of the second live-usage report ("why PTC cannot fully replace native
+  tools"). Shipped: the unawaited-coroutine render note (second occurrence across two
+  sessions — `<coroutine object …>` repr now gets a one-line name-and-remedy); three
+  SKILL.md doctrine lines (mixed-lane file-ledger hazard, `display(Image(...))` for
+  perception, durable pid/log discipline against kernel expiry). Corrected as factually
+  off: "PTC cannot show me pixels" (the display shim + ImageContent path has done exactly
+  that since T8 — a doctrine gap, not a capability gap) and "kernel edit lacks uniqueness
+  checks" (files.py ships Claude-Code-exact edit semantics); "all pull, no wake-on-done"
+  is superseded on hosts with MCP auto-backgrounding, measured live on this one. Accepted
+  as structural and NOT actioned from the plugin: the permission/hook boundary (the
+  audit-instead-of-guard-rails decision above), harness file-ledger integration, user-side
+  diff rendering, TaskStop/ListAgents integration for kernel children — harness-side
+  seams, honestly named in the skill's when-NOT-to-use boundary. Kernel survivability
+  across plugin upgrades and item-2 auto-keying (third evidence point) stay on the
+  tracker as design candidates, not silent scope.
+  Date/Author: 2026-08-31 / Claude (adjudicating the second forwarded live-usage report)
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -1907,6 +1924,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-08-31 (second feedback triage, v0.1.7): unawaited-coroutine render note shipped (test-pinned in test_shape.py); SKILL.md gains the file-ledger hazard, display-to-perceive, and durable-pid lines; Decision Log records the full triage including the two factually-off claims and the structural items left to the harness seam.
 
 - 2026-08-31 (footer fingerprint, v0.1.6): live feedback charged the `ran:` footer with duplication; adjudicated against the audit-visibility design intent — kept always-on, per-entry clip 80→48 chars, consecutive identical commands collapse to `(×N)`, durable audit.jsonl command record 200→2000 chars. Decision Log entry records the two rejected recommendations.
 

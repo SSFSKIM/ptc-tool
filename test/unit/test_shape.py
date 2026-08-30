@@ -119,6 +119,21 @@ def test_nonadjacent_repeats_do_not_collapse():
     assert footer_line(ms) == "ran: a · ran: b · ran: a"
 
 
+def test_an_unawaited_coroutine_result_is_named():
+    """`bash(...)` without `await` settles `ok` with a coroutine repr and no output — the
+    silent form of the most-hit live trap (observed in two separate sessions). Nothing
+    else in the response distinguishes it from a successful quiet cell, so the render
+    says what happened and what to do."""
+    out = Completed(3, _rec(result_repr="<coroutine object bash at 0x104abc>"), "")
+    r = render(out, "k", Config.from_env(env={}))
+    assert "unawaited coroutine" in r.text and "await" in r.text
+
+
+def test_a_normal_repr_draws_no_coroutine_note():
+    out = Completed(3, _rec(result_repr="'<coroutine-like string, not a coroutine>'"), "")
+    assert "unawaited" not in render(out, "k", Config.from_env(env={})).text
+
+
 # --- self-review extension: Busy carries (cell_id, reason) since T6 — "running",
 # "pending-unconfirmed", "lock-held". None/-1 mean no real id is known; the three
 # reasons must render distinct guidance and never fabricate an id (client.py docs
