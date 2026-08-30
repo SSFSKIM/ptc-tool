@@ -163,8 +163,9 @@ searching.
 `history(session=None, cwd=None)` defaults to this kernel's own Claude session id (from
 `meta.json`); pass `session=` explicitly for any other session id, and `cwd=` only if that
 session ran somewhere this kernel's `meta.json` does not name. Raises `RuntimeError` if no
-session id is known (an alias-keyed kernel) or `FileNotFoundError` if no transcript is
-found on disk. Also available: `t.text()`, `t.path`, `t.messages` (the raw JSONL rows).
+session id is known (an alias-keyed kernel, or a subagent's auto-keyed kernel — a sidechain
+has no transcript of its own here; pass `session=` for a real one) or `FileNotFoundError`
+if no transcript is found on disk. Also available: `t.text()`, `t.path`, `t.messages` (the raw JSONL rows).
 Claude transcripts only — on a `provider="codex"` handle `history()` raises
 `NotImplementedError` (those turns are a codex rollout, a store this build does not read);
 use `h.messages()` there.

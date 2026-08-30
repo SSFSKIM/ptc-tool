@@ -169,8 +169,11 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
     # under worktree isolation works in a checkout the parent's cwd knows nothing about.
     sub_cwd = mapping.get("cwd")
     cwd = sub_cwd if isinstance(sub_cwd, str) and _os.path.isabs(sub_cwd) else base.cwd
+    # No session id: the parent's sent this kernel's `history()` and `agent.fork()` to the
+    # PARENT's conversation, and a subagent's own is a sidechain with no resumable id to put
+    # here instead — None routes them to the documented alias-keyed error.
     return Resolved(safe_key(f"{base.key}--sub-{agent_id}"), base.source + "+subagent",
-                    base.claude_session_id, cwd, base.degraded)
+                    None, cwd, base.degraded)
 
 
 def _base_resolve(explicit: str | None = None, ppid: int | None = None, env=None,

@@ -394,6 +394,23 @@ def test_a_subagent_kernel_is_spawned_in_the_subagents_own_directory(monkeypatch
     assert r.cwd == "/work/tree-a"
 
 
+def test_a_subagent_kernel_is_not_bound_to_the_parents_transcript(monkeypatch, tmp_path):
+    """A subagent's conversation is a sidechain with no resumable session id of its own, so
+    inheriting the parent's sent `history()` and `agent.fork()` to the PARENT's conversation
+    — silently, and reading the wrong conversation is the exact failure this feature exists
+    to end. None routes them to the documented alias-keyed error instead."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    sid = "11111111-2222-3333-4444-555555555555"
+    _write_mapping(tmp_path, "toolu_1", "agent_7")
+
+    base = _base_env_resolve(env={"CLAUDE_CODE_SESSION_ID": sid})
+    sub = _base_env_resolve(env={"CLAUDE_CODE_SESSION_ID": sid}, tool_use_id="toolu_1")
+
+    assert base.claude_session_id == sid, "the base rung stopped naming a session at all"
+    assert sub.claude_session_id is None
+    assert sub.source == "env-claude-session+subagent"
+
+
 def test_a_mapping_with_no_usable_cwd_keeps_the_bases(monkeypatch, tmp_path):
     """The cwd is one more thing the hook may not have had, and it comes off a file. Absent
     or not an absolute path, the base rung's answer stands — the same fail-open the agent id
