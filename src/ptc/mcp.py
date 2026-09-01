@@ -1,4 +1,4 @@
-"""The ptc MCP server (stdio). Tools: exec, wait, interrupt, restart, kernels."""
+"""The ptc MCP server (stdio). Tools: exec, wait, interrupt, restart, kernels, peek."""
 import asyncio
 from pathlib import Path
 
@@ -21,10 +21,13 @@ functions, agent handles) persists across calls, turns, compaction, and --resume
 until the kernel's idle TTL. Assign large results to variables and print compact
 summaries; output truncates with a full-log path. Pre-bound: read, write, edit,
 bash, agent, llm, web_fetch, web_search, history, workflow, asyncio (all Python;
-async ones are awaited at top level). Tools: exec, wait, interrupt, restart, kernels.
+async ones are awaited at top level). Tools: exec, wait, interrupt, restart,
+kernels, peek.
 If a cell yields `running`, use wait(cell_id); if the kernel is busy, wait or
 interrupt — nothing queues. wait also takes until="<python regex>", returning as
-soon as new output first matches instead of at settle. Pass session="<id>"
+soon as new output first matches instead of at settle. peek(expr) reads a
+variable's repr while a cell runs; exec(queue=True) waits for the slot instead of
+returning busy. Pass session="<id>"
 explicitly if results ever look like a different session's namespace, or if this
 client does not set a session id of its own (the header then reads
 `keying: adapter-local`). Subagent callers are auto-keyed to their own kernels;
@@ -250,6 +253,44 @@ async def restart_tool(session: str | None = None, ctx: Context = None) -> list:
         "must be recreated. Agent sessions remain resumable via agent.list().]"))]
 
 
+def _peek_text(key: str, expr: str) -> str:
+    """The peek reply as one line of text.
+
+    The imports are function-local on purpose: the module-level names are bound at import
+    time, and the ones this reaches for are exactly the ones a caller (or a test) needs to
+    be able to substitute in their SOURCE module.
+    """
+    from .discovery import read_meta
+    from .kernel import kernel_alive
+    from .peek_client import PeekUnavailable, peek_kernel
+    if not kernel_alive(key):
+        return f"[no live kernel for {key} — exec first]"
+    try:
+        reply = peek_kernel(key, expr)
+    except PeekUnavailable:
+        build = read_meta(key).get("build") or "?"
+        return f"[kernel build {build} predates peek — restart() to upgrade]"
+    if "error" in reply:
+        # Passed through as the kernel worded it, and no further: an error is not
+        # necessarily a bad name. A cell mid-mutation can raise from a perfectly correct
+        # expression, and a reading imposed here would be wrong as often as it was right.
+        return f"[peek {key}] error: {reply['error']}"
+    note = " …[truncated at 4000 chars]" if reply.get("truncated") else ""
+    return f"[peek {key}] {reply['repr']}{note}"
+
+
+async def peek_tool(expr: str, session: str | None = None, ctx: Context = None) -> list:
+    """Read a value while the kernel is busy — the one channel that works mid-cell
+    (wait tails output; peek reads variables). `expr` is a Name/attribute/constant-index
+    chain evaluated against the live namespace, repr capped at 4000 chars; no calls, no
+    assignments — refused before evaluation. Not a boundary: attribute access and repr
+    run the object's own code. A kernel from a build before peek has no channel —
+    restart() upgrades it."""
+    r = await asyncio.to_thread(_resolve, session, tool_use_id=_tool_use_id(ctx))
+    text = await asyncio.to_thread(_peek_text, r.key, expr)
+    return [TextContent(type="text", text=text)]
+
+
 async def kernels_tool() -> list:
     """List every live kernel: key, pid, alive, depth, last-used, cwd — what exists before
     choosing a session= value."""
@@ -269,7 +310,8 @@ async def kernels_tool() -> list:
 # auto-detection, but pinning it False makes "content array only, no structuredContent"
 # an explicit guarantee rather than an incidental consequence of the annotation's shape.
 for fn, name in ((exec_tool, "exec"), (wait_tool, "wait"), (interrupt_tool, "interrupt"),
-                 (restart_tool, "restart"), (kernels_tool, "kernels")):
+                 (restart_tool, "restart"), (kernels_tool, "kernels"),
+                 (peek_tool, "peek")):
     server.tool(name=name, structured_output=False)(fn)
 
 

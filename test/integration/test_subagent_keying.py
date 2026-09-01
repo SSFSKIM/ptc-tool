@@ -55,3 +55,34 @@ def test_a_subagents_call_gets_a_kernel_the_parents_call_cannot_see(ptc_home, mo
 
     kill_kernel("dispatchbase--sub-agent_7")
     kill_kernel("dispatchbase")
+
+
+def test_a_subagents_peek_reads_its_own_kernel_not_the_parents(ptc_home, monkeypatch):
+    """peek takes the same keying overlay every other handler takes. Two mappings for one
+    agent because a mapping is CONSUMED on first resolution and peek never spawns: the
+    first mapping rides an exec that brings the subagent's kernel up, the second keys the
+    peek. Both assertions are the proof — a NameError alone could come from a key that
+    resolved without a live sub kernel, and the absence of the secret alone could be any
+    dead-kernel message."""
+    monkeypatch.setenv("PTC_SESSION", "peekbase")
+    run = ptc_home / "run"
+    run.mkdir(parents=True, exist_ok=True)
+
+    parent = asyncio.run(mcp_mod.server.call_tool(
+        "exec", {"code": "TOKEN = 'parent-secret'"}, _ctx("toolu_parent")))
+    assert "ok" in parent.content[0].text
+
+    for tid in ("toolu_sub_a", "toolu_sub_b"):
+        (run / f"tooluse-{tid}.json").write_text(json.dumps(
+            {"agent_id": "agent_9", "agent_type": "general-purpose", "written_at": 1}))
+
+    spawn = asyncio.run(mcp_mod.server.call_tool("exec", {"code": "pass"}, _ctx("toolu_sub_a")))
+    assert "ok" in spawn.content[0].text
+
+    peeked = asyncio.run(mcp_mod.server.call_tool(
+        "peek", {"expr": "TOKEN"}, _ctx("toolu_sub_b"))).content[0].text
+    assert "NameError" in peeked, peeked
+    assert "parent-secret" not in peeked, peeked
+
+    kill_kernel("peekbase--sub-agent_9")
+    kill_kernel("peekbase")

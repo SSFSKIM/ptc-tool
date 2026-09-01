@@ -9,7 +9,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__(plugin_ptc_)?ptc__(exec|wait|interrupt|restart|kernels)",
+        "matcher": "mcp__(plugin_ptc_)?ptc__(exec|wait|interrupt|restart|kernels|peek)",
         "hooks": [
           {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\""}
         ]

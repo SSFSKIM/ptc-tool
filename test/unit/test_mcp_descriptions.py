@@ -20,7 +20,7 @@ def _descriptions() -> dict[str, str]:
 
 def test_every_tool_ships_a_nonempty_description():
     desc = _descriptions()
-    assert set(desc) == {"exec", "wait", "interrupt", "restart", "kernels"}
+    assert set(desc) == {"exec", "wait", "interrupt", "restart", "kernels", "peek"}
     for name, text in desc.items():
         assert len(text) > 40, f"{name} has no real description: {text!r}"
 
@@ -47,3 +47,31 @@ def test_instructions_point_at_the_skill():
     from ptc.mcp import INSTRUCTIONS
     assert "ptc:ptc" in INSTRUCTIONS
     assert "skill" in INSTRUCTIONS.lower()
+
+
+def test_peek_description_carries_the_contract():
+    from ptc import mcp
+    doc = mcp.peek_tool.__doc__
+    for token in ("busy", "repr", "restart()", "no calls"):
+        assert token in doc, token
+
+
+def test_instructions_mention_peek_and_queue():
+    from ptc.mcp import INSTRUCTIONS
+    assert "peek" in INSTRUCTIONS and "queue=True" in INSTRUCTIONS
+
+
+def test_pre_peek_message_is_exact(monkeypatch, tmp_path):
+    """A kernel spawned before peek existed has no socket, and the only fix is a restart.
+    `PeekUnavailable` is also what a dead socket raises, so the text names the build it
+    was asked about — the reader can tell "old build" from "wrong kernel"."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    import ptc.mcp as mcp
+    monkeypatch.setattr("ptc.kernel.kernel_alive", lambda key: True)
+    monkeypatch.setattr("ptc.discovery.read_meta", lambda key: {"build": "abc123def456"})
+    from ptc.peek_client import PeekUnavailable
+    def raise_unavailable(key, expr):
+        raise PeekUnavailable("no socket")
+    monkeypatch.setattr("ptc.peek_client.peek_kernel", raise_unavailable)
+    text = mcp._peek_text("k", "x")
+    assert text == "[kernel build abc123def456 predates peek — restart() to upgrade]"

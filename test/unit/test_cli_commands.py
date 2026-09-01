@@ -409,3 +409,26 @@ def test_the_interrupted_exit_code_is_documented_in_help():
         cli.main(["--help"])
     assert f"{cli.EXIT_INTERRUPTED} the cell was interrupted" in " ".join(out.getvalue().split())
     assert cli.EXIT_INTERRUPTED == 130
+
+
+def test_cli_peek_prints_repr(monkeypatch, capsys, tmp_path):
+    """`ptc peek <expr>` is the terminal's half of the mid-cell read: it prints the repr
+    alone, so a shell can capture it."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_SESSION", "cli-peek")
+    import ptc.cli as cli
+    monkeypatch.setattr(cli, "peek_kernel", lambda key, expr: {"repr": "42", "truncated": False})
+    assert cli.main(["peek", "n"]) == 0
+    assert "42" in capsys.readouterr().out
+
+
+def test_cli_peek_says_predates_on_unavailable(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_SESSION", "cli-peek2")
+    import ptc.cli as cli
+    from ptc.peek_client import PeekUnavailable
+    def boom(key, expr):
+        raise PeekUnavailable("no socket")
+    monkeypatch.setattr(cli, "peek_kernel", boom)
+    assert cli.main(["peek", "n"]) == 1
+    assert "predates peek" in capsys.readouterr().err

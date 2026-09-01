@@ -10,6 +10,7 @@ from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
 from .ownership import UnknownOwner
 from .paths import Config
+from .peek_client import PeekUnavailable, peek_kernel
 from .shape import render, to_dict
 from .venv import ensure_venv, stamp_current, stamp_payload, venv_python
 
@@ -85,6 +86,7 @@ def _run(argv=None) -> int:
     sp.add_argument("--until", default=None, metavar="REGEX",
                     help="return as soon as new output matches this Python regex, "
                          "rather than waiting for the cell to settle")
+    sp = com("peek"); sp.add_argument("expr")
     com("interrupt"); com("restart"); com("list"); com("doctor")
     sp = com("kill"); sp.add_argument("--all", action="store_true",
                                       help="kill every known kernel, not just one")
@@ -165,6 +167,22 @@ def _run(argv=None) -> int:
     key, notice, resolved = _pick_session(a.session)
     if notice:
         print(notice, file=sys.stderr)
+    if a.cmd == "peek":
+        try:
+            reply = peek_kernel(key, a.expr)
+        except PeekUnavailable:
+            print("ptc: kernel build predates peek — restart() to upgrade "
+                  "(or no kernel is running)", file=sys.stderr)
+            return 1
+        if a.json:
+            print(json.dumps({"key": key, **reply}))
+            return 0 if "error" not in reply else 1
+        if "error" in reply:
+            print(f"ptc: peek error: {reply['error']}", file=sys.stderr)
+            return 1
+        note = " …[truncated]" if reply.get("truncated") else ""
+        print(reply["repr"] + note)
+        return 0
     if a.cmd == "kill":
         killed = kill_kernel(key)
         if a.json:

@@ -156,7 +156,8 @@ def test_hooks_manifest_registers_pre_tool_use_for_both_tool_name_forms():
 
     matcher = re.compile(entry["matcher"])
     for name in ("mcp__plugin_ptc_ptc__exec", "mcp__ptc__wait", "mcp__ptc__interrupt",
-                 "mcp__plugin_ptc_ptc__restart", "mcp__ptc__kernels"):
+                 "mcp__plugin_ptc_ptc__restart", "mcp__ptc__kernels",
+                 "mcp__plugin_ptc_ptc__peek", "mcp__ptc__peek"):
         assert matcher.fullmatch(name), f"{name} would never fire the hook"
     for name in ("mcp__plugin_ptc_ptc__execute", "mcp__other__exec", "Bash"):
         assert not matcher.fullmatch(name), f"{name} must not fire the hook"

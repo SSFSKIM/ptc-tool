@@ -33,6 +33,9 @@ next native Edit of it will demand a fresh Read — prefer one lane per file wit
   to wait for afterwards.
 - If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
   queues silently.
+- While a cell runs, `peek` (MCP tool / `ptc peek <expr>`) reads a variable's repr from
+  the live namespace — chains only, no calls; wait() tails output, peek reads values.
+  Kernels from pre-peek builds have no channel; restart() upgrades them.
 - One session key is one kernel. Subagents you dispatch are keyed to kernels of their own
   automatically (the plugin's PreToolUse hook names the caller to the adapter), so they
   do not contend with you; to deliberately SHARE your kernel with one, pass your own
