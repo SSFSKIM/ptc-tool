@@ -25,7 +25,8 @@ class Rule:
 
 class PolicyError(RuntimeError):
     """The policy file exists but cannot be believed. Governed calls fail on this LOUDLY:
-    a silently ignored typo would leave the user thinking themselves protected."""
+    a silently ignored typo would leave the user thinking themselves protected. A file
+    present but unreadable raises this too: cannot be read is a case of cannot be believed."""
 
 
 class PolicyGateRefusal(RuntimeError):
@@ -57,9 +58,15 @@ def _parse(text: str) -> "list[Rule]":
         if not isinstance(raw, dict) or not isinstance(raw.get("tools"), list) \
                 or not all(isinstance(t, str) for t in raw["tools"]):
             raise PolicyError(f"deny[{i}] needs a \"tools\" list of strings")
+        if not raw["tools"]:
+            raise PolicyError(f"deny[{i}] \"tools\" must name at least one tool")
         pattern, path = raw.get("pattern"), raw.get("path")
         if (pattern is None) == (path is None):
             raise PolicyError(f"deny[{i}] needs exactly one of \"pattern\" or \"path\"")
+        if pattern is not None and not isinstance(pattern, str):
+            raise PolicyError(f"deny[{i}] \"pattern\" must be a string")
+        if path is not None and not isinstance(path, str):
+            raise PolicyError(f"deny[{i}] \"path\" must be a string")
         if pattern is not None:
             try:
                 re.compile(pattern)
@@ -81,7 +88,11 @@ def load_rules() -> "list[Rule] | None":
     key = (str(p), mtime)
     if _cache is not None and _cache[0] == key:
         return _cache[1]
-    rules = _parse(p.read_text())
+    try:
+        text = p.read_text()
+    except OSError as e:
+        raise PolicyError(f"policy.json cannot be read: {e}") from e
+    rules = _parse(text)
     _cache = (key, rules)
     return rules
 
