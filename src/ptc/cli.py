@@ -216,10 +216,13 @@ def _run(argv=None) -> int:
             # machine form dropped it and emitted an ordinary successful cell, so a script
             # went on assuming the variables and imports of a namespace that is gone.
             d["expired"] = info.expired_notice.strip() if info.expired_notice else None
+        d["build_note"] = info.build_note if info is not None else None
         print(json.dumps(d))
     else:
         if info is not None and info.expired_notice:
             print(f"[previous kernel expired: {info.expired_notice.strip()}]")
+        if info is not None and info.build_note:
+            print(f"[{info.build_note}]")
         print(render(outcome, key, cfg).text)
     from .client import Busy, Completed, NotFound
     if isinstance(outcome, Busy):

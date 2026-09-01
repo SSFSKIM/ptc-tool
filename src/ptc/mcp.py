@@ -164,6 +164,8 @@ async def exec_tool(code: str, session: str | None = None,
         rendered.text = (f"[previous kernel expired: {info.expired_notice.strip()} — fresh "
                          f"namespace; agent sessions remain resumable via agent.list()]\n"
                          + rendered.text)
+    if info.build_note:
+        rendered.text = f"[{info.build_note}]\n" + rendered.text
     return _content(rendered)
 
 

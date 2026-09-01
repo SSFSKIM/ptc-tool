@@ -300,46 +300,7 @@ def test_restart_keeps_the_ttl_and_the_concurrency_bound_the_kernel_was_spawned_
         kill_kernel("kcfg")
 
 
-# --- r13 finding 4: a venv rebuilt under a live kernel strands it on deleted code ------
-
-def test_a_venv_upgrade_recycles_the_kernel_it_stranded(ptc_home, monkeypatch):
-    """The launcher clears and recreates the shared ~/.ptc/venv whenever its stamp changes,
-    while a kernel spawned from the old one keeps running out of the directory that was
-    removed — and `ensure_kernel`'s attach branch had no build check at all, so it handed
-    that kernel back for the rest of its idle TTL. The identity is recorded at spawn and
-    compared on attach; a mismatch recycles and says so on the same channel a TTL expiry
-    uses, because it is the same news: the namespace is gone.
-    """
-    from ptc.client import Completed, KernelClient
-    from ptc.discovery import read_meta
-    from ptc.paths import Config
-
-    build = {"id": "aaaaaaaaaaaa1111"}
-    monkeypatch.setattr(kernel, "build_identity", lambda: build["id"])
-    cfg = Config.from_env()
-
-    first = ensure_kernel("up1", cwd=str(ptc_home))
-    assert read_meta("up1")["build"] == "aaaaaaaaaaaa1111"
-    KernelClient("up1").exec_cell("upgrade_marker = 1", timeout_s=60, config=cfg)
-
-    same = ensure_kernel("up1", cwd=str(ptc_home))
-    assert not same.spawned and same.pid == first.pid, "a matching build was not attached to"
-    assert same.expired_notice is None
-
-    build["id"] = "bbbbbbbbbbbb2222"            # the launcher rebuilt the shared venv
-    fresh = ensure_kernel("up1", cwd=str(ptc_home))
-    assert fresh.spawned and fresh.pid != first.pid, "the stranded kernel was attached to"
-    assert fresh.expired_notice and "upgrade" in fresh.expired_notice, fresh.expired_notice
-    assert read_meta("up1")["build"] == "bbbbbbbbbbbb2222"
-    out = KernelClient("up1").exec_cell("print('upgrade_marker' in dir())",
-                                        timeout_s=60, config=cfg)
-    assert isinstance(out, Completed) and "False" in out.output, "the namespace survived"
-
-    # the notice is delivered once, like the TTL one
-    again = ensure_kernel("up1", cwd=str(ptc_home))
-    assert not again.spawned and again.expired_notice is None
-    kill_kernel("up1")
-
+# --- v0.3 i1: builds are immutable, so a build difference is news, not a death ---------
 
 def test_a_kernel_with_no_build_stamp_on_either_side_is_left_alone(ptc_home, monkeypatch):
     """A dev run, a hand-made venv, a test fixture: there is no stamp to compare and never
@@ -353,3 +314,47 @@ def test_a_kernel_with_no_build_stamp_on_either_side_is_left_alone(ptc_home, mon
     again = ensure_kernel("up2", cwd=str(ptc_home))
     assert not again.spawned and again.pid == first.pid and again.expired_notice is None
     kill_kernel("up2")
+
+
+def test_kernel_survives_a_build_change_with_notice(ptc_home, monkeypatch):
+    """Spec acceptance 1 (unit-level twin of the live check): a new CURRENT build must not
+    recycle a standing kernel — same pid, namespace intact, one notice line."""
+    from ptc.client import Completed, KernelClient
+    from ptc.paths import Config
+    cfg = Config.from_env()
+    # the test venv carries no stamp, so identity is None there; pin a known build for the
+    # SPAWN so meta.json records one — the note needs both sides known
+    monkeypatch.setattr(kernel, "build_identity", lambda: "aaaaaaaaaaaa")
+    info = ensure_kernel("survive", cwd=str(ptc_home), config=cfg)
+    first_pid = info.pid
+    out = KernelClient("survive").exec_cell("carried = 41 + 1", timeout_s=60, config=cfg)
+    assert isinstance(out, Completed) and out.record.status == "ok"
+    # a different CURRENT build: the adapter's own identity moves, the kernel's stays
+    monkeypatch.setattr(kernel, "build_identity", lambda: "ffffffffffff")
+    again = ensure_kernel("survive", cwd=str(ptc_home), config=cfg)
+    assert again.spawned is False and again.pid == first_pid
+    assert again.expired_notice is None
+    assert "restart() to pick up the new runtime" in (again.build_note or "")
+    out = KernelClient("survive").exec_cell("print(carried)", timeout_s=60, config=cfg)
+    assert isinstance(out, Completed) and "42" in out.output
+    kill_kernel("survive")
+
+
+def test_protocol_zero_kernel_recycles_once_with_notice(ptc_home):
+    """A kernel from before the contract existed reads protocol 0 and is replaced exactly
+    once, on the channel a TTL expiry already uses — then records the current protocol and
+    never takes that path again."""
+    from ptc.discovery import read_meta
+    from ptc.paths import Config
+    cfg = Config.from_env()
+    info = ensure_kernel("proto", cwd=str(ptc_home), config=cfg)
+    old_pid = info.pid
+    meta = read_meta("proto")
+    del_protocol = {k: v for k, v in meta.items() if k != "protocol"}
+    # a direct write, not write_meta: that one MERGES and so cannot take a key away
+    (ptc_home / "kernels" / "proto" / "meta.json").write_text(json.dumps(del_protocol))
+    again = ensure_kernel("proto", cwd=str(ptc_home), config=cfg)
+    assert again.spawned is True and again.pid != old_pid
+    assert "protocol change" in (again.expired_notice or "")
+    assert read_meta("proto").get("protocol") == 1
+    kill_kernel("proto")

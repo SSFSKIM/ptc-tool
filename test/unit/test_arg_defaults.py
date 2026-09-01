@@ -25,7 +25,7 @@ def seen(monkeypatch, tmp_path):
 
     def fake_ensure(key, **kw):
         captured["ensure"] = kw
-        return SimpleNamespace(expired_notice=None)
+        return SimpleNamespace(expired_notice=None, build_note=None)
 
     def fake_exec(self, code, timeout_s, config):
         captured.update(timeout_s=timeout_s, cap=config.max_output_chars)

@@ -20,6 +20,7 @@ from .ownership import (
     write_owner,
 )
 from .paths import (
+    PTC_PROTOCOL,
     Config,
     cells_dir,
     kernel_dir,
@@ -27,7 +28,7 @@ from .paths import (
     private_open,
     secure_dir,
 )
-from .venv import build_identity, venv_python
+from .venv import build_identity, spawn_venv, venv_python
 
 
 @dataclass
@@ -37,6 +38,7 @@ class KernelInfo:
     connection_file: Path
     spawned: bool
     expired_notice: str | None
+    build_note: str | None = None
 
 
 def kernel_alive(key: str) -> bool:
@@ -60,33 +62,41 @@ def read_expiry(key: str) -> str | None:
         return None
 
 
-def _upgraded_under(key: str) -> str | None:
-    """Has the venv this kernel is running from been rebuilt since it started?
+def _venv_gone(key: str) -> str | None:
+    """Has the venv this kernel launched from VANISHED under it (GC accident, manual rm)?
 
-    The launcher clears and recreates the shared `~/.ptc/venv` whenever its stamp changes,
-    and a kernel already running keeps executing modules out of the directory that was
-    removed: every import of something not yet loaded fails, and everything already loaded
-    is a version nobody ships any more. Attaching to it hands the caller a namespace built
-    on deleted code, indefinitely — a kernel outlives the adapter that spawned it by up to
-    the idle TTL, so this is not a narrow window.
-
-    Both identities have to be KNOWN before this answers yes. One is absent for a kernel
-    spawned outside a provisioned venv (a dev run, a test fixture, a hand-made venv), and
-    absent again for the moments a provision spends between `uv venv --clear` and writing
-    the new stamp. Neither is evidence of an upgrade, and acting on the second would try to
-    spawn a replacement out of a half-built venv; both attach exactly as before, and the
-    next ensure — once two known identities differ — recycles then.
-
-    The text is shaped for the same channel the TTL notice travels on (`KernelInfo
-    .expired_notice`, rendered as "previous kernel expired: ..."), because it is the same
-    news to the caller: the namespace is gone and here is why.
+    Under immutable builds an upgrade no longer touches a standing venv, so the old
+    rebuilt-under-us check retired with the rebuild itself; what remains fatal is the
+    directory being gone. No recorded venv (a dev spawn, a pre-v0.3 kernel already gated
+    by protocol below) claims nothing.
     """
+    v = read_meta(key).get("venv")
+    if not isinstance(v, str) or Path(v).exists():
+        return None
+    return (f"replaced because the venv it was running from ({v}) no longer exists — "
+            "removed by GC or by hand")
+
+
+def _protocol_mismatch(key: str) -> str | None:
+    """Does this kernel speak our disk/wire contract? Absent reads 0: pre-v0.3 kernels
+    recycle exactly once at rollout, with the same notice channel every upgrade used."""
+    have = read_meta(key).get("protocol")
+    have = have if isinstance(have, int) and not isinstance(have, bool) else 0
+    if have == PTC_PROTOCOL:
+        return None
+    return (f"replaced after a ptc protocol change (kernel protocol {have}, "
+            f"current {PTC_PROTOCOL})")
+
+
+def _build_note(key: str) -> str | None:
+    """One header line when an attach crosses builds — known and different on both sides.
+    The kernel keeps running old code deliberately; the note is what keeps that a choice."""
     was = read_meta(key).get("build")
     now = build_identity()
     if not was or not now or was == now:
         return None
-    return (f"replaced after a ptc runtime upgrade — the venv it was running from "
-            f"(build {was[:12]}) was rebuilt as {now[:12]} and no longer exists")
+    return (f"kernel running build {was[:12]} (current {now[:12]}) — restart() to pick "
+            "up the new runtime")
 
 
 def _rotate_cells(kd: Path) -> None:
@@ -173,23 +183,25 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
         # `UnknownOwner` leaves this key exactly as it was found.
         alive = settled_owner_state(o)
         attachable = bool(o and alive and (kd / "ready").exists())
-        # A live kernel whose venv was rebuilt under it is not attachable: it runs deleted
-        # code, and the caller has to be told its namespace is gone rather than handed one
-        # that half-works. Recycling is the ordinary spawn path below — `_clean_stale`
-        # reaps it exactly as it reaps any other kernel standing in the way.
-        upgraded = _upgraded_under(key) if attachable else None
-        if attachable and upgraded is None:
+        # A live kernel is recycled only when attaching would be a LIE: its venv vanished
+        # (it runs deleted code) or it predates our disk/wire contract. A mere build
+        # difference attaches fine and says so (`build_note`). Recycling is the ordinary
+        # spawn path below — `_clean_stale` reaps it exactly as it reaps any other kernel
+        # standing in the way.
+        stale = (_venv_gone(key) or _protocol_mismatch(key)) if attachable else None
+        if attachable and stale is None:
             # Attaching to a live kernel is the only chance to repair a meta.json that
             # was written before anyone knew the Claude session id (a CLI exec keyed off
             # an env rung, an MCP attach after the CLI spawned the kernel): history() and
             # agent.fork() read the id back from there and are unavailable without it.
             if claude_session_id and not read_meta(key).get("claude_session_id"):
                 write_meta(key, claude_session_id=claude_session_id)
-            return KernelInfo(key, o.pid, kd / "connection.json", False, None)
-        # A marker and an upgrade cannot both be standing — a key with an expiry marker has
-        # no live kernel to have been upgraded under — so this is a choice on paper only,
-        # and the marker wins because it is the one that must also be CONSUMED.
-        expired = read_expiry(key) or upgraded
+            return KernelInfo(key, o.pid, kd / "connection.json", False, None,
+                              _build_note(key))
+        # A marker and a stale gate cannot both be standing — a key with an expiry marker
+        # has no live kernel to have been gated — so this is a choice on paper only, and
+        # the marker wins because it is the one that must also be CONSUMED.
+        expired = read_expiry(key) or stale
         _clean_stale(kd, key, o, alive)
         secure_dir(cells_dir(key))          # the rotation above took the old one away
         secure_dir(cells_dir(key) / "offsets")
@@ -205,8 +217,8 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
         epoch = str(int(time.time()))
         # Read beside the interpreter it names and BEFORE the fork, so meta.json records
         # the build this kernel really launched from rather than whatever the venv became
-        # while it was starting (`_upgraded_under` compares against it for the rest of
-        # this kernel's life).
+        # while it was starting (`_build_note` compares against it for the rest of this
+        # kernel's life).
         build = build_identity()
         proc = subprocess.Popen(
             [str(venv_python()), "-m", "ipykernel_launcher", "-f", str(conn)],
@@ -255,12 +267,19 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             # `max_output_chars` are read per request by the client and the renderer and
             # are deliberately absent: pinning them here would make a restart silently
             # change what a later, unrelated caller's own timeout meant.
+            #
+            # `venv` and `protocol` are not configuration at all: they record WHERE this
+            # kernel stands and WHAT it speaks, which is what the attach gates above have
+            # to ask of a kernel nobody in this process started. Neither is in
+            # `_KERNEL_LIFETIME_FIELDS` — a restart re-derives both from the runtime doing
+            # the restarting, which is the only honest answer.
             write_meta(key, kernel_key=key,
                        claude_session_id=claude_session_id or read_meta(key).get(
                            "claude_session_id"),
                        cwd=work, depth=cfg.depth, max_depth=cfg.max_depth,
                        idle_hours=cfg.idle_hours, max_concurrency=cfg.max_concurrency,
-                       epoch=epoch, build=build)
+                       epoch=epoch, build=build,
+                       venv=str(spawn_venv()), protocol=PTC_PROTOCOL)
             from .client import run_bootstrap
             run_bootstrap(key, cfg)
             (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
