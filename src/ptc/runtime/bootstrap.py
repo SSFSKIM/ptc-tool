@@ -396,6 +396,11 @@ def install(config_json: str) -> str:
     ip.events.register("post_run_cell", _post_run_cell)
     _install_display_shim()
     _install_traceback_mirror()
+    try:
+        from . import peek as _peek
+        _peek.install_peek(STATE.kernel_dir, ip.user_ns)
+    except Exception:
+        pass   # peek is a convenience: its absence must never fail bootstrap
     threading.Thread(target=_watchdog, daemon=True, name="ptc-watchdog").start()
     from . import bind
     bind(ip)
