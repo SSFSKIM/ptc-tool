@@ -184,6 +184,93 @@ def test_web_fetch_summary_does_not_deadlock_against_llm(tmp_path, monkeypatch):
     assert r.summary == "SUMMARY" and "page body" in r.text   # full text kept alongside
 
 
+# -- web_fetch under the deny policy ---------------------------------------
+
+def _redirect_transport():
+    """hop.example redirects once to denied.example, which serves the page."""
+    import httpx
+
+    def handler(request):
+        if request.url.host == "hop.example":
+            return httpx.Response(302, headers={"location": "https://denied.example/x"})
+        return httpx.Response(200, text="made it")
+    return httpx.MockTransport(handler)
+
+
+def _govern(monkeypatch, tmp_path, name, policy_doc=None):
+    """A kernel dir + a PTC_HOME whose policy.json is `policy_doc` (None = no file)."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.delenv("PTC_POLICY", raising=False)
+    if policy_doc is not None:
+        (tmp_path / "policy.json").write_text(json.dumps(policy_doc))
+    kd = tmp_path / "kernels" / name
+    (kd / "cells").mkdir(parents=True)
+    monkeypatch.setattr(STATE, "kernel_dir", kd)
+    monkeypatch.setattr(STATE, "current_cell", 1)
+    monkeypatch.setattr(STATE, "cell_mutations", [])
+    return kd
+
+
+def _audit(kd):
+    return [json.loads(x) for x in (kd / "audit.jsonl").read_text().splitlines()]
+
+
+def test_web_fetch_denies_at_the_hop_not_after_it(monkeypatch, tmp_path):
+    """The redirect TARGET is checked before it is requested. httpx following redirects
+    itself would have fetched denied.example and only then handed back a final url to
+    judge — the request the policy forbids would already have gone out."""
+    kd = _govern(monkeypatch, tmp_path, "webgov", {
+        "version": 1, "deny": [{"tools": ["web_fetch"], "pattern": "denied\\.example"}]})
+    with pytest.raises(PermissionError, match="rule 0"):
+        asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
+    assert any(e["kind"] == "denied" and "denied.example" in e["value"] for e in _audit(kd))
+
+
+def test_web_fetch_follows_redirects_and_audits_both_urls_under_policy(monkeypatch,
+                                                                      tmp_path):
+    kd = _govern(monkeypatch, tmp_path, "webok", {
+        "version": 1, "deny": [{"tools": ["web_fetch"], "pattern": "never-matches-zz"}]})
+    r = asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
+    assert "made it" in r.text and "denied.example" in r.url
+    wf = [e for e in _audit(kd) if e["kind"] == "web_fetch" and "final_url" in e]
+    assert wf and wf[0]["url"].startswith("https://hop.example") \
+        and "denied.example" in wf[0]["final_url"]
+
+
+def test_web_fetch_without_policy_audits_nothing_new(monkeypatch, tmp_path):
+    """No policy file, no behavioral change: redirects are still followed by the manual
+    loop, and the governed audit line is absent."""
+    kd = _govern(monkeypatch, tmp_path, "webnone")
+    r = asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
+    assert "made it" in r.text and "denied.example" in r.url
+    entries = _audit(kd)
+    assert not [e for e in entries if e["kind"] == "denied" or "final_url" in e]
+    # the EXISTING per-call audit line still fires, policy or not
+    assert [e for e in entries if e["kind"] == "web_fetch"]
+
+
+def test_web_fetch_hop_limit_is_not_infinite(monkeypatch, tmp_path):
+    """A redirect cycle terminates loudly rather than looping forever — httpx's own
+    max_redirects no longer applies once the loop is ours."""
+    import httpx
+    _govern(monkeypatch, tmp_path, "webloop")
+    t = httpx.MockTransport(
+        lambda request: httpx.Response(302, headers={"location": "https://loop.example/n"}))
+    with pytest.raises(RuntimeError, match="more than 10 redirects"):
+        asyncio.run(web.web_fetch("https://loop.example/0", _transport=t))
+
+
+def test_web_fetch_malformed_policy_is_loud(monkeypatch, tmp_path):
+    """A file that cannot be believed fails the fetch before it starts, exactly as it
+    does for write/edit/bash."""
+    from ptc.policy import PolicyError
+
+    _govern(monkeypatch, tmp_path, "webbad")
+    (tmp_path / "policy.json").write_text("{not json")
+    with pytest.raises(PolicyError):
+        asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
+
+
 # -- web_search parsing ----------------------------------------------------
 
 def test_parse_blocks_reads_the_real_s6_links_payload():

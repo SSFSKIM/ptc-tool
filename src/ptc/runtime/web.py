@@ -23,9 +23,12 @@ from dataclasses import dataclass
 from html import unescape
 from urllib.parse import urlsplit
 
+from ptc import policy
+
 from . import audit
 from .agents import AgentFailed, AgentOpts, child_ptc_env, guarded, shared_semaphore
 from .claude_backend import terminal_failure
+from .files import _denied
 
 #: Hard body cap, enforced WHILE streaming: a limit checked after the download has already
 #: finished is a report, not a cap.
@@ -41,6 +44,10 @@ _WEB_TOOL_NAMES = ("WebSearch", "web_search")
 _LINKS_RE = re.compile(r"^Links:\s*(\[.*\])\s*$", re.M)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+#: Redirect chains are walked by hand (each hop is a URL the policy must judge before it is
+#: requested), so this is the bound httpx's own `max_redirects` used to provide.
+_MAX_HOPS = 10
 
 #: Last-resort prose extraction: an optionally quoted/bracketed title in front of a URL.
 _PROSE_LINK_RE = re.compile(r"(?:\"([^\"]+)\"|\[([^\]]+)\])?\s*\(?(https?://[^\s)\"'<>]+)")
@@ -81,7 +88,7 @@ def _is_html(raw: str, content_type: str) -> bool:
 
 
 async def web_fetch(url: str, *, prompt: str | None = None,
-                    timeout: float = 30.0) -> FetchResult:
+                    timeout: float = 30.0, _transport=None) -> FetchResult:
     """GET `url`, follow redirects, return the whole page as markdown in `.text`.
 
     `prompt=` additionally runs `llm(prompt, over the text)` and fills `.summary` — the
@@ -93,30 +100,57 @@ async def web_fetch(url: str, *, prompt: str | None = None,
     concurrency permit), while the optional summarization runs under `llm()`'s own
     default. A 30 s page deadline is generous; the same 30 s applied to a model call over
     a long page would mostly just fail.
+
+    Redirects are followed BY HAND, one hop at a time, so that a deny policy judges every
+    URL before it is requested. Letting httpx follow the chain would hand back only the
+    final url to judge — by then the forbidden request has already gone out.
     """
     audit.append("web_fetch", url=url[:200], summarize=bool(prompt))
+    # A malformed file reads as governed on purpose: the first `_denied` then raises
+    # `PolicyError` out of the fetch, exactly as it does for write/edit/bash.
+    governed = policy.file_state() in ("active", "malformed")
 
     async def _get():
         import httpx
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+        # `_transport` is a test seam; None is httpx's own "use the real transport".
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout,
+                                     transport=_transport,
                                      headers={"User-Agent": "ptc/0.1"}) as c:
-            async with c.stream("GET", url) as r:
-                chunks, total = [], 0
-                async for chunk in r.aiter_bytes():
-                    total += len(chunk)
-                    if total > _MAX_BYTES:
-                        raise ValueError(
-                            f"response exceeds the {_MAX_BYTES} byte cap: {url}")
-                    chunks.append(chunk)
-                return (str(r.url), r.status_code, b"".join(chunks),
-                        r.charset_encoding or "utf-8",
-                        r.headers.get("content-type", ""))
+            current, hops = url, 0
+            while True:
+                if governed:
+                    _denied("web_fetch", str(current))   # BEFORE the request goes out
+                async with c.stream("GET", current) as r:
+                    if r.is_redirect:
+                        nxt = (str(r.next_request.url) if r.next_request is not None
+                               else str(r.headers.get("location")))
+                        hops += 1
+                        if hops > _MAX_HOPS:
+                            raise RuntimeError(
+                                f"web_fetch: more than {_MAX_HOPS} redirects from {url}")
+                        current = nxt
+                        continue
+                    chunks, total = [], 0
+                    async for chunk in r.aiter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_BYTES:
+                            raise ValueError(
+                                f"response exceeds the {_MAX_BYTES} byte cap: {url}")
+                        chunks.append(chunk)
+                    return (str(r.url), r.status_code, b"".join(chunks),
+                            r.charset_encoding or "utf-8",
+                            r.headers.get("content-type", ""))
 
     # The shared pool bounds the fetch itself — but the permit is RELEASED before the
     # summarization below. Holding it across `llm()`, which takes a permit of its own from
     # the same pool, would deadlock every caller at max_concurrency.
     final_url, status, body, encoding, ctype = await guarded(
         shared_semaphore(), _get, timeout)
+    # One ADDITIONAL line under a policy, carrying where the fetch ENDED as well as where
+    # it was aimed: the pre-call line above cannot know the final url yet, and a redirect
+    # chain is exactly what an auditor needs to see.
+    if governed:
+        audit.append("web_fetch", url=str(url)[:200], final_url=str(final_url)[:200])
 
     raw = body.decode(encoding, errors="replace")
     html = _is_html(raw, ctype)
