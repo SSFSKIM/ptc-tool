@@ -105,9 +105,11 @@ def install_peek(kernel_dir, namespace) -> None:
     The REAL socket binds at a short deterministic tmpdir path and `peek.sock` is a
     SYMLINK to it: AF_UNIX caps sun_path at 104 bytes on macOS, and a kernel dir under a
     pytest tmp_path (or a long PTC_HOME, or a subagent-suffixed key) blows past it —
-    bind fails, the belt below swallows it, and peek is silently absent. connect()
-    resolves symlinks, so the client and every consumer see only `peek.sock`. The real
-    path is derived by hash, so a respawn of the same key lands on the same file and the
+    bind fails, the belt below swallows it, and peek is silently absent. The cap binds
+    BOTH ends — the string handed to connect() is a sun_path too — so the client reads
+    the link itself (`peek_client._connect_path`) and connects to the short target; the
+    published `peek.sock` is the name, never the wire address. The real path is derived
+    by hash, so a respawn of the same key lands on the same file and the
     unlink-before-bind covers the previous incarnation.
     """
     import hashlib
