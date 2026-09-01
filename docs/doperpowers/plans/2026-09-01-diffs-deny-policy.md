@@ -16,7 +16,7 @@
 - Schema v1, verbatim from the spec: `{"version": 1, "deny": [{"tools": ["bash"], "pattern": "<python regex, re.search against the final command string>"}, {"tools": ["write", "edit"], "path": "<glob against the resolved absolute path>"}, {"tools": ["web_fetch"], "pattern": "<regex against the URL>"}]}`.
 - A match raises `PermissionError` naming the rule index and pattern; the denial itself is audited: `kind="denied"`, with `tool` and the offending value clipped to 200 chars.
 - Diff cap: **2000 chars per mutation entry**, in both the mutation record and the audit.jsonl line; difflib unified diff with 3 context lines; `write` to an existing file diffs against its prior content, a new file diffs against empty.
-- `web_fetch` policy evaluation is PER-HOP: redirects followed manually, every hop's URL checked before it is requested, original and final URLs both audited (one `kind="web_fetch"` audit line, only when a policy is active — no policy, no new audit lines).
+- `web_fetch` policy evaluation is PER-HOP: redirects followed manually, every hop's URL checked before it is requested, original and final URLs both audited: one ADDITIONAL `kind="web_fetch"` line carrying `final_url`, only when a policy is active. The existing unconditional per-call web_fetch audit line stays untouched — no policy means no NEW KINDS of lines, not an empty audit file.
 - Upgrade-skew gate (spec verbatim semantics): attach REFUSES — an explicit error, not a recycle, not a notice — when a policy file that is malformed or carries ≥1 deny rule exists AND the kernel's meta lacks `governed`, naming both exits (`restart()` to govern / remove the policy to keep the namespace). No policy file attaches exactly as v0.4.0 does.
 - The F2 admission machinery, discovery, and the venv/GC layer are untouched.
 - No version bumps, no push (controller ships after the final review). Run tests with `uv run pytest …` from the repo root.
@@ -254,7 +254,7 @@ def file_state() -> str:
 - [ ] **Step 4: Run to verify pass**
 
 Run: `uv run pytest test/unit/test_policy.py -v`
-Expected: PASS (12 collected items — the parametrized malformed test expands to 6).
+Expected: PASS (11 collected items — 5 singles + the 6-way parametrized malformed test).
 
 - [ ] **Step 5: Commit**
 
@@ -270,11 +270,32 @@ git commit -m "f5(ptc): policy core — schema-v1 deny rules, mtime cache, loud-
 **Files:**
 - Modify: `src/ptc/runtime/files.py` (whole file is 46 lines — diff recording + policy check)
 - Modify: `src/ptc/runtime/shell.py` (policy check at the spawn seam)
+- Modify: `test/conftest.py` (suite-wide policy isolation — see Step 0)
 - Test: `test/unit/test_files.py` (extend), `test/unit/test_governed_wrappers.py` (new)
 
 **Interfaces:**
 - Consumes: from Task 1: `policy.match(tool, value) -> Rule | None`, `policy.PolicyError`.
 - Produces: mutation entries for `write`/`edit` gain a `diff: str` field (≤2000 chars); denials audit as `kind="denied"` with `tool`, `rule` (index), `value` (clipped 200); a `_denied(tool, value)` helper in `src/ptc/runtime/files.py` that Task 3's web wrapper imports (`from .files import _denied`).
+
+- [ ] **Step 0: Isolate the suite from the developer's real policy file**
+
+Once wrappers are governed, any test that calls `files.write`/`shell.bash`/`web_fetch`
+without pinning `PTC_HOME` would stat (and maybe parse) the REAL `~/.ptc/policy.json` —
+green today only because none exists, and this initiative exists so the owner will
+create one. Add to `test/conftest.py`:
+
+```python
+@pytest.fixture(autouse=True)
+def _no_real_policy(tmp_path, monkeypatch):
+    """Governed wrappers must never consult the developer's real ~/.ptc/policy.json:
+    point PTC_POLICY at a path that does not exist (= the empty policy). Tests that
+    exercise policy delenv or override this themselves."""
+    monkeypatch.setenv("PTC_POLICY", str(tmp_path / "no-policy.json"))
+```
+
+and add `monkeypatch.delenv("PTC_POLICY", raising=False)` inside the existing `ptc_home`
+fixture (conftest.py:85-93), so integration tests that write `ptc_home/policy.json` get
+the PTC_HOME-relative path. Commit rides with this task's commit.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -296,7 +317,7 @@ def test_write_and_edit_record_bounded_diffs(files_env, tmp_path):
     entry = STATE.cell_mutations[-1]
     assert entry["kind"] == "edit"
     assert "-beta" in entry["diff"] and "+gamma" in entry["diff"]
-    assert len(entry["diff"]) <= 2000 + 100            # cap plus the truncation note
+    assert len(entry["diff"]) <= 2000
 
 
 def test_huge_diff_is_capped_with_a_note(files_env, tmp_path):
@@ -305,7 +326,7 @@ def test_huge_diff_is_capped_with_a_note(files_env, tmp_path):
     target = tmp_path / "big.txt"
     files.write(str(target), "x\n" * 5000)
     d = STATE.cell_mutations[-1]["diff"]
-    assert len(d) <= 2000 + 100
+    assert len(d) <= 2000
     assert "truncated" in d
 ```
 
@@ -361,10 +382,13 @@ def test_denied_bash_raises_before_spawn(governed, tmp_path):
 
 
 def test_unmatched_calls_run_untouched(governed, tmp_path):
-    from ptc.runtime import files
+    import asyncio
+    from ptc.runtime import files, shell
     governed({"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]})
     out = files.write(str(tmp_path / "ok.txt"), "fine")
     assert "Wrote" in out
+    r = asyncio.run(shell.bash("echo ok"))        # acceptance 1's second half: unaffected
+    assert getattr(r, "code", 0) == 0 or "ok" in str(r)
 
 
 def test_malformed_policy_is_loud_for_governed_and_silent_for_read(governed, tmp_path):
@@ -374,12 +398,16 @@ def test_malformed_policy_is_loud_for_governed_and_silent_for_read(governed, tmp
     (tmp_path / "readable.txt").write_text("still readable")
     with pytest.raises(policy.PolicyError):
         files.write(str(tmp_path / "x.txt"), "data")
+    import asyncio
+    from ptc.runtime import shell
+    with pytest.raises(policy.PolicyError):        # acceptance 4: bash("echo hi") raises
+        asyncio.run(shell.bash("echo hi"))
     assert files.read(str(tmp_path / "readable.txt")) == "still readable"
 ```
 
-(If `test_files.py` has no reusable fixture named like `files_env`, build the two diff
-tests on the `governed` fixture pattern above instead — the assertions are the contract,
-the fixture is plumbing. Note the bash test drives the coroutine with a loop directly;
+(`test_files.py` has an AUTOUSE fixture `_audit_to_tmp` that already does the setup —
+the right adaptation is simply DROPPING the `files_env` parameter from the two diff
+tests; do not rebuild them on another fixture. Note the bash test drives the coroutine with a loop directly;
 if `shell.bash`'s signature or event-loop needs differ, follow how `test_bash_argv.py`
 invokes it and keep the assertions.)
 
@@ -401,7 +429,7 @@ from ptc import policy
 
 from . import audit
 
-_DIFF_CAP = 2000
+_DIFF_CAP = 2000   # INCLUSIVE of the truncation note: spec acceptance 2 binds ≤2000
 
 
 def _denied(tool: str, value: str) -> None:
@@ -422,8 +450,8 @@ def _diff(path: str, old: str, new: str) -> str:
         old.splitlines(keepends=True), new.splitlines(keepends=True),
         fromfile=path, tofile=path, n=3))
     if len(d) > _DIFF_CAP:
-        d = d[:_DIFF_CAP] + "\n…[diff truncated — the full change is in the file; the "\
-                            "audit record is capped the same way]"
+        note = "\n…[diff truncated — the full change is in the file]"
+        d = d[:_DIFF_CAP - len(note)] + note        # cap INCLUSIVE of the note
     return d
 ```
 
@@ -467,20 +495,18 @@ def edit(path, old: str, new: str, replace_all: bool = False) -> str:
 
 - [ ] **Step 4: Governance at bash's spawn seam**
 
-In `src/ptc/runtime/shell.py`, find the line `audit.append("bash", command=label[:2000])`
-— `label` at that point is the final command string (a shell string, or the shlex-joined
-argv). The policy check goes at the TOP of the async `bash(...)` function, as soon as
-`label` is computable and before any process is spawned:
+In `src/ptc/runtime/shell.py`: `label` is computed at shell.py:426, the unconditional
+`audit.append("bash", command=label[:2000])` sits at shell.py:430, and the spawn follows
+at shell.py:434. Insert exactly one line BETWEEN the label computation and that audit
+line (i.e. between 426 and 430):
 
 ```python
-    from .files import _denied
     _denied("bash", label)
 ```
 
-(if `label` is computed lower in the function, hoist just the label computation, not the
-audit — the audit line stays where the spawn succeeds; a denied call must leave ONLY the
-`denied` audit line. Import at function top-level of the module if the file's idiom
-prefers that.)
+with `from .files import _denied` added to the module imports. Nothing else moves — a
+denied call raises before the bash audit line and before any spawn, leaving ONLY the
+`denied` audit entry.
 
 - [ ] **Step 5: Run to verify pass, then the neighbors**
 
@@ -506,7 +532,7 @@ git commit -m "f5(ptc): bounded diffs on write/edit + deny policy trips files/ba
 
 **Interfaces:**
 - Consumes: from Task 1: `policy.match`/`PolicyError`; from Task 2: `files._denied(tool, value)`.
-- Produces: `web_fetch` behavior contract — every hop's URL checked BEFORE request; one `kind="web_fetch"` audit line (`url`, `final_url`) when and only when a policy is active; `FetchResult.url` still the final URL.
+- Produces: `web_fetch` behavior contract — every hop's URL checked BEFORE request; one ADDITIONAL `kind="web_fetch"` audit line carrying `url` + `final_url` (each clipped [:200]) when and only when a policy is active — the EXISTING per-call audit line at web.py:97 (`url[:200]`, `summarize`) is UNCHANGED and fires policy-or-not; `test_web_fetch_audits_the_url` pins it and must keep passing. `FetchResult.url` still the final URL.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -561,7 +587,7 @@ def test_web_fetch_follows_redirects_and_audits_both_urls_under_policy(monkeypat
     r = asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
     assert "made it" in r.text and "denied.example" in r.url
     entries = [json.loads(l) for l in (kd / "audit.jsonl").read_text().splitlines()]
-    wf = [e for e in entries if e["kind"] == "web_fetch"]
+    wf = [e for e in entries if e["kind"] == "web_fetch" and "final_url" in e]
     assert wf and wf[0]["url"].startswith("https://hop.example") \
         and "denied.example" in wf[0]["final_url"]
 
@@ -579,7 +605,10 @@ def test_web_fetch_without_policy_audits_nothing_new(monkeypatch, tmp_path):
     monkeypatch.setattr(STATE, "cell_mutations", [])
     r = asyncio.run(web.web_fetch("https://hop.example/r", _transport=_redirect_transport()))
     assert "made it" in r.text
-    assert not (kd / "audit.jsonl").exists()
+    # the EXISTING per-call audit line still fires; what must be absent without a policy
+    # is any denied entry and any final_url-carrying (governed) entry
+    entries = [json.loads(l) for l in (kd / "audit.jsonl").read_text().splitlines()]
+    assert not [e for e in entries if e["kind"] == "denied" or "final_url" in e]
 ```
 
 (If `web_fetch` has no seam for a transport, add the private keyword-only parameter
@@ -593,36 +622,64 @@ Expected: FAIL (no `_transport` seam / redirects auto-followed / no policy consu
 
 - [ ] **Step 3: Implement the manual hop loop in `src/ptc/runtime/web.py`**
 
-Change the client construction (web.py:100-101) to `follow_redirects=False` (plus the
-`transport=_transport` seam) and replace the single `.get(url)` with:
+The real shape of `web_fetch` (read it first, web.py:83-130): the request happens inside
+a nested closure `_get()` as `async with c.stream("GET", url) as r:`, which enforces
+`_MAX_BYTES` WHILE STREAMING (`aiter_bytes` loop that raises mid-stream) and returns a
+5-tuple `(final_url, status, body, encoding, ctype)`; the closure runs under
+`guarded(shared_semaphore(), _get, timeout)`, and web.py:97 audits every call
+unconditionally. There is no `.get(url)` — do NOT introduce one: a plain `.get` would
+buffer the body and destroy the mid-stream cap that
+`test_web_fetch_size_cap_trips_mid_stream` pins.
+
+The change, precisely:
+
+- `httpx.AsyncClient(…)` gains `follow_redirects=False` and `transport=_transport`
+  (new keyword-only parameter `_transport=None` on `web_fetch`, threaded through —
+  httpx treats None as "the real transport").
+- Inside `_get()`, wrap the existing stream block in a hop loop:
 
 ```python
-        from ptc import policy as _policy
-        from .files import _denied
-        governed = _policy.file_state() in ("active", "malformed")
-        hops = 0
-        current = url
-        while True:
-            if governed:
-                _denied("web_fetch", str(current))   # checked BEFORE the request goes out
-            resp = await client.get(current)
-            if not resp.is_redirect:
-                break
-            hops += 1
-            if hops > 10:
-                raise RuntimeError(f"web_fetch: more than 10 redirects from {url}")
-            # httpx computes the absolutized target for us
-            current = str(resp.next_request.url) if resp.next_request is not None \
-                else str(resp.headers.get("location"))
-        if governed:
-            audit.append("web_fetch", url=str(url), final_url=str(current))
+            from ptc import policy as _policy
+            from .files import _denied
+            governed = _policy.file_state() in ("active", "malformed")
+            current, hops = url, 0
+            while True:
+                if governed:
+                    _denied("web_fetch", str(current))   # BEFORE the request goes out
+                async with c.stream("GET", current) as r:
+                    if r.is_redirect:
+                        nxt = (str(r.next_request.url) if r.next_request is not None
+                               else str(r.headers.get("location")))
+                        hops += 1
+                        if hops > 10:
+                            raise RuntimeError(
+                                f"web_fetch: more than 10 redirects from {url}")
+                        current = nxt
+                        continue
+                    # … the EXISTING body/cap/encoding logic runs here, unchanged,
+                    # against this final response `r` …
+                    return (str(r.url), r.status_code, body, encoding, ctype)
 ```
 
-adapting names to the function's existing locals (the response the rest of the function
-reads is `resp`; `FetchResult.url` keeps carrying the final URL, which is now `current`).
-Note `_denied` on a MALFORMED policy raises PolicyError out of `_policy.match` — loud,
-exactly the files/bash behavior; the `governed` flag calls `file_state()` first, which
-does not raise. Import `audit` the way the module already does.
+  i.e. only the final (non-redirect) response enters the existing `aiter_bytes` cap
+  loop; the tuple contract and everything downstream stay byte-identical.
+- After the tuple comes back (where `final_url` is in scope, web.py:118-127), add the
+  governed audit — one ADDITIONAL line, only under a policy:
+
+```python
+        if governed:
+            audit.append("web_fetch", url=str(url)[:200], final_url=str(final_url)[:200])
+```
+
+  (compute `governed` once in `web_fetch`'s scope so both the loop and this line see
+  it). web.py:97's existing unconditional audit line is NOT touched.
+- Note on the test file: `test/unit/test_web.py` fakes nothing via httpx — it runs a
+  real localhost `http.server` (test_web.py:49-64). The `_transport` seam is NEW and
+  conflict-free with that idiom; the new tests use `httpx.MockTransport`.
+
+A malformed policy: `_policy.file_state()` returns "malformed" without raising, so
+`governed` is True and the first `_denied` call raises `PolicyError` out of
+`policy.match` — loud, exactly the files/bash behavior.
 
 - [ ] **Step 4: Run the web tests**
 
@@ -791,17 +848,23 @@ def test_policy_gate_fires_only_for_ungoverned_kernel_with_standing_policy(monke
     monkeypatch.delenv("PTC_POLICY", raising=False)
     write_meta("k", cwd="/x")                     # no `governed` key: a pre-i3 kernel
     assert kernel._policy_gate("k") is None       # no policy file → no gate
-    (tmp_path / "policy.json").write_text(json.dumps(
-        {"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
+    import itertools
+    import os as _os
+    _tick = itertools.count(1)
+    def put(text):
+        f = tmp_path / "policy.json"
+        f.write_text(text)
+        now = __import__("time").time() + next(_tick)   # force a visible mtime step
+        _os.utime(f, (now, now))                        # (the cache keys on mtime)
+    put(json.dumps({"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
     msg = kernel._policy_gate("k")
     assert "restart()" in msg and "remove the policy" in msg
-    (tmp_path / "policy.json").write_text('{"version": 1, "deny": []}')
+    put('{"version": 1, "deny": []}')
     assert kernel._policy_gate("k") is None       # empty policy does not gate
-    (tmp_path / "policy.json").write_text("garbage")
+    put("garbage")
     assert "restart()" in kernel._policy_gate("k")  # malformed gates exactly like active
     write_meta("k", governed=True)
-    (tmp_path / "policy.json").write_text(json.dumps(
-        {"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
+    put(json.dumps({"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
     assert kernel._policy_gate("k") is None       # governed kernel attaches under policy
 ```
 
@@ -921,9 +984,28 @@ Doctrine — `skills/ptc/SKILL.md`, one bullet beside the trust/audit doctrine:
   protect.
 ```
 
-`README.md` — one sentence in its trust-model section mirroring the same claim (find the
-section that states the exec-approval boundary; keep the README/skill wording aligned as
-that section's convention demands).
+`README.md` — one sentence in its trust-model section mirroring the same claim, AND
+amend the existing clause at README.md:45-46 ("give visibility, not enforcement") so the
+section does not argue with itself — e.g. "give visibility, not enforcement — plus an
+opt-in deny tripwire (`~/.ptc/policy.json`), which is a tripwire, never a sandbox". Keep
+the README/skill wording aligned as that section's convention demands.
+
+Also add one CLI test beside `test/unit/test_cli_commands.py`'s existing
+`test_an_unidentifiable_owner_is_a_sentence_not_a_traceback` idiom:
+
+```python
+def test_policy_gate_refusal_is_a_sentence_not_a_traceback(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_SESSION", "gatecli")
+    import ptc.cli as cli
+    from ptc.policy import PolicyGateRefusal
+    def boom(*a, **kw):
+        raise PolicyGateRefusal("kernel gatecli predates policy enforcement — restart() or remove the policy")
+    monkeypatch.setattr(cli, "ensure_kernel", boom)
+    assert cli.main(["exec", "1+1"]) == 1
+    err = capsys.readouterr().err
+    assert "restart()" in err and "Traceback" not in err
+```
 
 - [ ] **Step 4: Run everything named**
 
@@ -965,7 +1047,7 @@ Run: `uv run pytest test/ -q` — paste the tail.
 Run:
 `uv run pytest "test/unit/test_governed_wrappers.py::test_denied_bash_raises_before_spawn" "test/unit/test_governed_wrappers.py::test_unmatched_calls_run_untouched" "test/integration/test_mutation_footer.py::test_kernel_edit_shows_a_diff_block" "test/unit/test_governed_wrappers.py::test_malformed_policy_is_loud_for_governed_and_silent_for_read" "test/unit/test_web.py::test_web_fetch_denies_at_the_hop_not_after_it" "test/unit/test_web.py::test_web_fetch_follows_redirects_and_audits_both_urls_under_policy" "test/integration/test_kernel_lifecycle.py::test_policy_present_refuses_ungoverned_attach_then_recovers" -v`
 
-Expected: all pass. Map in the report: criterion 1 → denied_bash + unmatched; 2 → kernel_edit_shows_a_diff_block (also assert from its output that the audit line's diff is ≤2100 chars — read the audit.jsonl the test's ptc_home leaves if the fixture allows, else cite the cap test `test_huge_diff_is_capped_with_a_note`); 4 → malformed_loud; 5 → the two web tests (note: the denial is at the second hop — the redirector itself was allowed — and the audit-both-URLs half is proven by the non-denied twin, since a denied fetch never completes to have a final URL); 6 → refuses_ungoverned_attach_then_recovers.
+Expected: all pass. Map in the report: criterion 1 → denied_bash + unmatched (which now runs `bash("echo ok")` itself); 2 → kernel_edit_shows_a_diff_block (also assert from its output that the audit line's diff is ≤2100 chars — read the audit.jsonl the test's ptc_home leaves if the fixture allows, else cite the cap test `test_huge_diff_is_capped_with_a_note`); 4 → malformed_loud; 5 → the two web tests (note: the denial is at the second hop — the redirector itself was allowed — and the audit-both-URLs half is proven by the non-denied twin, since a denied fetch never completes to have a final URL); 6 → refuses_ungoverned_attach_then_recovers.
 
 - [ ] **Step 3: Report**
 
