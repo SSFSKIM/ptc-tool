@@ -199,3 +199,77 @@ def ensure_venv(run=subprocess.run) -> Path:
         finally:
             lock.rmdir()
         return vd / "bin" / "python"
+
+
+def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
+    """Delete build venvs nothing needs; never one someone might be climbing into.
+
+    A candidate dies only when it is not the build THIS process runs from, no kernel with
+    a live owner records it in meta.json `venv`, and it is older than the grace (which is
+    also what protects a NEWER build another session just provisioned — the runtime cannot
+    recompute a source payload to name "current"). Deferred entirely while any kernel key
+    holds a provisional owner (owner.json without `ready`): that spawn's build is not
+    recorded yet. Serialized against provisioning on the same provision.lock; a held lock
+    means "not now", never "force it".
+    """
+    import time
+
+    from .discovery import read_meta
+    from .ownership import UnknownOwner, read_owner, settled_owner_state
+    from .paths import kernels_root
+    referenced: set[str] = set()
+    root = kernels_root()
+    if root.is_dir():
+        for kd in sorted(root.iterdir()):
+            if not kd.is_dir():
+                continue
+            o = read_owner(kd.name)
+            if o is None:
+                continue
+            if not (kd / "ready").exists():
+                return []          # provisional spawn mid-bootstrap: defer everything
+            try:
+                alive = settled_owner_state(o)
+            except UnknownOwner:
+                alive = True       # unreadable identity pins, never frees
+            if alive:
+                v = read_meta(kd.name).get("venv")
+                if isinstance(v, str):
+                    referenced.add(v)
+    candidates: list[Path] = []
+    vr = venvs_root()
+    if vr.is_dir():
+        candidates += sorted(vr.iterdir())
+    legacy = venv_dir()
+    if legacy.exists() or legacy.is_symlink():
+        candidates.append(legacy)
+    keep = runtime_venv()
+    lock = ptc_home() / "provision.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.mkdir()
+    except (FileExistsError, OSError):
+        return []                  # provisioning (or another GC) is running: not now
+    removed: list[str] = []
+    try:
+        now = time.time()
+        for c in candidates:
+            if c.is_symlink() or not c.is_dir():
+                continue           # a dev setup symlinks the legacy path at a shared cache
+            if keep is not None and c == keep:
+                continue
+            if str(c) in referenced:
+                continue
+            try:
+                if now - c.stat().st_mtime < grace_s:
+                    continue
+                shutil.rmtree(c)
+                removed.append(str(c))
+            except OSError:
+                continue
+    finally:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+    return removed

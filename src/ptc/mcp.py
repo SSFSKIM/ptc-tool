@@ -274,6 +274,11 @@ for fn, name in ((exec_tool, "exec"), (wait_tool, "wait"), (interrupt_tool, "int
 
 
 def main() -> None:
+    try:
+        from .venv import gc_builds
+        gc_builds()
+    except Exception:
+        pass   # GC must never cost a session its adapter
     server.run()          # stdio transport
 
 

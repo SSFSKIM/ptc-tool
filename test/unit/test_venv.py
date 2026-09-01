@@ -193,7 +193,7 @@ def test_waits_for_contended_lock_then_returns_without_provisioning(monkeypatch,
 
 
 def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
-    """venv.py has no time.time()/time.monotonic() call: the 10-minute budget
+    """ensure_venv has no time.time()/time.monotonic() call: the 10-minute budget
     is a fixed 1200-iteration poll loop (1200 * 0.5s sleep), not a wall-clock
     check. A lock that never clears must exhaust every iteration and raise."""
     _project(monkeypatch, tmp_path)
@@ -219,3 +219,92 @@ def test_waiter_provisions_its_own_build_after_holder_releases(monkeypatch, tmp_
     py = venv.ensure_venv(run=_fake_run_factory(calls))
     assert any(c[1] == "venv" for c in calls), "waiter must provision its own build"
     assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"
+
+
+import os
+import time as _time
+
+
+def _aged_build(home: Path, name: str, age_s: float = 100 * 3600) -> Path:
+    d = home / "venvs" / name
+    (d / "bin").mkdir(parents=True)
+    (d / "bin" / "python").write_text("#!fake\n")
+    old = _time.time() - age_s
+    os.utime(d, (old, old))
+    return d
+
+
+def _kernel_row(home: Path, key: str, *, ready: bool, venv_path: str | None,
+                alive: bool, monkeypatch) -> None:
+    from ptc.discovery import write_meta
+    from ptc.ownership import Owner, write_owner
+    monkeypatch.setenv("PTC_HOME", str(home))
+    kd = home / "kernels" / key
+    kd.mkdir(parents=True, exist_ok=True)
+    write_owner(key, Owner(99999 if alive else 1, "birth", _time.time(), "n0", "e0"))
+    if ready:
+        (kd / "ready").write_text("e0")
+    if venv_path is not None:
+        write_meta(key, venv=venv_path)
+
+
+def _gc_env(monkeypatch, tmp_path, *, alive_pids=()):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("PTC_HOME", str(home))
+    import ptc.venv as pv
+    monkeypatch.setattr(pv, "runtime_venv", lambda: None)
+    from ptc import ownership
+    monkeypatch.setattr(ownership, "settled_owner_state",
+                        lambda o: o.pid in alive_pids)
+    return home
+
+
+def test_gc_removes_unreferenced_aged_builds(monkeypatch, tmp_path):
+    home = _gc_env(monkeypatch, tmp_path)
+    dead = _aged_build(home, "aaaaaaaaaaaa")
+    removed = venv.gc_builds()
+    assert str(dead) in removed and not dead.exists()
+
+
+def test_gc_keeps_builds_referenced_by_a_live_kernel(monkeypatch, tmp_path):
+    home = _gc_env(monkeypatch, tmp_path, alive_pids={99999})
+    kept = _aged_build(home, "bbbbbbbbbbbb")
+    _kernel_row(home, "k1", ready=True, venv_path=str(kept), alive=True,
+                monkeypatch=monkeypatch)
+    assert venv.gc_builds() == []
+    assert kept.exists()
+
+
+def test_gc_defers_entirely_while_a_spawn_is_provisional(monkeypatch, tmp_path):
+    """owner.json without `ready` = a bootstrap in flight whose build is not recorded
+    yet; deleting ANY build on that gap recreates the deleted-venv failure."""
+    home = _gc_env(monkeypatch, tmp_path, alive_pids={99999})
+    victim = _aged_build(home, "cccccccccccc")
+    _kernel_row(home, "mid-spawn", ready=False, venv_path=None, alive=True,
+                monkeypatch=monkeypatch)
+    assert venv.gc_builds() == []
+    assert victim.exists()
+
+
+def test_gc_respects_grace_symlinks_and_the_lock(monkeypatch, tmp_path):
+    home = _gc_env(monkeypatch, tmp_path)
+    fresh = _aged_build(home, "dddddddddddd", age_s=60)          # inside grace
+    real = _aged_build(home, "eeeeeeeeeeee")
+    link = home / "venvs" / "linked"
+    link.symlink_to(real)                                         # dev-cache symlink
+    legacy = home / "venv"
+    (legacy / "bin").mkdir(parents=True)
+    old = _time.time() - 100 * 3600
+    os.utime(legacy, (old, old))
+    removed = venv.gc_builds()
+    # precise claims (note: `real` is itself unreferenced+aged and legitimately removed;
+    # the symlink-skip protects the LINK from being followed, so test with lexists):
+    assert fresh.exists() and str(fresh) not in removed
+    assert link.is_symlink() and str(link) not in removed
+    assert str(legacy) in removed and not legacy.exists()         # legacy is a candidate
+    # lock-held: nothing moves
+    again = _aged_build(home, "ffffffffffff")
+    (home / "provision.lock").mkdir()
+    assert venv.gc_builds() == []
+    assert again.exists()
