@@ -947,6 +947,27 @@ are binding.
 - **S8 — peek daemon under a busy kernel.** See initiative 2 above: a daemon thread serving
   `peek.sock` answers inside 1 s while a tight-loop cell holds the main thread; a stale
   socket after kernel death confuses nothing.
+  *Verdict (measured 2026-09-01 on a real kernel, plan stage): PROMOTE, with two orders of
+  margin.* Three runs of `test/spikes/s8_peek_daemon.py` against a real ipykernel driven by
+  `while True: n += 1` (the cell state observed is `Running` — the loop genuinely holds the
+  main thread) peeked `n` over the socket in **6 / 8 / 15 ms**, against a 1 s bound. The
+  busy mechanism is ordinary GIL sharing: the serving thread parks in `accept()` with the
+  GIL released, and CPython's switch interval hands it the GIL on the next check — the
+  spinning loop had reached ~2 × 10⁷ iterations by the time each answer came back, so it was
+  never idle. The socket is bound short in the temp dir and published at `peek.sock` as a
+  symlink (the AF_UNIX 104-byte path cap), which is the mechanism Task 2 ships.
+  **Stale socket: confuses nothing, and the ordering is the one the design assumes.** The
+  probe's post-death connect *succeeded* rather than being refused, and the cause is a
+  sub-millisecond race, not a design hole: `kill_kernel` unlinks `owner.json`/`ready` right
+  after `killpg`, so `kernel_alive()` reports dead **before** the OS has finished tearing
+  down the SIGKILLed process's listening socket, and a connect landing in that window is
+  accepted into a backlog nobody will ever read. Measured in isolation, the window closes
+  after ~0.13 ms (five connect attempts); the socket file left on disk afterwards is inert —
+  connecting to it returns `ConnectionRefusedError` and never a wrong answer. Discovery is
+  therefore strictly ahead of the socket, which is exactly the promote criterion. Two notes
+  carry into Task 2: consult liveness before the socket (already the design), and bound the
+  peek read with a timeout, because a connection accepted into a dead kernel's backlog
+  produces no reply at all rather than an error. Runbook: `test/spikes/s8_peek_daemon.py`.
 
 ## Acceptance
 
