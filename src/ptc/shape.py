@@ -102,6 +102,21 @@ def footer_line(mutations: list, budget: int | None = None) -> str | None:
     return _SEP.join([*kept, _more(len(parts) - len(kept))]) if kept else _more(len(parts))
 
 
+def diff_block(mutations: list, budget: int | None = None) -> str | None:
+    """What CHANGED, where the footer says what the cell DID. Bounded like every other
+    trailing piece; the untruncated diffs live in audit.jsonl (each already capped at
+    2000 chars by the recorder)."""
+    parts = [m["diff"] for m in mutations
+             if m.get("kind") in ("write", "edit") and m.get("diff")]
+    if not parts:
+        return None
+    text = "diff:\n" + "\n".join(p.rstrip("\n") for p in parts)
+    if budget is not None and len(text) > budget:
+        note = "\n…[diffs truncated — full (2000-char-capped) copies in audit.jsonl]"
+        text = (text[:max(budget - len(note), 0)] + note)[:budget]
+    return text
+
+
 def _header(cell_id, status: str, dur_ms: int | None, degraded: bool) -> str:
     dur = f" · {dur_ms / 1000:.1f}s" if dur_ms is not None else ""
     deg = " · [keying: adapter-local]" if degraded else ""
@@ -204,6 +219,7 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
     # the footer did it with ~179k characters of mutations, `result_repr` can do it with
     # the 4096 the kernel allows it against a cap of 100.
     f = footer_line(rec.mutations, budget=trailing_budget(cap))
+    d = diff_block(rec.mutations, budget=trailing_budget(cap))
     err_line = None
     if rec.status == "error" and rec.error and rec.error.get("ename") not in (None, ""):
         if rec.error["ename"] not in outcome.output:
@@ -215,11 +231,11 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
         # `bash(...)` without `await` settles `ok` with exactly this repr and nothing else
         # to distinguish it from a successful quiet cell — the silent form of the trap.
         res_line += "\n[an unawaited coroutine: nothing ran — re-run the call with await]"
-    trailing = sum(len(x) for x in (f, err_line, res_line) if x)
+    trailing = sum(len(x) for x in (f, err_line, res_line, d) if x)
     body = _truncate(outcome.output, cap - trailing, full_log)
     if body:
         lines.append(body.rstrip("\n"))
-    lines.extend(x for x in (err_line, res_line, f) if x)
+    lines.extend(x for x in (err_line, res_line, d, f) if x)
     return Rendered("\n".join(lines), [Path(p) for p in rec.images if Path(p).exists()])
 
 

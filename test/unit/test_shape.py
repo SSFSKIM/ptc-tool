@@ -264,3 +264,46 @@ def test_render_and_to_dict_report_a_cell_that_does_not_exist():
     assert "still running" not in r.text
     assert to_dict(NotFound(4242), "k") == {"status": "not_found", "cell_id": 4242}
     assert render(Busy(7, reason="running"), "k", cfg).text != r.text
+
+
+def test_diff_block_renders_write_and_edit_diffs():
+    from ptc.shape import diff_block
+    muts = [
+        {"kind": "edit", "path": "/p/a.py", "diff": "--- /p/a.py\n+++ /p/a.py\n-old\n+new\n"},
+        {"kind": "bash", "command": "ls"},
+        {"kind": "write", "path": "/p/b.py", "diff": "+++ /p/b.py\n+hello\n"},
+    ]
+    block = diff_block(muts, budget=None)
+    assert block.startswith("diff:")
+    assert "-old" in block and "+new" in block and "+hello" in block
+
+
+def test_diff_block_is_none_without_diffs():
+    from ptc.shape import diff_block
+    assert diff_block([{"kind": "bash", "command": "ls"}], budget=None) is None
+    assert diff_block([], budget=None) is None
+
+
+def test_diff_block_truncates_honestly_to_budget():
+    from ptc.shape import diff_block
+    muts = [{"kind": "edit", "path": "/p/a.py", "diff": "x" * 5000}]
+    block = diff_block(muts, budget=300)
+    assert len(block) <= 300
+    assert "audit.jsonl" in block          # the untruncated record's address
+
+
+def test_render_places_diff_between_result_and_footer(tmp_path):
+    from ptc.cells import CellRecord
+    from ptc.client import Completed
+    from ptc.paths import Config
+    from ptc.shape import render
+    rec = CellRecord(status="ok", duration_ms=5, result_repr="'done'", error=None,
+                     images=[], mutations=[
+                         {"kind": "edit", "path": "/p/a.py", "added": 1, "removed": 1,
+                          "diff": "--- /p/a.py\n+++ /p/a.py\n-old\n+new\n"}])
+    text = render(Completed(3, rec, "body text"), "k", Config.from_env()).text
+    assert "diff:" in text and "-old" in text
+    # the load-bearing ordering claims:
+    assert text.index("result:") < text.index("diff:")
+    assert text.index("body text") < text.index("diff:")
+    assert "edited /p/a.py" in text or "edit" in text      # footer still fingerprints
