@@ -709,8 +709,9 @@ when the marketplace prunes old versions.
   contract (cells layout, record schema, connection handshake). Attach is allowed whenever
   the kernel's venv directory still exists and its protocol matches; a build difference
   alone costs one notice line in the shaped header — `kernel running build <old> (current
-  <new>); restart() to pick up the new runtime` — never a recycle. `_upgraded_under`
-  becomes the venv-gone check (GC accident, manual rm), reporting on the same notice
+  <new>) — restart() to pick up the new runtime` — never a recycle. `_upgraded_under`
+  retired with the in-place rebuild itself; its successor `_venv_gone` checks that the
+  recorded venv still stands (GC accident, manual rm), reporting on the same notice
   channel as today. An absent protocol reads as 0, so pre-v0.3 kernels are recycled once at
   rollout with the standard notice — the cost every upgrade charged until now, paid one
   last time. (Initiative 3 adds one conditional gate on this attach — the
