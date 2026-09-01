@@ -821,6 +821,11 @@ the untruncated record stays in audit.jsonl.
 ]}
 ```
 
+`tools` names are a closed set — exactly the four governed wrappers above (`GOVERNED_TOOLS`
+in `src/ptc/policy.py`). An unknown name is a malformed policy, loud at parse, never a
+silently inert rule: a rule that can never fire must not count toward an active policy.
+Widening the set later is a deliberate schema decision, not a free string.
+
 `web_fetch` evaluation is per-hop: redirects are followed manually and every hop's URL is
 checked BEFORE it is requested, with the original and final URLs both audited — a denied
 destination reached through an allowed redirector is refused at the hop, not regretted
@@ -1714,6 +1719,28 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   plain exec lives under). Suite 570 passed / 7 skipped.
   Date/Author: 2026-09-01 / Claude (SDE controller).
 
+- Decision: initiative 3 SHIPPED as v0.5.0 (commits bb5c2b5..df899cc). Six-task SDE run
+  (policy core; governed wrappers + diffs; web per-hop denial; diff render; skew gate +
+  doctrine; acceptance — all six criteria PASS, criterion 5 stronger than planned: a
+  denied redirect's audit already records both URLs across the request and deny lines).
+  Task 1's review forced three red-first loader fixes (non-string pattern/path, unreadable
+  file, empty tools list — all now malformed-loud). Final review (fable, whole branch):
+  FIX-FIRST on two P2s, both honesty-doctrine violations, fixed red-first in df899cc:
+  unknown tool names now a parse-time PolicyError (closed set `GOVERNED_TOOLS` — the same
+  active-but-unfirable class the Task-1 wave closed for `tools: []`), and the README's
+  skew-gate claim corrected (the refusal keys on a kernel from a build predating policy
+  enforcement — meta lacking `governed` — NOT on policy write time; current-build kernels
+  read the policy live via the mtime cache). Debt logged on the tracker, most important
+  first: `governed` is a boolean so the identical skew returns if the governed set widens
+  (generation integer closes it durably); hop-0 URL matched raw vs httpx-normalized later
+  hops; unbounded diff input before the cap (measured harmless: 0.1 s / 200k-line
+  rewrite); unreachable Location-fallback branch (verified against httpx 0.28.1 source);
+  mutable cached rules list; same-mtime-tick staleness; conftest sentinel filename;
+  render-layer nits (sub-note budget, diff-vs-footer ordering pin, 4-piece worst case).
+  Dismissed with reason: denied mutations render no footer line (the PermissionError
+  already renders in the cell's error output). Suite 607 passed / 7 skipped.
+  Date/Author: 2026-09-01 / Claude (SDE controller).
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2359,6 +2386,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (initiative 3 shipped, v0.5.0): governed side effects live — bounded unified diffs (≤2000 chars, note-inclusive) in the shaped `diff:` block and audit.jsonl for `write`/`edit`, the opt-in deny policy (schema v1, closed `tools` set — a clause this section gained in the ship pass after the final review caught unknown names loading as unfirable protection), per-hop web_fetch denial with both URLs audited, and the upgrade-skew attach gate (`governed` meta marker, two-exit refusal). The README's skew claim was corrected in the fix wave: refusal keys on the kernel's build predating enforcement, not policy write time. Decision Log entry above carries the delivery record and triaged debt. Suite 607 passed. This closes the v0.3 line — all three structural items from the second live-usage report are shipped (v0.3.0, v0.4.0, v0.5.0).
 
 - 2026-09-01 (initiative 2 shipped, v0.4.0): queued admission + peek live — `exec(queue=True)`/`ptc exec --queue` wait-then-submit in front of the untouched F2 machinery with an honest `queue-timeout`, and a sixth MCP tool `peek` (CLI `ptc peek`) reading AST-restricted variable reprs from a busy kernel over a symlink-published socket (sun_path cap corrected on both ends mid-flight). Subagent auto-keying covers peek via the extended hook matcher. This section's peek containment sentence and the CLI table were corrected in the ship commit; the Decision Log entry above carries the delivery record and triaged debt. Suite 570 passed.
 
