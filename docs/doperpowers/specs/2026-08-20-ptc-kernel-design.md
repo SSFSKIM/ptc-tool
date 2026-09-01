@@ -128,6 +128,9 @@ are spawned *from inside* the kernel — nothing authoritative lives in the adap
 installing a target project's deps into the kernel — run project code through the project's own
 environment, verbatim Prime doctrine).
 
+*(v0.3, initiative 1 of `## Structural follow-on`, supersedes the single shared directory:
+side-by-side immutable `~/.ptc/venvs/<build_id>/`, `--no-editable`, path-independent identity.)*
+
 ### Spawn and keying
 
 A kernel is spawned on first `exec` for a session key:
@@ -224,7 +227,8 @@ kernel with the namespace intact.
 A stdio MCP server (Python `mcp` SDK), registered by the plugin's `.mcp.json`. It declares
 server-level `instructions` (a ~10-line condensation of the skill: persistent namespace, assign
 don't print, yield/wait, `session=` escape hatch) so the basics survive even when the skill is not
-loaded. Five tools:
+loaded. Five tools (initiative 2 of `## Structural follow-on` adds a sixth, `peek`, and a
+`queue=` param on `exec`):
 
 | tool | params | behavior |
 |---|---|---|
@@ -654,6 +658,151 @@ recorded as a residual, not shipped.
 | `PTC_MAX_OUTPUT_CHARS` | `12000` | default result cap |
 | `PTC_IDLE_HOURS` | `24` | kernel self-reap (the TTL qualifying all persistence promises) |
 | `PTC_CODEX_INHERIT` | unset | `1` restores the user's full Codex surface in `provider="codex"` children — PTC otherwise spawns `codex app-server --disable hooks --disable plugins`, which also removes plugin-provided skills. Credential stripping from the codex child's environment is unconditional and this knob does not affect it. |
+| `PTC_POLICY` | `~/.ptc/policy.json` | deny-policy file path (v0.3 initiative 3); absent file = empty policy |
+
+## Structural follow-on (v0.3 line): immutable-build venvs, queued admission, governed side effects
+
+Three initiatives designed together (2026-09-01, from the second live-usage report's structural
+items), delivered sequentially as three separate plans in this order. Each layers onto a standing
+guarantee without changing it: survivability makes the venv immutable instead of rebuilding it in
+place, queueing puts a wait in FRONT of the unchanged admission machinery, governance defaults to
+an empty policy. Shared vocabulary: a **build** is one provisioned venv identified by what it was
+built from; the **admission machinery** is `src/ptc/client.py`'s F2 apparatus (submit lock,
+pending marker, epoch/nonce discharge proofs) guaranteeing a request is never invisibly queued.
+
+### Initiative 1 — kernel survivability: immutable per-build venvs
+
+**Problem.** `~/.ptc/venv` is one shared directory; every stamp change rebuilds it IN PLACE
+(`uv venv --clear`), so a running kernel keeps executing out of a deleted tree and
+`_upgraded_under` recycles it — deliberately, because attaching to deleted code is worse.
+Observed three times in one live session; each recycle annihilated a namespace holding
+unserializable state (subprocess handles — precisely what no snapshot scheme could save).
+Two aggravators: the stamp payload embeds the package's absolute path, so a plugin version
+bump with UNCHANGED dependencies still reads as a new build; and the project is installed
+editable, so a provisioned venv also dies with the plugin cache directory it points into
+when the marketplace prunes old versions.
+
+**Design.** Builds become immutable and side-by-side:
+
+- **Identity**: `build_id = sha256(canonical-json{schema: 3, pyproject_sha, lock_sha,
+  src_sha})[:12]`, where `src_sha` hashes the sorted (relative path, content sha256) pairs
+  of `src/ptc/**/*.py`. Path-independent: the same source provisioned from any plugin cache
+  directory reuses the same venv. Computed identically in `src/ptc/venv.py` and
+  `bin/ptc-launch` (the byte-identical-payload contract those two files already carry).
+- **Layout**: `~/.ptc/venvs/<build_id>/`, stamp written inside as `.ptc-version` (full
+  payload, for diagnostics). `paths.venv_dir()` resolves to the current build's directory.
+  Legacy `~/.ptc/venv` is never touched again.
+- **Self-containment**: `uv sync --no-editable` installs the project as a copy, so a
+  provisioned build outlives the plugin cache directory it was provisioned from.
+- **Attach across builds**: meta.json's `build` keeps recording the build the kernel
+  launched from, plus a new integer `protocol` (current value: 1) naming the disk/wire
+  contract (cells layout, record schema, connection handshake). Attach is allowed whenever
+  the kernel's venv directory still exists and its protocol matches; a build difference
+  alone costs one notice line in the shaped header — `kernel running build <old> (current
+  <new>); restart() to pick up the new runtime` — never a recycle. `_upgraded_under`
+  becomes the venv-gone check (GC accident, manual rm), reporting on the same notice
+  channel as today. An absent protocol reads as 0, so pre-v0.3 kernels are recycled once at
+  rollout with the standard notice — the cost every upgrade charged until now, paid one
+  last time.
+- **GC**: a build directory (the legacy `~/.ptc/venv` included, using the identity its own
+  `.ptc-version` yields) is deleted when it is not the current build, no kernel with a live
+  owner references it in meta.json `build`, and its mtime is older than 72 h. Runs after
+  every successful provision and from the SessionStart hook.
+
+**Spike S7** (plan-stage): provision a second build beside an existing one; measure marginal
+allocated disk (uv hardlinks + APFS clones should land far below the 535 MB nominal) and
+warm provision time. Promote as-is if marginal cost is tolerable (< ~150 MB allocated,
+< 60 s warm); otherwise tighten the GC grace — the design itself does not change.
+
+**Acceptance** (observable):
+1. A kernel holds a variable; modify a file's content under `src/ptc/` (the identity hashes
+   content, not mtimes — a new build_id) and re-provision; a fresh adapter attaches to the
+   SAME kernel — variable intact, header carries the build-difference notice.
+2. After `ptc kill` of every kernel referencing the old build, the next provision (or
+   SessionStart) removes that build's directory once past grace (tested with grace 0).
+3. Provision, then rename the package source directory: kernel spawn + bootstrap still
+   succeed from the venv's own copy (the `--no-editable` proof).
+
+### Initiative 2 — queued admission and the peek channel
+
+**Queued admission.** `exec(code, queue=True)` (CLI `--queue`): when admission returns
+Busy, poll `is_busy()` at 0.5 s + jitter until free, then submit through the untouched
+`exec_cell` path; a caller that loses the admission race to another poller takes the Busy
+as one more poll and keeps looping while budget remains. The F2 invariant is REWORDED, not weakened: a request is never
+*invisibly* queued — a queued call is one tool call visibly in flight, and its budget is
+the ordinary `timeout_s`, so a long-budget queued exec rides the harness's ~2-minute
+auto-backgrounding into "wake me when my turn ran". Budget exhausted while still waiting →
+`Busy(reason="queue-timeout")`, rendered with how long it queued and which cell holds the
+kernel. Two concurrent queued callers race for the slot without FIFO ordering (Decision
+Log). The plain busy render gains one hint line: `pass queue=True to wait for the slot`.
+
+**Peek.** A read-only inspection channel that works while the kernel is busy — the
+feedback's actual pain ("can't even check a counter behind a long cell"; output tailing
+already works via `wait`, but expression values do not). Bootstrap starts a daemon thread
+serving `~/.ptc/kernels/<key>/peek.sock` (0600, inside the 0700 kernel dir): one JSON line
+in (`{"expr": …}`), one out (`{"repr": …, "truncated": bool}` or `{"error": …}`). The
+expression is AST-restricted to Name / Attribute / constant-Subscript chains — no calls,
+no assignments — then evaluated against the kernel namespace under the GIL; repr capped at
+4000 chars. Residual, stated: `__repr__` is user code and a mid-mutation object reprs as a
+snapshot — this is an informational channel inside the kernel's own trust domain, not a
+new boundary. Surface: a sixth MCP tool `peek(expr, session=)` (docstring = call-time
+contract), CLI `ptc peek <expr>`, one instructions-digest line, and the `hooks/hooks.json`
+PreToolUse matcher gains `peek` so a subagent's peek resolves to ITS kernel, not the
+parent's. A kernel from a pre-peek build has no socket; the tool says so and names
+`restart()` as the upgrade.
+
+**Spike S8** (plan-stage): daemon-thread responsiveness under a busy kernel (tight-loop
+cell) — peek must answer inside 1 s; also verify a stale socket after kernel death
+confuses nothing (discovery reports the kernel dead before anyone consults the socket).
+
+**Acceptance**:
+1. A cell running `while True: n += 1` holds the kernel; plain `exec("n")` → Busy carrying
+   the hint line; `peek("n")` → an int repr within 1 s.
+2. `exec("2+2", queue=True, timeout_s=60)` behind a 10 s sleep cell returns `4` in one
+   call.
+3. `peek("os.system('true')")` → rejected (call nodes refused), kernel untouched.
+4. A dispatched subagent's `peek` answers from the subagent's own kernel.
+
+### Initiative 3 — governed side effects: diffs and a deny policy
+
+**Diffs.** `files.write`/`files.edit` (`src/ptc/runtime/files.py`) additionally record a
+unified diff (difflib, 3 context lines) capped at 2000 chars per mutation — in the
+mutation entry and the same audit.jsonl line. `write` to an existing file reads it first to
+diff against; a new file diffs against empty. The renderer (`src/ptc/shape.py`) shows a
+`diff:` block after the output inside the existing trailing-budget mechanics — the footer
+fingerprint says what the cell DID, the diff shows what CHANGED; both truncate honestly and
+the untruncated record stays in audit.jsonl.
+
+**Deny policy.** Opt-in, user-owned: `~/.ptc/policy.json` (path overridable via
+`PTC_POLICY`), consulted kernel-side by the governed wrappers (`bash`, `write`, `edit`,
+`web_fetch` in v1), cached by mtime. Schema v1:
+
+```json
+{"version": 1, "deny": [
+  {"tools": ["bash"], "pattern": "<python regex, re.search against the final command string>"},
+  {"tools": ["write", "edit"], "path": "<glob against the resolved absolute path>"},
+  {"tools": ["web_fetch"], "pattern": "<regex against the URL>"}
+]}
+```
+
+A match raises `PermissionError` naming the rule index and pattern, and the denial itself
+is audited (`kind="denied"`, tool + clipped payload). Absent file = empty policy = today's
+behavior, tested as such. A file that exists but does not parse fails CLOSED AND LOUD:
+every governed call raises naming the parse error (a silently ignored typo would leave the
+user believing themselves protected), while ungoverned calls (`read`, `llm`, `agent`,
+plain Python) are untouched. Child PTC kernels read the same PTC_HOME policy; `agent()`
+children are full Claude Code processes under their OWN permission system — the policy
+governs this kernel's wrappers, and raw Python was never governed (the
+audit-instead-of-guard-rails boundary stands; this is a tripwire for the wrappers, not a
+sandbox).
+
+**Acceptance**:
+1. A policy denying `^rm ` → `bash("rm -rf /tmp/x")` raises PermissionError naming rule 0;
+   audit.jsonl gains a `denied` line; `bash("echo ok")` unaffected.
+2. `edit()` on a file → the shaped result carries a `diff:` block with `-`/`+` lines; the
+   audit.jsonl entry holds the same diff (≤ 2000 chars).
+3. No policy file → the full existing suite passes unchanged.
+4. Malformed policy.json → `bash("echo hi")` raises naming the JSON error; `read()` works.
 
 ## Delegated unknowns → spikes
 
@@ -732,6 +881,12 @@ are binding.
   is honestly empty on this shape rather than backfilled from the model's write-up. Runbook:
   `test/spikes/s6_websearch_shape.py`; the observed block is the fixture in
   `test/unit/test_web.py`.
+- **S7 — marginal cost of a second build venv.** See initiative 1 in the v0.3 section above:
+  measure allocated disk and warm provision time of a side-by-side build. Promote as-is under
+  ~150 MB allocated and 60 s warm; over that, tighten the GC grace (design unchanged).
+- **S8 — peek daemon under a busy kernel.** See initiative 2 above: a daemon thread serving
+  `peek.sock` answers inside 1 s while a tight-loop cell holds the main thread; a stale
+  socket after kernel death confuses nothing.
 
 ## Acceptance
 
@@ -1370,6 +1525,59 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   before the fix. Known seam, tracker-logged: the CLI resolves without the overlay, so a
   subagent must not mix MCP exec with CLI wait.
   Date/Author: 2026-08-31 / Claude (design approved by owner; v0.2.0)
+
+- Decision: kernel survivability via **immutable per-build venvs** (`~/.ptc/venvs/<build_id>/`,
+  v0.3 initiative 1): an upgrade provisions a NEW directory and never touches the one a
+  running kernel stands on. Build identity is path-independent (pyproject + lock + src tree
+  hashes, no package path), and the project is installed `--no-editable` so a build outlives
+  the plugin cache directory it came from. Rejected: in-place rebuild + recycle (today's
+  behavior — the state annihilation this initiative exists to kill); namespace serialization
+  (the observed losses were live subprocess handles, exactly what no snapshot can save);
+  keeping the venv inside the plugin cache (the marketplace prunes old versions under it).
+  Rejected within the chosen design: keeping the package path in the identity (it is why a
+  version bump with unchanged deps rebuilt everything — the needless-death cause).
+  Date/Author: 2026-09-01 / design session (approved by owner).
+
+- Decision: cross-build attach is governed by a single integer `PTC_PROTOCOL` recorded in
+  meta.json; absent reads as 0, current is 1, mismatch recycles with the standard notice —
+  so pre-v0.3 kernels pay today's upgrade cost exactly once more at rollout. A build
+  difference alone is a header notice, never a recycle. Rejected: grandfathering absent
+  protocol as compatible (unauditable disk-contract drift against arbitrarily old kernels);
+  a per-field compatibility matrix (bookkeeping far beyond what one integer buys).
+  Date/Author: 2026-09-01 / design session.
+
+- Decision: busy queueing is **wait-then-submit** (`exec(queue=True)`, opt-in): poll for the
+  slot in front of the untouched admission machinery, budget = the ordinary `timeout_s`,
+  honest `queue-timeout` Busy on exhaustion. The F2 invariant is reworded to "never
+  INVISIBLY queued". Rejected: a true kernel-side ZMQ queue (no cell id until start,
+  interrupt behavior over queued requests unverified, and a full rework of the
+  pending/epoch/nonce machinery — high risk for no added value over wait-then-submit under
+  auto-backgrounding); queue-by-default (silently changes the existing instant-Busy
+  contract; the busy render's hint line makes the opt-in discoverable instead). Accepted
+  simplification: concurrent queued callers race without FIFO ordering — same-kernel
+  concurrent queueing is rare, and ordering that matters belongs in one cell.
+  Date/Author: 2026-09-01 / design session (owner chose wait-then-submit + opt-in).
+
+- Decision: **peek** is a kernel-side daemon thread + unix socket serving AST-restricted
+  (Name/Attribute/constant-Subscript, no calls) namespace reads while the kernel is busy;
+  repr capped at 4000 chars; hooks matcher extended so subagents peek their own kernels.
+  Rejected: full eval (mutation-capable — no longer read-only); the jupyter control channel
+  (executes no code); harness-side inspection (cannot see a live namespace). Residual
+  stated: `__repr__` is user code and mid-mutation objects repr as snapshots — informational
+  channel inside the kernel's existing trust domain.
+  Date/Author: 2026-09-01 / design session (owner opted in, spike S8 gates the thread).
+
+- Decision: governance = **bounded diffs + opt-in deny policy**, no approval tier. Diffs
+  (2000 chars/entry) ride the mutation records, audit.jsonl, and a `diff:` render block;
+  the policy file (`~/.ptc/policy.json`, `PTC_POLICY`) is user-owned, empty-by-default,
+  evaluated in the governed wrappers only, and a malformed file fails closed-and-loud for
+  governed calls (a silently ignored typo would fake protection). Rejected: an ask/approval
+  tier that pauses a cell mid-flight (no user channel exists inside a cell; it contradicts
+  the audit-instead-of-guard-rails decision above; and it is a large state machine for a
+  boundary raw Python steps around anyway — the policy is a tripwire for the wrappers, not
+  a sandbox); shipping any default rules (the plugin never owns the user's policy).
+  Date/Author: 2026-09-01 / design session (owner chose diff + deny; ask-tier recorded as
+  rejected, revisitable only with an upstream mid-cell approval channel).
 
 ## Surprises & Discoveries
 
@@ -2016,3 +2224,5 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (v0.3 line designed): the three structural items from the second live-usage report — kernel survivability, busy queueing, governance — designed in one brainstorming pass and approved by the owner. New section `## Structural follow-on (v0.3 line)` carries the three initiative designs with per-initiative acceptance; spikes S7 (venv marginal cost) and S8 (peek daemon under load) registered; five Decision Log entries seed the choices and rejected alternatives; Provisioning and MCP-adapter sections gained forward pointers; `PTC_POLICY` added to the configuration reference. Delivery is sequential (survivability → queueing → governance), one plan each.
