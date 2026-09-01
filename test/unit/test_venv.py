@@ -74,6 +74,9 @@ def test_build_id_changes_with_source_content(monkeypatch, tmp_path):
     before = venv.build_id()
     _write_src_tree(root, extra="CHANGED = True\n")
     assert venv.build_id() != before
+    after_src = venv.build_id()
+    (root / "uv.lock").write_text("version = 1\n# a dependency was pinned down\n")
+    assert venv.build_id() != after_src, "a lock-only change is a new build"
 
 
 def test_stamp_payload_has_no_path_and_schema_3(monkeypatch, tmp_path):
@@ -142,6 +145,18 @@ def test_new_build_lands_beside_old_one(monkeypatch, tmp_path):
     assert (new / "bin" / "python").exists()
 
 
+def test_spawn_venv_prefers_a_standing_provisioned_build(monkeypatch, tmp_path):
+    """A checkout CLI run is not provisioned itself, but once its `ptc setup` has built the
+    current source's venv, kernels must spawn from THAT — nothing fills the legacy shared
+    directory any more, so without this rung the CLI-standalone flow has no venv at all."""
+    from ptc.paths import venv_dir as legacy_dir
+    _project(monkeypatch, tmp_path)
+    monkeypatch.setattr(venv, "runtime_venv", lambda: None)
+    assert venv.spawn_venv() == legacy_dir()          # nothing provisioned yet
+    venv.ensure_venv(run=_fake_run_factory([]))
+    assert venv.spawn_venv() == venv.build_venv_dir(venv.build_id())
+
+
 def test_ensure_venv_without_source_raises_runtime_error(monkeypatch, tmp_path):
     """A --no-editable runtime has no pyproject/lock beside it and so cannot compute a
     payload. Saying so beats provisioning something under a guessed identity."""
@@ -191,3 +206,16 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="lock"):
         venv.ensure_venv(run=_must_not_provision)
     assert len(sleep_calls) == 1200
+
+
+def test_waiter_provisions_its_own_build_after_holder_releases(monkeypatch, tmp_path):
+    """The lock holder was provisioning a DIFFERENT build; when it releases, the waiter
+    must take the lock and provision its own rather than raise (rollout overlap)."""
+    _project(monkeypatch, tmp_path)
+    lock = tmp_path / "home" / "provision.lock"
+    lock.mkdir(parents=True)
+    calls: list = []
+    monkeypatch.setattr(time, "sleep", lambda s: lock.rmdir())
+    py = venv.ensure_venv(run=_fake_run_factory(calls))
+    assert any(c[1] == "venv" for c in calls), "waiter must provision its own build"
+    assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"

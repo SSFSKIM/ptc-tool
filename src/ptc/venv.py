@@ -69,9 +69,19 @@ def runtime_venv() -> Path | None:
 
 
 def spawn_venv() -> Path:
-    """The venv kernels are spawned from: our own build when provisioned, else the legacy
-    shared directory (dev runs and the test fixtures that symlink it)."""
-    return runtime_venv() or venv_dir()
+    """The venv kernels are spawned from: our own build when we run provisioned; else the
+    current source's provisioned build when one is standing (a checkout CLI after
+    `ptc setup`); else the legacy shared directory (dev runs and the test fixtures that
+    symlink it — no test home carries a provisioned build, so fixtures keep resolving to
+    their symlink)."""
+    rv = runtime_venv()
+    if rv is not None:
+        return rv
+    try:
+        bd = build_venv_dir(build_id())
+    except OSError:
+        return venv_dir()
+    return bd if (bd / "bin" / "python").exists() else venv_dir()
 
 
 def venv_python() -> Path:
@@ -141,43 +151,51 @@ def ensure_venv(run=subprocess.run) -> Path:
             "or a checkout, never from a --no-editable runtime") from e
     bid = build_id(payload)
     vd = build_venv_dir(bid)
-    if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
-        return vd / "bin" / "python"
     lock = ptc_home() / "provision.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        lock.mkdir()  # mkdir-based lock, matches ptc-launch
-    except FileExistsError:
-        # another provisioner is running; wait for it (up to 10 min), then re-check
-        import time
-        for _ in range(1200):
-            if not lock.exists():
-                break
-            time.sleep(0.5)
+    import time
+    polls = 1200                       # 10 min at 0.5 s
+    while True:
         if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
             return vd / "bin" / "python"
-        raise RuntimeError("venv provisioning lock held and build still absent; "
-                           f"remove {lock} if no other ptc process is running")
-    try:
-        uv = _uv()
-        # --clear is harmless on a fresh directory and load-bearing on a retry over a
-        # half-provisioned one (uv refuses to create over an existing venv). It never
-        # touches another build: this directory is named for THIS payload.
-        run([uv, "venv", str(vd), "--python", "3.12", "--seed", "--clear"],
-            check=True)
-        # `uv sync --locked` installs the versions in the checked-in `uv.lock` and fails
-        # loudly if that lock no longer matches `pyproject.toml` — the honest failure, at
-        # provisioning time, rather than a kernel quietly running a resolution nobody
-        # tested. `--inexact` leaves the seeded pip alone (a bare sync removes anything the
-        # lock does not name); `--no-dev` keeps the test group out of a user's runtime;
-        # `--no-editable` copies the project into the venv so the build outlives the source
-        # directory it came from — the self-containment half of survivability.
-        run([uv, "sync", "--locked", "--inexact", "--no-dev", "--no-editable",
-             "--extra", "kernel", "--project", str(PKG_ROOT)],
-            check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(vd)})
-        # The stamp goes in LAST: it is what marks the directory complete, so a provision
-        # that dies midway leaves a build nothing will mistake for finished.
-        (vd / ".ptc-version").write_text(json.dumps(payload))
-    finally:
-        lock.rmdir()
-    return vd / "bin" / "python"
+        try:
+            lock.mkdir()  # mkdir-based lock, matches ptc-launch
+        except FileExistsError:
+            # Take-the-lock retry, not wait-then-recheck: under per-build directories the
+            # holder is usually provisioning a DIFFERENT build (old and new adapters
+            # overlap across every rollout), so a cleared lock says nothing about ours —
+            # keep trying to TAKE it ourselves until the budget runs out.
+            if polls <= 0:
+                raise RuntimeError(
+                    "venv provisioning lock held and build still absent; "
+                    f"remove {lock} if no other ptc process is running")
+            polls -= 1
+            time.sleep(0.5)
+            continue
+        try:
+            # Re-checked under the lock: the holder we queued behind may have been
+            # provisioning this very build.
+            if not ((vd / "bin" / "python").exists() and _stamp_matches(vd, payload)):
+                uv = _uv()
+                # --clear is harmless on a fresh directory and load-bearing on a retry over
+                # a half-provisioned one (uv refuses to create over an existing venv). It
+                # never touches another build: this directory is named for THIS payload.
+                run([uv, "venv", str(vd), "--python", "3.12", "--seed", "--clear"],
+                    check=True)
+                # `uv sync --locked` installs the versions in the checked-in `uv.lock` and
+                # fails loudly if that lock no longer matches `pyproject.toml` — the honest
+                # failure, at provisioning time, rather than a kernel quietly running a
+                # resolution nobody tested. `--inexact` leaves the seeded pip alone (a bare
+                # sync removes anything the lock does not name); `--no-dev` keeps the test
+                # group out of a user's runtime; `--no-editable` copies the project into
+                # the venv so the build outlives the source directory it came from — the
+                # self-containment half of survivability.
+                run([uv, "sync", "--locked", "--inexact", "--no-dev", "--no-editable",
+                     "--extra", "kernel", "--project", str(PKG_ROOT)],
+                    check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(vd)})
+                # The stamp goes in LAST: it is what marks the directory complete, so a
+                # provision that dies midway leaves a build nothing mistakes for finished.
+                (vd / ".ptc-version").write_text(json.dumps(payload))
+        finally:
+            lock.rmdir()
+        return vd / "bin" / "python"
