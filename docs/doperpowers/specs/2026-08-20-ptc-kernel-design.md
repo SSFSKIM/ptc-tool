@@ -884,6 +884,14 @@ are binding.
 - **S7 — marginal cost of a second build venv.** See initiative 1 in the v0.3 section above:
   measure allocated disk and warm provision time of a side-by-side build. Promote as-is under
   ~150 MB allocated and 60 s warm; over that, tighten the GC grace (design unchanged).
+  *Verdict (measured 2026-09-01, design stage): PROMOTE, by three orders of magnitude on
+  disk.* Two same-lock venvs provisioned side by side on APFS: apparent 521 MB each, true
+  allocated cost of the second (df free-space delta) **6.7 MB**; warm provision **0.28 s**
+  (`uv venv` 0.03 s + `uv sync --locked --no-editable` 0.25 s). uv's clone/hardlink reuse of
+  its global cache makes side-by-side builds nearly free; the 72 h GC grace is generous, not
+  load-bearing. Approximation stated: measured with the same lock under the current scheme —
+  a real upgrade shares slightly less (changed dep versions cost their own extents), which
+  cannot approach the promote bound.
 - **S8 — peek daemon under a busy kernel.** See initiative 2 above: a daemon thread serving
   `peek.sock` answers inside 1 s while a tight-loop cell holds the main thread; a stale
   socket after kernel death confuses nothing.
