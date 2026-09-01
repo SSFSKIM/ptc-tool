@@ -115,6 +115,8 @@ _BUSY_TEXT = {
     "running": "cell {id} is still running",
     "pending-unconfirmed": "cell {id} was just submitted and is awaiting the kernel's confirmation",
     "lock-held": "cell {id} is busy — another submission currently holds the kernel's admission lock",
+    "queue-timeout": ("cell {id} is still running — this call queued for its whole budget "
+                      "and the slot never freed"),
 }
 _BUSY_TEXT_NO_ID = {
     # No id was ever confirmed, so no terminal record can discharge the marker either
@@ -124,6 +126,7 @@ _BUSY_TEXT_NO_ID = {
                             "id — nothing else is admitted until it settles or restart() "
                             "clears it"),
     "lock-held": "another submission currently holds the kernel's admission lock",
+    "queue-timeout": "the slot never freed within this call's budget",
 }
 
 
@@ -138,14 +141,22 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
         # The named cell is whatever is holding a SHARED kernel — often another caller's,
         # never this one's submission (nothing was queued). Pointing wait() at that cell as
         # a source of output invited the reader to adopt another caller's result as theirs.
+        #
+        # A queue-timeout caller already waited for the slot, so it is told what its wait
+        # cost and NOT told to pass the flag it just passed.
+        queued = (f"queued {outcome.queued_s:.0f}s — "
+                  if outcome.queued_s is not None else "")
         return Rendered(
             f"[kernel busy{' · [keying: adapter-local]' if degraded else ''}] "
-            f"{which}. "
+            f"{queued}{which}. "
             + (f"That cell may belong to another caller of this shared kernel: its output is "
                f"that cell's, not the result of what you just tried to run — "
                f"wait(cell_id={outcome.cell_id}) tells you when the kernel frees, and "
                "collects that output only for the cell's own submitter. " if has_id else "")
-            + "interrupt() to stop it, or resubmit after it finishes. Nothing was queued.", [])
+            + ("interrupt() to stop it, or resubmit after it finishes. Nothing was queued."
+               if outcome.reason == "queue-timeout" else
+               "interrupt() to stop it, resubmit after it finishes, or pass queue=True "
+               "to wait for the slot. Nothing was queued."), [])
     if isinstance(outcome, NotFound):
         # Said plainly, because the alternative is a caller waiting on an id that will
         # never resolve: nothing is running under this number and nothing will be.
@@ -214,7 +225,10 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
 
 def to_dict(outcome, key: str) -> dict:
     if isinstance(outcome, Busy):
-        return {"status": "busy", "cell_id": outcome.cell_id, "reason": outcome.reason}
+        return {"status": "busy", "cell_id": outcome.cell_id, "reason": outcome.reason,
+                # what a queue=True call spent waiting before it gave up (None otherwise):
+                # the --json caller must see what the text render says
+                "queued_s": outcome.queued_s}
     if isinstance(outcome, NotFound):
         return {"status": "not_found", "cell_id": outcome.cell_id}
     if isinstance(outcome, Running):

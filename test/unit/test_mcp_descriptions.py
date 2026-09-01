@@ -33,6 +33,15 @@ def test_exec_description_carries_the_call_time_traps():
         "the kernel/tool timeout naming split is a documented live trap"
 
 
+def test_exec_offers_queue_in_both_the_schema_and_the_description():
+    """The parameter is what makes the wait callable; the sentence is what makes a caller
+    facing `busy` know it exists — the schema alone cannot say the budget is timeout_s."""
+    tools = asyncio.run(server.list_tools())
+    exec_tool = next(t for t in tools if t.name == "exec")
+    assert "queue" in exec_tool.input_schema["properties"]
+    assert "queue=True" in (exec_tool.description or "")
+
+
 def test_wait_description_defines_until_and_since():
     text = _descriptions()["wait"]
     assert "until" in text and "since" in text

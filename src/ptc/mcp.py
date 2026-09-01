@@ -24,14 +24,13 @@ bash, agent, llm, web_fetch, web_search, history, workflow, asyncio (all Python;
 async ones are awaited at top level). Tools: exec, wait, interrupt, restart,
 kernels, peek.
 If a cell yields `running`, use wait(cell_id); if the kernel is busy, wait or
-interrupt — nothing queues. wait also takes until="<python regex>", returning as
-soon as new output first matches instead of at settle. peek(expr) reads a
-variable's repr while a cell runs; exec(queue=True) waits for the slot instead of
-returning busy. Pass session="<id>"
-explicitly if results ever look like a different session's namespace, or if this
-client does not set a session id of its own (the header then reads
-`keying: adapter-local`). Subagent callers are auto-keyed to their own kernels;
-pass session= only to deliberately share one.
+interrupt — nothing queues silently; exec(queue=True) waits for the slot. wait
+also takes until="<python regex>", returning as soon as new output first matches
+instead of at settle. peek(expr) reads a variable's repr while a cell runs.
+Pass session="<id>" explicitly if results ever look like a different session's
+namespace, or if this client does not set a session id of its own (the header
+then reads `keying: adapter-local`). Subagent callers are auto-keyed to their own
+kernels; pass session= only to deliberately share one.
 Tool descriptions carry only the call-time contracts; for anything beyond quick
 calls — agent fan-out, llm, web, workflow — invoke the ptc:ptc skill first: it is
 the full API doctrine.
@@ -142,6 +141,7 @@ def _cfg(timeout_s: float | None, max_output_chars: int | None) -> Config:
 async def exec_tool(code: str, session: str | None = None,
                     timeout_s: float | None = None,
                     max_output_chars: int | None = None,
+                    queue: bool = False,
                     ctx: Context = None) -> list:
     """Run Python in this session's persistent IPython kernel. Variables, imports, and
     handles survive across calls, turns, and compaction — assign large results to variables
@@ -154,14 +154,17 @@ async def exec_tool(code: str, session: str | None = None,
     subagent callers are auto-keyed to kernels of their own; other parallel callers must
     each pass their own session="<name>" or they contend for it and see each other's
     cells. A `running` yield means use the wait tool; `busy` means another cell is still
-    running — nothing queues. The ptc:ptc skill documents the full agent/llm/web/workflow
-    API — invoke it before using those."""
+    running — nothing queues. queue=True waits for the slot instead (budget = timeout_s;
+    with a long budget the wait auto-backgrounds and your turn arrives as a notification).
+    The ptc:ptc skill documents the full agent/llm/web/workflow API — invoke it before
+    using those."""
     r = await asyncio.to_thread(_resolve, session, tool_use_id=_tool_use_id(ctx))
     cfg = _cfg(timeout_s, max_output_chars)
     info = await asyncio.to_thread(ensure_kernel, r.key, cwd=r.cwd,
                                    claude_session_id=r.claude_session_id, config=cfg)
-    outcome = await asyncio.to_thread(KernelClient(r.key).exec_cell, code,
-                                      timeout_s=cfg.yield_s, config=cfg)
+    kc = KernelClient(r.key)
+    runner = kc.exec_cell_queued if queue else kc.exec_cell
+    outcome = await asyncio.to_thread(runner, code, timeout_s=cfg.yield_s, config=cfg)
     rendered = render(outcome, r.key, cfg, degraded=r.degraded)
     if info.expired_notice:
         rendered.text = (f"[previous kernel expired: {info.expired_notice.strip()} — fresh "

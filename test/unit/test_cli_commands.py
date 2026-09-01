@@ -290,6 +290,26 @@ def test_exec_refused_as_busy_exits_nonzero(monkeypatch, capsys):
     assert "busy" in capsys.readouterr().out
 
 
+def test_exec_queue_flag_routes_through_the_waiting_path(monkeypatch, capsys):
+    """`--queue` must reach `exec_cell_queued`; without the flag the plain path stands, and
+    a queue-timeout is still a kernel that ran nothing — EXIT_BUSY, not success."""
+    from ptc import client
+    from ptc.client import Busy
+
+    _exec_returning(monkeypatch, Busy(7, reason="running"))
+    seen = []
+    monkeypatch.setattr(client.KernelClient, "exec_cell_queued",
+                        lambda self, *a, **kw: seen.append(1) or Busy(
+                            7, reason="queue-timeout", queued_s=30.0))
+
+    assert cli.main(["exec", "-s", "k9", "--queue", "1+1"]) == cli.EXIT_BUSY
+    assert seen == [1]
+    assert "queued 30s" in capsys.readouterr().out
+
+    assert cli.main(["exec", "-s", "k9", "1+1"]) == cli.EXIT_BUSY
+    assert seen == [1], "the plain exec must not go through the waiting path"
+
+
 def test_exec_that_yielded_while_still_running_is_still_success(monkeypatch, capsys):
     """The distinction the code carries: a Running cell WAS submitted — the caller's yield
     budget ran out, not the work — so it keeps exit 0 and a cell id to wait on."""

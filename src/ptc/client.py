@@ -1,6 +1,7 @@
 """Jupyter-wire client. One instance per operation is fine; all durable state is on disk."""
 import json
 import os
+import random
 import re
 import signal
 import time
@@ -63,8 +64,11 @@ class Running:
 @dataclass
 class Busy:
     cell_id: int | None
-    #: why admission was refused — "running", "pending-unconfirmed", "lock-held"
+    #: why admission was refused — "running", "pending-unconfirmed", "lock-held",
+    #: or "queue-timeout" (a queued exec's budget ran out before the slot freed)
     reason: str = ""
+    #: how long a queue=True call waited before giving up; None on ordinary Busy
+    queued_s: float | None = None
 
 
 @dataclass
@@ -519,6 +523,34 @@ class KernelClient:
         finally:
             lock_cm.__exit__(None, None, None)
         return self._follow(cell_id, timeout_s)
+
+    def exec_cell_queued(self, code: str, timeout_s: float,
+                         config: Config) -> Completed | Running | Busy:
+        """`exec_cell` behind a wait-for-the-slot loop (spec: wait-then-submit).
+
+        The admission machinery is untouched — this polls in FRONT of it, so every
+        guarantee F2 makes still holds; the one budget covers the queue wait AND the
+        submitted cell's follow (a call that queued 100 s of a 300 s budget follows for
+        at most 200). A lost admission race (another poller won the slot) comes back as
+        Busy and is one more poll, not a return. Exhaustion returns an honest
+        `queue-timeout` Busy naming the holding cell and the time spent queued —
+        nothing was ever submitted, exactly as an ordinary Busy.
+        """
+        start = time.monotonic()
+        deadline = start + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                held = self.is_busy()
+                return Busy(held.cell_id if held is not None else None,
+                            reason="queue-timeout",
+                            queued_s=time.monotonic() - start)
+            out = self.exec_cell(code, timeout_s=remaining, config=config)
+            if not isinstance(out, Busy):
+                return out
+            # Jittered so a crowd of pollers on one kernel does not converge on a single
+            # retry instant, and never past the budget the caller gave this call.
+            time.sleep(min(0.5 + random.random() * 0.25, remaining))
 
     def _archived(self, cell_id: int, offset: int = 0, *,
                   implicit: bool = True) -> Completed | None:

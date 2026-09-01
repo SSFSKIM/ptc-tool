@@ -210,3 +210,16 @@ def test_exec_whose_cell_kills_the_kernel_settles_instead_of_yielding(ptc_home):
     assert out.record.error["ename"] == "KernelDied"
     assert "bye" in out.output
     assert elapsed < 20, f"the follow blocked on a dead kernel for {elapsed:.1f}s"
+
+
+def test_queued_exec_lands_behind_a_sleeping_cell(ptc_home):
+    """queue=True's whole promise against a real kernel: the second submission waits out
+    the first cell in front of the untouched admission machinery, then runs for real."""
+    cfg = Config.from_env()
+    ensure_kernel("qlive", cwd=str(ptc_home), config=cfg)
+    kc = KernelClient("qlive")
+    kc.exec_cell("import time", timeout_s=30, config=cfg)
+    kc.exec_cell("time.sleep(3)", timeout_s=0.3, config=cfg)   # leaves it running
+    out = kc.exec_cell_queued("2+2", timeout_s=60, config=cfg)
+    assert isinstance(out, Completed) and out.record.result_repr == "4"
+    kill_kernel("qlive")

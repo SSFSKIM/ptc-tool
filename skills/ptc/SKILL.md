@@ -32,7 +32,7 @@ next native Edit of it will demand a fresh Read — prefer one lane per file wit
   stop a runaway cell — it comes back with that cell's own tail, so there is nothing left
   to wait for afterwards.
 - If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
-  queues silently.
+  queues silently — or pass `queue=True` to the MCP exec to wait for the slot.
 - While a cell runs, `peek` (MCP tool / `ptc peek <expr>`) reads a variable's repr from
   the live namespace — chains only, no calls; wait() tails output, peek reads values.
   Kernels from pre-peek builds have no channel; restart() upgrades them.

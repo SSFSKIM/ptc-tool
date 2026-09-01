@@ -167,6 +167,22 @@ def test_render_busy_reasons_distinguish_without_fabricating_ids():
     assert pending_sentinel.text != lock_unknown.text
 
 
+def test_busy_render_carries_the_queue_hint():
+    text = render(Busy(3, reason="running"), "k", Config.from_env(env={})).text
+    assert "pass queue=True to wait for the slot" in text
+    assert "Nothing was queued" in text
+
+
+def test_queue_timeout_render_names_duration_and_holder():
+    """A queue-timeout caller already passed queue=True — repeating the hint is noise,
+    and the duration it spent queued is the fact this render exists to carry."""
+    text = render(Busy(3, reason="queue-timeout", queued_s=42.0), "k",
+                  Config.from_env(env={})).text
+    assert "queued 42s" in text and "cell 3" in text
+    assert "pass queue=True" not in text
+    assert "Nothing was queued" in text
+
+
 def test_truncate_non_positive_cap_still_truncates():
     """PTC_MAX_OUTPUT_CHARS=0 must not defeat truncation: Python's text[-0:] is the
     WHOLE string (not empty), so a naive tail slice would leak everything back out
@@ -210,7 +226,11 @@ def test_to_dict_busy_carries_reason():
     """to_dict is the JSON-facing twin of render(); a --json/MCP caller needs the
     same reason distinction a text reader gets from the prose."""
     d = to_dict(Busy(None, reason="lock-held"), "k")
-    assert d == {"status": "busy", "cell_id": None, "reason": "lock-held"}
+    assert d == {"status": "busy", "cell_id": None, "reason": "lock-held",
+                 "queued_s": None}
+    # and the queued form carries what the text render says it waited
+    assert to_dict(Busy(3, reason="queue-timeout", queued_s=42.0), "k") == {
+        "status": "busy", "cell_id": 3, "reason": "queue-timeout", "queued_s": 42.0}
 
 
 def test_result_and_error_ride_inside_the_response_budget():

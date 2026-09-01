@@ -50,7 +50,8 @@ EXIT_INTERRUPTED = 130
 
 _EXIT_CODES = ("exit codes: 0 success · 1 the cell raised, the wait found no such cell, or "
                f"kill found nothing to kill · {EXIT_BUSY} the kernel was busy and the code "
-               "was NOT run (nothing is ever queued — wait, interrupt, or retry) · "
+               "was NOT run (nothing is ever queued silently — wait, interrupt, retry, or "
+               "exec --queue) · "
                f"{EXIT_INTERRUPTED} the cell was interrupted before it finished")
 
 
@@ -82,6 +83,8 @@ def _run(argv=None) -> int:
 
     com("setup")
     sp = com("exec"); sp.add_argument("code")
+    sp.add_argument("--queue", action="store_true",
+                    help="wait for the kernel's slot instead of exiting busy")
     sp = com("wait"); sp.add_argument("cell_id", type=int); sp.add_argument("--since", type=int, default=-1)
     sp.add_argument("--until", default=None, metavar="REGEX",
                     help="return as soon as new output matches this Python regex, "
@@ -222,7 +225,9 @@ def _run(argv=None) -> int:
         # back from there (the restart path above learned this first).
         info = ensure_kernel(key, cwd=resolved.cwd,
                              claude_session_id=resolved.claude_session_id, config=cfg)
-        outcome = KernelClient(key).exec_cell(code, timeout_s=cfg.yield_s, config=cfg)
+        kc = KernelClient(key)
+        runner = kc.exec_cell_queued if a.queue else kc.exec_cell
+        outcome = runner(code, timeout_s=cfg.yield_s, config=cfg)
     else:  # wait
         outcome = KernelClient(key).wait_cell(a.cell_id, timeout_s=cfg.yield_s,
                                               since=a.since, until=a.until)
