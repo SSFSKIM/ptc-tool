@@ -694,6 +694,15 @@ when the marketplace prunes old versions.
   Legacy `~/.ptc/venv` is never touched again.
 - **Self-containment**: `uv sync --no-editable` installs the project as a copy, so a
   provisioned build outlives the plugin cache directory it was provisioned from.
+- **Runtime self-identity**: a provisioned runtime never needs the source tree. Payload
+  computation lives only in the two provisioners (`bin/ptc-launch` and
+  `src/ptc/venv.py::ensure_venv`), both of which run beside a source tree; the
+  adapter and the kernel learn their OWN build from the stamp inside the venv they run
+  from (`sys.prefix/.ptc-version`), and "current" for the attach notice is the adapter's
+  own build — the launcher chose it moments ago. A dev run outside any provisioned venv
+  keeps build None, exactly as today. (Review finding: computing identity from
+  PKG-relative files breaks under `--no-editable`, where no pyproject/lock/src sits
+  beside the installed package.)
 - **Attach across builds**: meta.json's `build` keeps recording the build the kernel
   launched from, plus a new integer `protocol` (current value: 1) naming the disk/wire
   contract (cells layout, record schema, connection handshake). Attach is allowed whenever
@@ -703,11 +712,17 @@ when the marketplace prunes old versions.
   becomes the venv-gone check (GC accident, manual rm), reporting on the same notice
   channel as today. An absent protocol reads as 0, so pre-v0.3 kernels are recycled once at
   rollout with the standard notice — the cost every upgrade charged until now, paid one
-  last time.
+  last time. (Initiative 3 adds one conditional gate on this attach — the
+  governed-capability rule there.)
 - **GC**: a build directory (the legacy `~/.ptc/venv` included, using the identity its own
   `.ptc-version` yields) is deleted when it is not the current build, no kernel with a live
   owner references it in meta.json `build`, and its mtime is older than 72 h. Runs after
-  every successful provision and from the SessionStart hook.
+  every successful provision and from the SessionStart hook. GC serializes with
+  provisioning on the same `provision.lock`, and DEFERS entirely while any kernel key
+  holds a provisional owner (owner.json without `ready`): a spawn's bootstrap window has
+  recorded no build yet, and deleting "unreferenced" builds inside that gap would recreate
+  the exact deleted-venv failure this initiative kills. A ready kernel whose meta records
+  no build (a dev spawn outside provisioned venvs) pins nothing.
 
 **Spike S7** (plan-stage): provision a second build beside an existing one; measure marginal
 allocated disk (uv hardlinks + APFS clones should land far below the 535 MB nominal) and
@@ -721,7 +736,11 @@ warm provision time. Promote as-is if marginal cost is tolerable (< ~150 MB allo
 2. After `ptc kill` of every kernel referencing the old build, the next provision (or
    SessionStart) removes that build's directory once past grace (tested with grace 0).
 3. Provision, then rename the package source directory: kernel spawn + bootstrap still
-   succeed from the venv's own copy (the `--no-editable` proof).
+   succeed from the venv's own copy, and the adapter still resolves its own build id for
+   the header notice (the `--no-editable` + self-identity proof).
+4. A spawn whose bootstrap is in flight (owner.json present, `ready` absent) defers GC:
+   no build directory is deleted until the spawn settles (interleaving test, legacy
+   `~/.ptc/venv` included).
 
 ### Initiative 2 — queued admission and the peek channel
 
@@ -736,16 +755,20 @@ auto-backgrounding into "wake me when my turn ran". Budget exhausted while still
 kernel. Two concurrent queued callers race for the slot without FIFO ordering (Decision
 Log). The plain busy render gains one hint line: `pass queue=True to wait for the slot`.
 
-**Peek.** A read-only inspection channel that works while the kernel is busy — the
+**Peek.** An inspection channel that works while the kernel is busy — the
 feedback's actual pain ("can't even check a counter behind a long cell"; output tailing
 already works via `wait`, but expression values do not). Bootstrap starts a daemon thread
 serving `~/.ptc/kernels/<key>/peek.sock` (0600, inside the 0700 kernel dir): one JSON line
 in (`{"expr": …}`), one out (`{"repr": …, "truncated": bool}` or `{"error": …}`). The
 expression is AST-restricted to Name / Attribute / constant-Subscript chains — no calls,
-no assignments — then evaluated against the kernel namespace under the GIL; repr capped at
-4000 chars. Residual, stated: `__repr__` is user code and a mid-mutation object reprs as a
-snapshot — this is an informational channel inside the kernel's own trust domain, not a
-new boundary. Surface: a sixth MCP tool `peek(expr, session=)` (docstring = call-time
+no assignments — which makes casual mutation inexpressible, and the claim stops there:
+attribute access runs properties and descriptors, subscript runs `__getitem__`, and repr
+runs `__repr__` — all user code. Peek is **mutation-resistant by construction, not
+read-only and not a boundary**; it stays inside the kernel's existing trust domain.
+Evaluation runs on a per-request thread joined at 5 s — a blocking `__repr__` answers
+`{"error": "evaluation timed out"}` instead of wedging the channel (the abandoned thread
+is the stated residual); repr capped at 4000 chars; a mid-mutation object reprs as a
+snapshot. Surface: a sixth MCP tool `peek(expr, session=)` (docstring = call-time
 contract), CLI `ptc peek <expr>`, one instructions-digest line, and the `hooks/hooks.json`
 PreToolUse matcher gains `peek` so a subagent's peek resolves to ITS kernel, not the
 parent's. A kernel from a pre-peek build has no socket; the tool says so and names
@@ -762,6 +785,8 @@ confuses nothing (discovery reports the kernel dead before anyone consults the s
    call.
 3. `peek("os.system('true')")` → rejected (call nodes refused), kernel untouched.
 4. A dispatched subagent's `peek` answers from the subagent's own kernel.
+5. `peek()` of an object whose `__repr__` blocks → a timeout error within ~5 s, and a
+   subsequent peek still answers.
 
 ### Initiative 3 — governed side effects: diffs and a deny policy
 
@@ -785,6 +810,11 @@ the untruncated record stays in audit.jsonl.
 ]}
 ```
 
+`web_fetch` evaluation is per-hop: redirects are followed manually and every hop's URL is
+checked BEFORE it is requested, with the original and final URLs both audited — a denied
+destination reached through an allowed redirector is refused at the hop, not regretted
+after it.
+
 A match raises `PermissionError` naming the rule index and pattern, and the denial itself
 is audited (`kind="denied"`, tool + clipped payload). Absent file = empty policy = today's
 behavior, tested as such. A file that exists but does not parse fails CLOSED AND LOUD:
@@ -796,6 +826,17 @@ governs this kernel's wrappers, and raw Python was never governed (the
 audit-instead-of-guard-rails boundary stands; this is a tripwire for the wrappers, not a
 sandbox).
 
+**Upgrade skew gate.** Policy is enforced by wrappers bound at BOOTSTRAP, so a live kernel
+from a pre-governance build would keep ungoverned `bash`/`write`/`edit`/`web_fetch` no
+matter what the user later writes into policy.json — a silent bypass wearing a
+survivability feature's clothes. Initiative 3's bootstrap therefore records
+`governed: true` in meta.json, and attach REFUSES (an explicit error — not a recycle, not
+a notice) when a policy file that is malformed or carries at least one deny rule exists
+and the kernel's meta lacks the capability, naming both exits: `restart()` to govern the
+kernel, or remove the policy to keep the ungoverned namespace. No policy file — the
+default — attaches exactly as initiative 1 says: an opted-in policy outranks
+survivability, and nothing outranks it silently.
+
 **Acceptance**:
 1. A policy denying `^rm ` → `bash("rm -rf /tmp/x")` raises PermissionError naming rule 0;
    audit.jsonl gains a `denied` line; `bash("echo ok")` unaffected.
@@ -803,6 +844,10 @@ sandbox).
    audit.jsonl entry holds the same diff (≤ 2000 chars).
 3. No policy file → the full existing suite passes unchanged.
 4. Malformed policy.json → `bash("echo hi")` raises naming the JSON error; `read()` works.
+5. A deny rule on a destination host, requested through an allowed redirector that 302s to
+   it → `web_fetch(redirector)` raises at the hop; audit records both URLs.
+6. A live pre-governance kernel plus a policy file with one deny rule → attach fails with
+   the two-exit error; removing the policy file re-attaches with the namespace intact.
 
 ## Delegated unknowns → spikes
 
@@ -1587,6 +1632,20 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   Date/Author: 2026-09-01 / design session (owner chose diff + deny; ask-tier recorded as
   rejected, revisitable only with an upstream mid-cell approval channel).
 
+- Decision: v0.3 spec review round (codex adversarial, gpt-5.5 at xhigh) — all five
+  findings adopted before any plan was written: (1) runtime self-identity comes from the
+  venv's own stamp via `sys.prefix`, never PKG-relative files, because a `--no-editable`
+  runtime has no source beside it; (2) a governed-capability attach gate — policy present
+  + ungoverned kernel refuses attach explicitly rather than silently bypassing the user's
+  policy (an opted-in policy outranks survivability); (3) peek's claim corrected to
+  mutation-resistant-not-read-only (properties/`__getitem__`/`__repr__` all run user
+  code), with a per-request eval-thread 5 s timeout; (4) per-hop redirect evaluation for
+  web_fetch policy, original and final URLs audited; (5) GC defers while any provisional
+  owner exists and serializes with provisioning on `provision.lock`. Environment note:
+  `gpt-5.6-sol` was retired for ChatGPT accounts between 08-30 and 09-01; frontier reviews
+  now route to `gpt-5.5`.
+  Date/Author: 2026-09-01 / Claude (review evaluated finding-by-finding; all five survived).
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2232,5 +2291,7 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (v0.3 spec review folded): codex adversarial round (gpt-5.5, xhigh) returned five findings, all adopted — runtime self-identity via the venv's own stamp, governed-capability attach gate, peek de-claimed to mutation-resistant with an eval-thread timeout, per-hop web_fetch policy evaluation, GC provisional-owner deferral with provision.lock serialization. S7 was also measured at design stage (6.7 MB allocated / 0.28 s warm — promoted). Acceptance grew four cases across the three initiatives.
 
 - 2026-09-01 (v0.3 line designed): the three structural items from the second live-usage report — kernel survivability, busy queueing, governance — designed in one brainstorming pass and approved by the owner. New section `## Structural follow-on (v0.3 line)` carries the three initiative designs with per-initiative acceptance; spikes S7 (venv marginal cost) and S8 (peek daemon under load) registered; five Decision Log entries seed the choices and rejected alternatives; Provisioning and MCP-adapter sections gained forward pointers; `PTC_POLICY` added to the configuration reference. Delivery is sequential (survivability → queueing → governance), one plan each.
