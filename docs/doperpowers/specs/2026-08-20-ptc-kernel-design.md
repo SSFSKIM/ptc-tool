@@ -1653,6 +1653,23 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   now route to `gpt-5.5`.
   Date/Author: 2026-09-01 / Claude (review evaluated finding-by-finding; all five survived).
 
+- Decision: initiative 1 SHIPPED as v0.3.0 (commits 3e033e4..35b449a). Five-task SDE run,
+  every task review spec-PASS; final whole-branch review (fable, codex unavailable) returned
+  two blockers, both fixed red-first in one wave: a settled-DEAD provisional owner no longer
+  defers GC (a SIGKILLed spawner's leftover owner.json had disarmed the sweep permanently —
+  live defers, UnknownOwner defers, dead falls through), and the spawn binds `spawn_venv()`
+  once pre-fork for both the Popen argv and the meta record (re-resolving at write time let
+  a mid-bootstrap provision poison `_venv_gone` and GC's reference set for the kernel's
+  life). Debt log carried on the tracker, triaged by the final review: launcher
+  re-provision bound + one-shot payload capture (do together next launcher touch), doctor
+  `build_venv` key, startup-GC synchronous rmtree, launcher exec-window ENOENT (ms,
+  self-heals; a venv-mtime touch at exec would close it), checkout-run `keep=None`
+  (grace-protected by design), dead provisional owner.json uncollected until the key's
+  next ensure, per-spawn `build_id()` rglob in dev runs (dismissed unless measured).
+  Suite 534 passed / 7 skipped; spec acceptance 1-4 all verified live against real uv and
+  real kernels at Task 5.
+  Date/Author: 2026-09-01 / Claude (SDE controller).
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2298,6 +2315,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (initiative 1 shipped, v0.3.0): immutable per-build venvs live — versioned self-contained builds (`~/.ptc/venvs/<build_id>/`, `--no-editable`, path-independent identity), lock-retry provisioning twins, attach across builds gated only by venv-gone/protocol with the build-drift notice, and startup GC (unreferenced + aged, deferred for live provisional spawns, lock-serialized). Delivered by a five-task subagent run with per-task reviews, a fable final whole-branch review (two blockers fixed in one wave), and live acceptance of all four spec criteria. Suite 534 passed. Decision Log entry above carries the full delivery record and the triaged debt log.
 
 - 2026-09-01 (initiative-1 plan review, Claude fallback): codex hit its monthly usage limit mid-review (resets Oct 1), so the plan review ran on the skill-sanctioned fallback — a fresh top-tier Claude reviewer, which verified snippets against code empirically. Three blocking plan-text findings adopted (doctor's bare-name import vs the `venv` local shadow in cli.py; the retired recycle-on-build-drift lifecycle test must be deleted, not "extended"; explicit rewrite instructions for the plugin-packaging twin tests), plus the stale layout sentence here (`paths.venv_dir()` stays legacy; `spawn_venv()` carries resolution) and the owner-only-modes exemption for venv trees. Claude reviewers carry all reviews for this initiative.
 
