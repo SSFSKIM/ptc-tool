@@ -10,6 +10,7 @@ from ptc import bgroups
 from ptc.ownership import proc_start_time
 
 from . import audit
+from .files import _denied
 from .state import STATE
 
 #: Live `bash()` process groups this kernel started, keyed by pgid: every background handle
@@ -424,6 +425,7 @@ async def bash(cmd: str | list[str] | tuple[str, ...], timeout: float = 120.0, c
     # line, the registry row, the handle. `shlex.join` is the argv's shell-equivalent, so a
     # reader of either can copy it, and every downstream consumer keeps taking a str.
     label = shlex.join(argv) if argv is not None else cmd
+    _denied("bash", label)
     # 2000, not the registry rows' 200: the footer clips to a 48-char fingerprint, which
     # makes this entry the one faithful record of what ran — it must hold a real command
     # whole while still bounding a heredoc a cell built in Python.

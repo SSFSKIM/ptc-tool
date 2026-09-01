@@ -40,3 +40,24 @@ def test_edit_exactly_once_rules(tmp_path):
     assert p.read_text() == "A\nBBB\nBB2\nA\n"
     m = STATE.cell_mutations[-1]
     assert m["kind"] == "edit" and m["path"].endswith("s.py")
+
+
+def test_write_and_edit_record_bounded_diffs(tmp_path):
+    target = tmp_path / "doc.txt"
+    files.write(str(target), "alpha\nbeta\n")
+    new_file_entry = STATE.cell_mutations[-1]
+    assert new_file_entry["kind"] == "write"
+    assert "+alpha" in new_file_entry["diff"]          # a new file diffs against empty
+    files.edit(str(target), "beta", "gamma")
+    entry = STATE.cell_mutations[-1]
+    assert entry["kind"] == "edit"
+    assert "-beta" in entry["diff"] and "+gamma" in entry["diff"]
+    assert len(entry["diff"]) <= 2000
+
+
+def test_huge_diff_is_capped_with_a_note(tmp_path):
+    target = tmp_path / "big.txt"
+    files.write(str(target), "x\n" * 5000)
+    d = STATE.cell_mutations[-1]["diff"]
+    assert len(d) <= 2000
+    assert "truncated" in d

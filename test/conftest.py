@@ -80,6 +80,14 @@ def _reap_kernels(tmp_path):
             os.environ["PTC_HOME"] = prev
 
 
+@pytest.fixture(autouse=True)
+def _no_real_policy(tmp_path, monkeypatch):
+    """Governed wrappers must never consult the developer's real ~/.ptc/policy.json:
+    point PTC_POLICY at a path that does not exist (= the empty policy). Tests that
+    exercise policy delenv or override this themselves."""
+    monkeypatch.setenv("PTC_POLICY", str(tmp_path / "no-policy.json"))
+
+
 @pytest.fixture
 def ptc_home(tmp_path, monkeypatch, kernel_venv) -> Path:
     """Isolated PTC_HOME whose venv/ is the cached real venv."""
@@ -87,6 +95,9 @@ def ptc_home(tmp_path, monkeypatch, kernel_venv) -> Path:
     home.mkdir()
     (home / "venv").symlink_to(kernel_venv)
     monkeypatch.setenv("PTC_HOME", str(home))
+    # Drop the suite-wide PTC_POLICY pin so a test that writes `ptc_home/policy.json`
+    # gets the PTC_HOME-relative path the real kernel would resolve.
+    monkeypatch.delenv("PTC_POLICY", raising=False)
     monkeypatch.delenv("PTC_SESSION", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     return home
