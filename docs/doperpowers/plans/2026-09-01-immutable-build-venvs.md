@@ -15,7 +15,7 @@
 - Python for provisioned venvs: **3.12** (`uv venv --python 3.12 --seed`).
 - Provisioning installs the checked-in `uv.lock`, never a fresh resolution: `uv sync --locked --inexact --no-dev --extra kernel` — initiative 1 adds `--no-editable`.
 - `bin/ptc-launch` runs under **system python3, stdlib only** — it may not import `ptc`. Its payload computation MUST stay semantically identical to `ptc.venv.stamp_payload()` (both sides say so in comments today; keep both comments true).
-- Everything created under PTC_HOME is owner-only: dirs 0700, files 0600 (`paths.secure_dir`, `paths.private_open`). New dirs/files follow this.
+- Everything created under PTC_HOME is owner-only: dirs 0700, files 0600 (`paths.secure_dir`, `paths.private_open`). Exception, matching today's behavior: venv TREES (`venvs/<bid>/`, the stamp inside) are created by `uv`/plain writes at umask defaults — exactly the modes `~/.ptc/venv` has now; do not add securing passes over them.
 - Stamp payload schema for the new scheme: `{"schema": 3, "pyproject_sha", "lock_sha", "src_sha"}` — **no package path**. `build_id` = first 12 hex of `sha256(json.dumps(payload, sort_keys=True))`.
 - Protocol constant: `PTC_PROTOCOL = 1` in `src/ptc/paths.py`. Absent protocol in meta reads as 0.
 - GC grace: 72 h (`72 * 3600.0` seconds, a named default parameter, overridable in tests).
@@ -49,6 +49,7 @@
   - `venv.runtime_venv() -> Path | None` (this process's own provisioned venv via `sys.prefix`, else None)
   - `venv.spawn_venv() -> Path` (= `runtime_venv() or paths.venv_dir()` — the legacy dir stays the dev/test fallback)
   - `venv.venv_python() -> Path` (= `spawn_venv()/"bin"/"python"` — name kept; `kernel.py` and `client.py` import it)
+  - Deliberate deviation from one stale spec sentence: the spec's "`paths.venv_dir()` resolves to the current build's directory" predates the review's runtime-self-identity finding; `venv_dir()` stays the LEGACY path and `spawn_venv()` carries the resolution (the spec has been patched to match — trust this plan and the spec's Runtime self-identity bullet).
   - `venv._identity_of(venv_path: Path) -> str | None` (schema≥3 stamp → `build_id(payload)`; older stamp → `sha256(text)` hex, the legacy identity format, unchanged)
   - `venv.build_identity() -> str | None` (= `_identity_of(spawn_venv())`)
   - `venv.ensure_venv(run=subprocess.run) -> Path` (provisions `venvs/<bid>/`, `--no-editable`; raises `RuntimeError` naming the launcher when no source tree is beside the package)
@@ -424,7 +425,7 @@ with:
 
 ```python
         try:
-            venv.stamp_payload()
+            stamp_payload()
             ready = stamp_current()
             would = ("nothing (build is provisioned)" if ready
                      else "provision this build (run: ptc setup)")
@@ -435,15 +436,20 @@ with:
         report = {"venv": str(venv_python()), "venv_ready": ready,
 ```
 
-adjust the following `"setup_would"` line to use `would`, and add `from ptc import venv`
-beside the existing `from .venv import …` import (or extend that import) so
-`venv.stamp_payload` resolves.
+adjust the following `"setup_would"` line to use `would`, and extend the existing import
+at `src/ptc/cli.py:14` to `from .venv import ensure_venv, stamp_current, stamp_payload,
+venv_python`. Deliberately BARE names, not `from ptc import venv`: `_run` assigns a local
+`venv = ensure_venv()` in its setup branch (cli.py:94), which would shadow a module import
+for the whole function and raise UnboundLocalError in doctor.
 
 - [ ] **Step 8: Run the full unit-venv + CLI files**
 
 Run: `uv run pytest test/unit/test_venv.py test/unit/test_cli_commands.py -v`
 Expected: PASS. If a CLI doctor test pins the old `setup_would` strings, update its
 expectation to the new strings above (the test is asserting report shape, not provisioning).
+Known and expected until Task 2 lands: `test_plugin_packaging.py`'s launcher-twin tests and
+the old `test_provision_upgrade.py` go red against the not-yet-migrated launcher — do NOT
+chase them in this task; Task 2 migrates both.
 
 - [ ] **Step 9: Commit**
 
@@ -644,9 +650,25 @@ which the old constants froze at import).
 - [ ] **Step 4: Run the integration file and the packaging pins**
 
 Run: `uv run pytest test/integration/test_provision_upgrade.py test/unit/test_plugin_packaging.py -v`
-Expected: PASS. If `test_plugin_packaging.py` pins launcher internals (it asserts the
-package sits inside the plugin root and the launcher's hash inputs exist), update only
-what names the removed constants — the containment assertions must keep passing untouched.
+Expected: the plugin-packaging twin tests FAIL in specific, known ways — fix them as
+follows (the containment assertions must keep passing untouched):
+
+- `test_launcher_and_library_run_the_same_provisioning_commands` breaks three ways: its
+  recorder normalizes `str(home / "venv")` (a string neither provisioner emits any more,
+  so the two command lists no longer compare equal), and its fake `run` creates only
+  `home/venv/bin`, so both provisioners' `(vd / ".ptc-version").write_text(...)` raise
+  FileNotFoundError before any assertion. Rewrite it: normalize
+  `str(home / "venvs" / bid)` on each side (launcher side `bid = mod.build_id()`; library
+  side `bid = pv.build_id()` after pointing `pv.PKG_ROOT` at the same source the launcher
+  reads, so both compute the same id), and make the fake `run` `mkdir -p` the versioned
+  target (`Path(cmd[2]) / "bin"` on the `venv` subcommand, as `test_venv.py`'s
+  `_fake_run_factory` does) so the stamp write lands.
+- `test_launcher_expands_a_user_path_in_ptc_home` asserts `mod.VENV == ptc_home()/"venv"`;
+  `VENV` is a function's job now — assert `mod.HOME == ptc_home()` instead and drop the
+  `VENV` line.
+- `test_launcher_stamp_matches_venv_module` (schema equality between the twins) should
+  pass again unchanged once both sides emit schema 3 — if it pins schema 2 literals,
+  update the literal to 3.
 
 - [ ] **Step 5: Commit**
 
@@ -882,6 +904,14 @@ def test_protocol_zero_kernel_recycles_once_with_notice(ptc_home):
     assert read_meta("proto").get("protocol") == 1
     kernel.kill_kernel("proto")
 ```
+
+Also DELETE `test_a_venv_upgrade_recycles_the_kernel_it_stranded`
+(test_kernel_lifecycle.py:305-341): it pins exactly the retired behavior — recycle on
+build drift — and fails deterministically under the new gates (venv recorded and standing,
+protocol matching → attach with a note, `spawned is False`). Its replacement is
+`test_kernel_survives_a_build_change_with_notice` above plus the venv-gone/protocol gate
+units. Keep its sibling `test_a_kernel_with_no_build_stamp_on_either_side_is_left_alone`
+(lines 344-355) — it still passes and still pins the right thing.
 
 Note for the executor: the existing tests in that file show the exact exec/spawn idioms —
 match them (e.g. if they pass `cwd=` or use a helper, do the same). The meta rewrite goes

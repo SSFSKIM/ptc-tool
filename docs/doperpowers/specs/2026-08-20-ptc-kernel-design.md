@@ -690,8 +690,9 @@ when the marketplace prunes old versions.
   directory reuses the same venv. Computed identically in `src/ptc/venv.py` and
   `bin/ptc-launch` (the byte-identical-payload contract those two files already carry).
 - **Layout**: `~/.ptc/venvs/<build_id>/`, stamp written inside as `.ptc-version` (full
-  payload, for diagnostics). `paths.venv_dir()` resolves to the current build's directory.
-  Legacy `~/.ptc/venv` is never touched again.
+  payload, for diagnostics). `venv.spawn_venv()` resolves the venv kernels launch from —
+  the runtime's own build when provisioned (via `sys.prefix`), else the legacy path;
+  `paths.venv_dir()` keeps naming legacy `~/.ptc/venv`, which is never touched again.
 - **Self-containment**: `uv sync --no-editable` installs the project as a copy, so a
   provisioned build outlives the plugin cache directory it was provisioned from.
 - **Runtime self-identity**: a provisioned runtime never needs the source tree. Payload
@@ -2296,6 +2297,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (initiative-1 plan review, Claude fallback): codex hit its monthly usage limit mid-review (resets Oct 1), so the plan review ran on the skill-sanctioned fallback — a fresh top-tier Claude reviewer, which verified snippets against code empirically. Three blocking plan-text findings adopted (doctor's bare-name import vs the `venv` local shadow in cli.py; the retired recycle-on-build-drift lifecycle test must be deleted, not "extended"; explicit rewrite instructions for the plugin-packaging twin tests), plus the stale layout sentence here (`paths.venv_dir()` stays legacy; `spawn_venv()` carries resolution) and the owner-only-modes exemption for venv trees. Claude reviewers carry all reviews for this initiative.
 
 - 2026-09-01 (initiative-1 planning pass): two drifts fixed while writing the execution plan — GC runs at adapter startup, not from the SessionStart hook (the hook is stdlib-only by design and cannot judge owner liveness; adapter startup has the same cadence and immediately follows every launcher provision), and GC's "current build" is defined as the build the running adapter itself stands on (a runtime cannot recompute a source payload; newer builds are protected by the 72 h grace). Kernel meta records the venv path (`venv`) beside the build identity, which is what GC's reference set and the venv-gone check read. Symlinked GC candidates are skipped.
 
