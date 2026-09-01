@@ -714,10 +714,14 @@ when the marketplace prunes old versions.
   rollout with the standard notice — the cost every upgrade charged until now, paid one
   last time. (Initiative 3 adds one conditional gate on this attach — the
   governed-capability rule there.)
-- **GC**: a build directory (the legacy `~/.ptc/venv` included, using the identity its own
-  `.ptc-version` yields) is deleted when it is not the current build, no kernel with a live
-  owner references it in meta.json `build`, and its mtime is older than 72 h. Runs after
-  every successful provision and from the SessionStart hook. GC serializes with
+- **GC**: a build directory (the legacy `~/.ptc/venv` included) is deleted when it is not
+  the build this adapter itself runs from (the runtime cannot recompute a source payload —
+  self-identity above — and a NEWER build another session just provisioned is protected by
+  the grace, not by naming), no kernel with a live owner references it in meta.json
+  (`venv` records the directory a kernel launched from), and its mtime is older than 72 h.
+  Runs at adapter startup — which immediately follows every launcher provision, and
+  recurs at least once per session, the same cadence a SessionStart hook would give
+  without asking a stdlib-only hook to judge owner liveness. GC serializes with
   provisioning on the same `provision.lock`, and DEFERS entirely while any kernel key
   holds a provisional owner (owner.json without `ready`): a spawn's bootstrap window has
   recorded no build yet, and deleting "unreferenced" builds inside that gap would recreate
@@ -740,7 +744,8 @@ warm provision time. Promote as-is if marginal cost is tolerable (< ~150 MB allo
    the header notice (the `--no-editable` + self-identity proof).
 4. A spawn whose bootstrap is in flight (owner.json present, `ready` absent) defers GC:
    no build directory is deleted until the spawn settles (interleaving test, legacy
-   `~/.ptc/venv` included).
+   `~/.ptc/venv` included). Symlinked candidates are never followed or deleted (a dev
+   setup symlinks the legacy path at a shared cache).
 
 ### Initiative 2 — queued admission and the peek channel
 
@@ -2291,6 +2296,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (initiative-1 planning pass): two drifts fixed while writing the execution plan — GC runs at adapter startup, not from the SessionStart hook (the hook is stdlib-only by design and cannot judge owner liveness; adapter startup has the same cadence and immediately follows every launcher provision), and GC's "current build" is defined as the build the running adapter itself stands on (a runtime cannot recompute a source payload; newer builds are protected by the 72 h grace). Kernel meta records the venv path (`venv`) beside the build identity, which is what GC's reference set and the venv-gone check read. Symlinked GC candidates are skipped.
 
 - 2026-09-01 (v0.3 spec review folded): codex adversarial round (gpt-5.5, xhigh) returned five findings, all adopted — runtime self-identity via the venv's own stamp, governed-capability attach gate, peek de-claimed to mutation-resistant with an eval-thread timeout, per-hop web_fetch policy evaluation, GC provisional-owner deferral with provision.lock serialization. S7 was also measured at design stage (6.7 MB allocated / 0.28 s warm — promoted). Acceptance grew four cases across the three initiatives.
 
