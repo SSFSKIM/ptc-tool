@@ -64,6 +64,14 @@ def test_malformed_shapes_raise_policy_error_and_state_malformed(monkeypatch, tm
     assert policy.file_state() == "malformed"
 
 
+def test_unknown_tool_name_is_loud_not_silent_false_protection(monkeypatch, tmp_path):
+    # A typo'd name can never match, so loading it would be protection that cannot fire.
+    _write(tmp_path, monkeypatch, {"version": 1, "deny": [{"tools": ["bsah"], "pattern": "^rm "}]})
+    with pytest.raises(policy.PolicyError, match="bsah"):
+        policy.load_rules()
+    assert policy.file_state() == "malformed"
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads anything")
 def test_unreadable_file_is_malformed_not_a_raw_oserror(monkeypatch, tmp_path):
     _write(tmp_path, monkeypatch, {"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]})

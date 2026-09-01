@@ -39,6 +39,10 @@ def policy_path() -> Path:
     return Path(raw).expanduser() if raw else ptc_home() / "policy.json"
 
 
+#: The tools whose wrappers consult the policy. A name outside this set can never match,
+#: so accepting one would load protection incapable of firing: parse fails loudly instead.
+GOVERNED_TOOLS = ("bash", "write", "edit", "web_fetch")
+
 #: (path, mtime) -> parsed rules. One entry: the file is one file.
 _cache: tuple[tuple[str, float], "list[Rule]"] | None = None
 
@@ -60,6 +64,10 @@ def _parse(text: str) -> "list[Rule]":
             raise PolicyError(f"deny[{i}] needs a \"tools\" list of strings")
         if not raw["tools"]:
             raise PolicyError(f"deny[{i}] \"tools\" must name at least one tool")
+        for t in raw["tools"]:
+            if t not in GOVERNED_TOOLS:
+                raise PolicyError(f"deny[{i}] \"tools\" names an ungoverned tool "
+                                  f"\"{t}\" (must be one of {', '.join(GOVERNED_TOOLS)})")
         pattern, path = raw.get("pattern"), raw.get("path")
         if (pattern is None) == (path is None):
             raise PolicyError(f"deny[{i}] needs exactly one of \"pattern\" or \"path\"")

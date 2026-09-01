@@ -44,6 +44,7 @@ def test_denied_bash_raises_before_spawn(governed, tmp_path):
         asyncio.run(shell.bash("rm -rf /tmp/never", timeout=5))
     denied = [e for e in _audit_lines(tmp_path) if e["kind"] == "denied"]
     assert denied and denied[0]["tool"] == "bash" and "rm -rf" in denied[0]["value"]
+    assert not any(e["kind"] == "bash" for e in _audit_lines(tmp_path))   # never spawned
 
 
 def test_unmatched_calls_run_untouched(governed, tmp_path):
