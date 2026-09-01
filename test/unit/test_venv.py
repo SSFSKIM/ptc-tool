@@ -1,10 +1,19 @@
 import json
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 from ptc import venv
-from ptc.paths import venv_dir
+
+
+def _write_src_tree(root: Path, extra: str = "") -> None:
+    (root / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (root / "uv.lock").write_text("version = 1\n")
+    pkg = root / "src" / "ptc"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text("VERSION = 1\n" + extra)
+    (pkg / "mod.py").write_text("def f():\n    return 1\n")
 
 
 def _fake_run_factory(calls):
@@ -12,10 +21,11 @@ def _fake_run_factory(calls):
         calls.append(cmd)
         # simulate uv creating the python binary on `uv venv`
         if cmd[1] == "venv":
-            p = venv_dir() / "bin"
+            target = Path(cmd[2])
+            p = target / "bin"
             if p.exists() and "--clear" not in cmd:
                 # uv 0.11: "A virtual environment already exists at: ..." (exit 2).
-                # The re-provision path hits this on every upgrade, so the fake must
+                # A retry over a half-provisioned directory hits this, so the fake must
                 # refuse exactly as uv does.
                 raise subprocess.CalledProcessError(2, cmd)
             p.mkdir(parents=True, exist_ok=True)
@@ -29,21 +39,87 @@ def _must_not_provision(cmd, **kw):
     raise AssertionError("must not provision")
 
 
-def test_provisions_when_missing(monkeypatch, tmp_path):
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+def _project(monkeypatch, tmp_path):
+    """An isolated PTC_HOME plus a source tree to compute a build identity from."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    root = tmp_path / "pkg"
+    root.mkdir(parents=True, exist_ok=True)
+    _write_src_tree(root)
+    monkeypatch.setattr(venv, "PKG_ROOT", root)
+    return root
+
+
+# -- identity: what a build IS, independent of where it sits ----------------------------
+
+
+def test_build_id_is_path_independent(monkeypatch, tmp_path):
+    """The same source at two different absolute paths is ONE build — the old scheme's
+    embedded pkg path made every plugin-cache relocation a needless rebuild."""
+    a, b = tmp_path / "cache-v1" / "pkg", tmp_path / "cache-v2" / "pkg"
+    for root in (a, b):
+        root.mkdir(parents=True)
+        _write_src_tree(root)
+    monkeypatch.setattr(venv, "PKG_ROOT", a)
+    ida = venv.build_id()
+    monkeypatch.setattr(venv, "PKG_ROOT", b)
+    idb = venv.build_id()
+    assert ida == idb and len(ida) == 12
+
+
+def test_build_id_changes_with_source_content(monkeypatch, tmp_path):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    _write_src_tree(root)
+    monkeypatch.setattr(venv, "PKG_ROOT", root)
+    before = venv.build_id()
+    _write_src_tree(root, extra="CHANGED = True\n")
+    assert venv.build_id() != before
+
+
+def test_stamp_payload_has_no_path_and_schema_3(monkeypatch, tmp_path):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    _write_src_tree(root)
+    monkeypatch.setattr(venv, "PKG_ROOT", root)
+    p = venv.stamp_payload()
+    assert p["schema"] == 3
+    assert set(p) == {"schema", "pyproject_sha", "lock_sha", "src_sha"}
+
+
+def test_identity_of_reads_schema3_and_legacy(monkeypatch, tmp_path):
+    v3 = tmp_path / "v3"
+    v3.mkdir()
+    payload = {"schema": 3, "pyproject_sha": "a", "lock_sha": "b", "src_sha": "c"}
+    (v3 / ".ptc-version").write_text(json.dumps(payload))
+    assert venv._identity_of(v3) == venv.build_id(payload)
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / ".ptc-version").write_text('{"schema": 2, "pkg": "/old"}')
+    import hashlib
+    assert venv._identity_of(legacy) == hashlib.sha256(
+        b'{"schema": 2, "pkg": "/old"}').hexdigest()
+    assert venv._identity_of(tmp_path / "nothing-here") is None
+
+
+# -- provisioning: one immutable directory per build ------------------------------------
+
+
+def test_provisions_into_versioned_dir(monkeypatch, tmp_path):
+    _project(monkeypatch, tmp_path)
     calls: list = []
     py = venv.ensure_venv(run=_fake_run_factory(calls))
-    assert py == venv_dir() / "bin" / "python"
-    assert any(c[1] == "venv" for c in calls)
+    bid = venv.build_id()
+    assert py == venv.build_venv_dir(bid) / "bin" / "python"
     sync = next(c for c in calls if c[1] == "sync")
-    # the checked-in lock, not a fresh resolution of pyproject.toml
-    assert "--locked" in sync and "--extra" in sync and "kernel" in sync
-    stamp = json.loads((venv_dir() / ".ptc-version").read_text())
-    assert stamp["schema"] == 2 and stamp["pyproject_sha"] and stamp["lock_sha"]
+    # the checked-in lock, not a fresh resolution; and copied in rather than linked back
+    # at the source tree, so the build outlives the directory it was made from
+    assert "--locked" in sync and "--no-editable" in sync and "kernel" in sync
+    stamp = json.loads((venv.build_venv_dir(bid) / ".ptc-version").read_text())
+    assert stamp == venv.stamp_payload()
 
 
-def test_skips_when_stamp_current(monkeypatch, tmp_path):
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+def test_skips_when_build_already_provisioned(monkeypatch, tmp_path):
+    _project(monkeypatch, tmp_path)
     calls: list = []
     venv.ensure_venv(run=_fake_run_factory(calls))
     calls.clear()
@@ -51,22 +127,36 @@ def test_skips_when_stamp_current(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_reprovisions_on_stamp_mismatch(monkeypatch, tmp_path):
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+def test_new_build_lands_beside_old_one(monkeypatch, tmp_path):
+    """The survivability core: a source change provisions a SECOND directory and leaves
+    the first untouched — nothing is ever rebuilt in place."""
+    root = _project(monkeypatch, tmp_path)
     calls: list = []
     venv.ensure_venv(run=_fake_run_factory(calls))
-    (venv_dir() / ".ptc-version").write_text('{"schema": 0}')
-    calls.clear()
+    old = venv.build_venv_dir(venv.build_id())
+    _write_src_tree(root, extra="CHANGED = True\n")
     venv.ensure_venv(run=_fake_run_factory(calls))
-    assert any(c[1] == "venv" for c in calls)
+    new = venv.build_venv_dir(venv.build_id())
+    assert new != old
+    assert (old / "bin" / "python").exists(), "old build must remain standing"
+    assert (new / "bin" / "python").exists()
+
+
+def test_ensure_venv_without_source_raises_runtime_error(monkeypatch, tmp_path):
+    """A --no-editable runtime has no pyproject/lock beside it and so cannot compute a
+    payload. Saying so beats provisioning something under a guessed identity."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(venv, "PKG_ROOT", tmp_path / "not-there")
+    with pytest.raises(RuntimeError, match="launcher"):
+        venv.ensure_venv(run=_must_not_provision)
 
 
 def test_waits_for_contended_lock_then_returns_without_provisioning(monkeypatch, tmp_path):
     """The lock dir already exists (another process is provisioning it). On
     our first poll it finishes: lock gone, venv python + a current stamp in
     place. We must pick that up and return without ever calling run."""
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
-    lock = tmp_path / "provision.lock"
+    _project(monkeypatch, tmp_path)
+    lock = tmp_path / "home" / "provision.lock"
     lock.mkdir(parents=True)
 
     sleep_calls: list = []
@@ -74,15 +164,16 @@ def test_waits_for_contended_lock_then_returns_without_provisioning(monkeypatch,
     def fake_sleep(seconds):
         sleep_calls.append(seconds)
         lock.rmdir()
-        p = venv_dir() / "bin"
+        vd = venv.build_venv_dir(venv.build_id())
+        p = vd / "bin"
         p.mkdir(parents=True, exist_ok=True)
         (p / "python").write_text("#!fake\n")
-        (venv_dir() / ".ptc-version").write_text(json.dumps(venv.stamp_payload()))
+        (vd / ".ptc-version").write_text(json.dumps(venv.stamp_payload()))
 
     monkeypatch.setattr(time, "sleep", fake_sleep)
 
     py = venv.ensure_venv(run=_must_not_provision)
-    assert py == venv_dir() / "bin" / "python"
+    assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"
     assert sleep_calls == [0.5]  # broke out of the poll loop on the first check after sleeping
 
 
@@ -90,8 +181,8 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     """venv.py has no time.time()/time.monotonic() call: the 10-minute budget
     is a fixed 1200-iteration poll loop (1200 * 0.5s sleep), not a wall-clock
     check. A lock that never clears must exhaust every iteration and raise."""
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
-    lock = tmp_path / "provision.lock"
+    _project(monkeypatch, tmp_path)
+    lock = tmp_path / "home" / "provision.lock"
     lock.mkdir(parents=True)
 
     sleep_calls: list = []
@@ -100,24 +191,3 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="lock"):
         venv.ensure_venv(run=_must_not_provision)
     assert len(sleep_calls) == 1200
-
-
-def test_a_lock_only_change_reprovisions(monkeypatch, tmp_path):
-    """A dependency fix that changes only `uv.lock` left every existing venv reading as
-    current and every fresh one resolving unconstrained from `pyproject.toml`, so a
-    deployed plugin could keep running versions nobody tested indefinitely."""
-    monkeypatch.setenv("PTC_HOME", str(tmp_path))
-    proj = tmp_path / "pkg"
-    proj.mkdir()
-    (proj / "pyproject.toml").write_text("[project]\nname = 'x'\n")
-    (proj / "uv.lock").write_text("version = 1\n")
-    monkeypatch.setattr(venv, "PKG_ROOT", proj)
-
-    calls: list = []
-    venv.ensure_venv(run=_fake_run_factory(calls))
-    venv.ensure_venv(run=_must_not_provision)          # nothing changed: no work
-
-    (proj / "uv.lock").write_text("version = 1\n# a dependency was pinned down\n")
-    calls.clear()
-    venv.ensure_venv(run=_fake_run_factory(calls))
-    assert any(c[1] == "sync" for c in calls), "a lock-only change must reprovision"

@@ -11,7 +11,7 @@ from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
 from .ownership import UnknownOwner
 from .paths import Config
 from .shape import render, to_dict
-from .venv import ensure_venv, stamp_current, venv_python
+from .venv import ensure_venv, stamp_current, stamp_payload, venv_python
 
 
 def _pick_session(explicit: str | None) -> tuple[str, str | None, object]:
@@ -111,10 +111,21 @@ def _run(argv=None) -> int:
         # was asked about — it could rebuild the venv (network, minutes) as a side effect
         # of someone asking why the venv looked wrong.
         import shutil
-        ready = stamp_current()
+        # stamp_current() answers False both for "this build is not provisioned" and for
+        # "there is no source here to compute a build from" — a --no-editable runtime.
+        # Reporting the second as staleness would send a user off to run a `ptc setup`
+        # that cannot work, so the two are separated before either reaches the report.
+        try:
+            stamp_payload()
+            ready = stamp_current()
+            would = ("nothing (build is provisioned)" if ready
+                     else "provision this build (run: ptc setup)")
+        except OSError:
+            ready = None
+            would = ("nothing here — no source tree beside this install; "
+                     "the MCP launcher provisions automatically")
         report = {"venv": str(venv_python()), "venv_ready": ready,
-                  "setup_would": "nothing (venv is current)" if ready else
-                                 "provision the venv (run: ptc setup)",
+                  "setup_would": would,
                   "uv": shutil.which("uv"),
                   "claude": shutil.which("claude"), "codex": shutil.which("codex"),
                   "PTC_SESSION": os.environ.get("PTC_SESSION"),

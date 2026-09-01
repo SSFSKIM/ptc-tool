@@ -1,76 +1,148 @@
-"""Provision ~/.ptc/venv with uv. Stamp payload is shared with bin/ptc-launch."""
+"""Provision immutable per-build venvs under ~/.ptc/venvs/<build_id>/.
+
+Payload computation lives ONLY in the provisioners — this module's ensure_venv (run from a
+checkout or the plugin dir) and bin/ptc-launch (stdlib twin; MUST stay semantically
+identical). Runtimes never recompute a payload: a provisioned venv carries its stamp
+inside, and a process identifies its own build via sys.prefix (`runtime_venv`).
+"""
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-from .paths import ptc_home, venv_dir
+from .paths import ptc_home, venv_dir, venvs_root
 
-PKG_ROOT = Path(__file__).resolve().parent.parent.parent  # .../ptc-surface/ptc
-
-
-def venv_python() -> Path:
-    return venv_dir() / "bin" / "python"
+PKG_ROOT = Path(__file__).resolve().parent.parent.parent  # .../ptc-tool
 
 
 def _uv() -> str:
     return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
+def src_tree_sha(root: Path | None = None) -> str:
+    """Content hash of the packaged source tree — sorted relative posix paths + content
+    hashes, so the same source hashes the same from any absolute location."""
+    base = (root or PKG_ROOT) / "src" / "ptc"
+    parts = [f"{p.relative_to(base).as_posix()}:"
+             f"{hashlib.sha256(p.read_bytes()).hexdigest()}"
+             for p in sorted(base.rglob("*.py"))]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
 def stamp_payload() -> dict:
-    """What the venv was built FROM, both files of it.
+    """What a build is MADE FROM — and nothing about where it sits.
 
     `uv.lock` is half the answer and used to be no part of it: a dependency fix that
     changed only the lock left every existing venv reading as current and every fresh one
     resolving unconstrained from `pyproject.toml`, so the deployed plugin could run
     versions nobody tested for as long as nobody touched the other file.
+
+    The old schema's embedded `pkg` path was the other half of the problem: it made every
+    plugin-cache relocation read as a new build, which is why unchanged-dependency
+    upgrades kept killing kernels. Raises OSError where there is no source tree beside the
+    install — a `--no-editable` runtime cannot answer this question and must not guess.
     """
     def sha(name: str) -> str:
         return hashlib.sha256((PKG_ROOT / name).read_bytes()).hexdigest()
-    return {"schema": 2, "pyproject_sha": sha("pyproject.toml"),
-            "lock_sha": sha("uv.lock"), "pkg": str(PKG_ROOT)}
+    return {"schema": 3, "pyproject_sha": sha("pyproject.toml"),
+            "lock_sha": sha("uv.lock"), "src_sha": src_tree_sha()}
 
 
-def build_identity() -> str | None:
-    """Which BUILD of the shared venv a process is running from; None where there is none.
+def build_id(payload: dict | None = None) -> str:
+    """The directory name a build owns. Short because it is a path segment people read;
+    12 hex is 48 bits over a handful of builds on one machine, not an isolation boundary."""
+    p = stamp_payload() if payload is None else payload
+    return hashlib.sha256(json.dumps(p, sort_keys=True).encode()).hexdigest()[:12]
 
-    The provisioners write `stamp_payload()` to `venv/.ptc-version` at the end of every
-    provision and `--clear` the whole directory at the start of the next one, so this
-    string changes exactly when the venv under a running kernel has been REPLACED. That is
-    the question `ensure_kernel` asks before attaching to a long-lived kernel, and it is
-    not the same question `stamp_current()` asks: the live payload changes the moment the
-    package sources do, whether or not anybody has rebuilt anything, and recycling a
-    kernel whose venv is still standing would throw a namespace away for nothing.
 
-    Hashed rather than kept whole — meta.json wants an identity, not a copy of a payload
-    carrying an absolute path. None where no stamp exists at all: a dev run, a hand-made
-    venv, a test fixture, or the instants a provision spends between the clear and the new
-    stamp. None of those is an upgrade. (A rebuild that lands on the SAME payload — a
-    repair of a corrupted venv — is invisible here, as it is to every other reading of the
-    stamp.)
+def build_venv_dir(bid: str) -> Path:
+    return venvs_root() / bid
+
+
+def runtime_venv() -> Path | None:
+    """This process's own provisioned venv — None for a dev/checkout run."""
+    p = Path(sys.prefix)
+    return p if (p / ".ptc-version").exists() else None
+
+
+def spawn_venv() -> Path:
+    """The venv kernels are spawned from: our own build when provisioned, else the legacy
+    shared directory (dev runs and the test fixtures that symlink it)."""
+    return runtime_venv() or venv_dir()
+
+
+def venv_python() -> Path:
+    return spawn_venv() / "bin" / "python"
+
+
+def _identity_of(venv_path: Path) -> str | None:
+    """The identity of the build standing at `venv_path`, read from its own stamp.
+
+    Schema >= 3 stamps identify as build_id(payload); older stamps keep the legacy
+    identity (sha256 of the raw text) so pre-v0.3 meta.json comparisons still hold.
+    None where no stamp exists at all: a dev run, a hand-made venv, a test fixture, or the
+    instants a provision spends before it writes its stamp. None of those is an upgrade.
     """
     try:
-        text = (venv_dir() / ".ptc-version").read_text()
+        text = (venv_path / ".ptc-version").read_text()
     except OSError:
         return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("schema"), int) \
+            and payload["schema"] >= 3:
+        return build_id(payload)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def stamp_current() -> bool:
-    stamp = venv_dir() / ".ptc-version"
-    if not (venv_python().exists() and stamp.exists()):
-        return False
+def build_identity() -> str | None:
+    """Which build THIS process (and the kernels it spawns) runs from.
+
+    Read from the venv's own stamp rather than recomputed from source: the live payload
+    changes the moment the package sources do, whether or not anybody has rebuilt
+    anything, and a `--no-editable` runtime has no source to recompute from at all.
+    """
+    return _identity_of(spawn_venv())
+
+
+def _stamp_matches(vd: Path, payload: dict) -> bool:
+    """Does the build already standing at `vd` carry exactly this payload? The directory
+    name is only 12 hex of the answer; the stamp is the whole of it."""
     try:
-        return json.loads(stamp.read_text()) == stamp_payload()
+        return json.loads((vd / ".ptc-version").read_text()) == payload
     except (json.JSONDecodeError, OSError):
         return False
 
 
+def stamp_current() -> bool:
+    """Is the CURRENT SOURCE's build already provisioned? Provisioner-side only — it needs
+    the source tree, so a `--no-editable` runtime gets False meaning "cannot know", which
+    is why callers that report to a human ask stamp_payload() themselves first."""
+    try:
+        payload = stamp_payload()
+    except OSError:
+        return False
+    vd = build_venv_dir(build_id(payload))
+    return (vd / "bin" / "python").exists() and _stamp_matches(vd, payload)
+
+
 def ensure_venv(run=subprocess.run) -> Path:
-    if stamp_current():
-        return venv_python()
+    try:
+        payload = stamp_payload()
+    except OSError as e:
+        raise RuntimeError(
+            "cannot provision: no source tree beside this install (missing "
+            f"{e.filename}) — provisioning happens in the launcher (bin/ptc-launch) "
+            "or a checkout, never from a --no-editable runtime") from e
+    bid = build_id(payload)
+    vd = build_venv_dir(bid)
+    if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
+        return vd / "bin" / "python"
     lock = ptc_home() / "provision.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -82,26 +154,30 @@ def ensure_venv(run=subprocess.run) -> Path:
             if not lock.exists():
                 break
             time.sleep(0.5)
-        if stamp_current():
-            return venv_python()
-        raise RuntimeError("venv provisioning lock held and venv still stale; "
+        if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
+            return vd / "bin" / "python"
+        raise RuntimeError("venv provisioning lock held and build still absent; "
                            f"remove {lock} if no other ptc process is running")
     try:
         uv = _uv()
-        # --clear: uv refuses to create a venv where one already exists, which is the
-        # state every upgrade starts from. It still declines to wipe a non-venv directory.
-        run([uv, "venv", str(venv_dir()), "--python", "3.12", "--seed", "--clear"],
+        # --clear is harmless on a fresh directory and load-bearing on a retry over a
+        # half-provisioned one (uv refuses to create over an existing venv). It never
+        # touches another build: this directory is named for THIS payload.
+        run([uv, "venv", str(vd), "--python", "3.12", "--seed", "--clear"],
             check=True)
         # `uv sync --locked` installs the versions in the checked-in `uv.lock` and fails
         # loudly if that lock no longer matches `pyproject.toml` — the honest failure, at
         # provisioning time, rather than a kernel quietly running a resolution nobody
         # tested. `--inexact` leaves the seeded pip alone (a bare sync removes anything the
-        # lock does not name); `--no-dev` keeps the test group out of a user's runtime; the
-        # project itself is installed editable, exactly as `uv pip install -e` had it.
-        run([uv, "sync", "--locked", "--inexact", "--no-dev", "--extra", "kernel",
-             "--project", str(PKG_ROOT)],
-            check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv_dir())})
-        (venv_dir() / ".ptc-version").write_text(json.dumps(stamp_payload()))
+        # lock does not name); `--no-dev` keeps the test group out of a user's runtime;
+        # `--no-editable` copies the project into the venv so the build outlives the source
+        # directory it came from — the self-containment half of survivability.
+        run([uv, "sync", "--locked", "--inexact", "--no-dev", "--no-editable",
+             "--extra", "kernel", "--project", str(PKG_ROOT)],
+            check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(vd)})
+        # The stamp goes in LAST: it is what marks the directory complete, so a provision
+        # that dies midway leaves a build nothing will mistake for finished.
+        (vd / ".ptc-version").write_text(json.dumps(payload))
     finally:
         lock.rmdir()
-    return venv_python()
+    return vd / "bin" / "python"

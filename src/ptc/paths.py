@@ -18,6 +18,11 @@ KEY_MAX = 128
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
+#: The disk/wire contract an adapter shares with a kernel (cells layout, record schema,
+#: connection handshake). Recorded in meta.json at spawn; attach requires equality, and an
+#: absent field reads as 0 — so pre-v0.3 kernels recycle once at rollout, with notice.
+PTC_PROTOCOL = 1
+
 #: (raw PTC_HOME, resolved absolute path) — see ptc_home().
 _HOME: tuple[str, Path] | None = None
 
@@ -47,7 +52,14 @@ def ptc_home() -> Path:
 
 
 def venv_dir() -> Path:
+    """The LEGACY single shared venv. Pre-v0.3 installs still have one, and dev runs and
+    the test fixtures still point at it; new provisioning lands under venvs_root()."""
     return ptc_home() / "venv"
+
+
+def venvs_root() -> Path:
+    """Parent of the immutable per-build venvs, one directory per build_id."""
+    return ptc_home() / "venvs"
 
 
 def run_dir() -> Path:
