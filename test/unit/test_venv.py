@@ -277,14 +277,44 @@ def test_gc_keeps_builds_referenced_by_a_live_kernel(monkeypatch, tmp_path):
 
 
 def test_gc_defers_entirely_while_a_spawn_is_provisional(monkeypatch, tmp_path):
-    """owner.json without `ready` = a bootstrap in flight whose build is not recorded
-    yet; deleting ANY build on that gap recreates the deleted-venv failure."""
+    """A LIVE owner.json without `ready` = a bootstrap in flight whose build is not
+    recorded yet; deleting ANY build on that gap recreates the deleted-venv failure."""
     home = _gc_env(monkeypatch, tmp_path, alive_pids={99999})
     victim = _aged_build(home, "cccccccccccc")
     _kernel_row(home, "mid-spawn", ready=False, venv_path=None, alive=True,
                 monkeypatch=monkeypatch)
     assert venv.gc_builds() == []
     assert victim.exists()
+
+
+def test_gc_is_not_disarmed_by_a_dead_provisional_owner(monkeypatch, tmp_path):
+    """A spawner SIGKILLed mid-bootstrap leaves owner.json with no `ready` forever;
+    deferring on that corpse disarmed GC permanently (final-review finding 1)."""
+    home = _gc_env(monkeypatch, tmp_path)          # no alive pids: the owner is dead
+    victim = _aged_build(home, "aaaaaaaaaaaa")
+    _kernel_row(home, "crashed", ready=False, venv_path=None, alive=False,
+                monkeypatch=monkeypatch)
+    removed = venv.gc_builds()
+    assert str(victim) in removed and not victim.exists()
+
+
+def test_gc_unknown_owner_pins_and_a_provisional_unknown_defers(monkeypatch, tmp_path):
+    """UnknownOwner stays the conservative direction on BOTH branches: a ready kernel
+    whose identity cannot be read pins its build; a provisional one defers the sweep."""
+    from ptc import ownership
+    home = _gc_env(monkeypatch, tmp_path)
+
+    def raise_unknown(o):
+        raise ownership.UnknownOwner("unreadable")
+    monkeypatch.setattr(ownership, "settled_owner_state", raise_unknown)
+    pinned = _aged_build(home, "cccccccccccc")
+    _kernel_row(home, "ready-unknown", ready=True, venv_path=str(pinned), alive=True,
+                monkeypatch=monkeypatch)
+    assert venv.gc_builds() == []          # referenced by the pinning unknown owner
+    assert pinned.exists()
+    _kernel_row(home, "prov-unknown", ready=False, venv_path=None, alive=True,
+                monkeypatch=monkeypatch)
+    assert venv.gc_builds() == []          # provisional unknown defers
 
 
 def test_gc_respects_grace_symlinks_and_the_lock(monkeypatch, tmp_path):

@@ -208,9 +208,11 @@ def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
     a live owner records it in meta.json `venv`, and it is older than the grace (which is
     also what protects a NEWER build another session just provisioned — the runtime cannot
     recompute a source payload to name "current"). Deferred entirely while any kernel key
-    holds a provisional owner (owner.json without `ready`): that spawn's build is not
-    recorded yet. Serialized against provisioning on the same provision.lock; a held lock
-    means "not now", never "force it".
+    holds a LIVE provisional owner (owner.json without `ready`), or one whose liveness
+    cannot be read at all: that spawn's build is not recorded yet. A provisional owner
+    settled dead is a crashed leftover, not a spawn window, and neither defers the sweep
+    nor pins a build. Serialized against provisioning on the same provision.lock; a held
+    lock means "not now", never "force it".
     """
     import time
 
@@ -227,7 +229,18 @@ def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
             if o is None:
                 continue
             if not (kd / "ready").exists():
-                return []          # provisional spawn mid-bootstrap: defer everything
+                # A provisional owner defers only while it is a spawn still in flight. A
+                # SIGKILLed spawner leaves this exact shape behind forever, and deferring
+                # on that corpse disarmed GC at every future startup; a settled-dead
+                # provisional therefore neither defers nor pins — it records no build, so
+                # it references nothing, and its owner.json is _clean_stale's to collect
+                # on this key's next ensure.
+                try:
+                    if settled_owner_state(o):
+                        return []
+                except UnknownOwner:
+                    return []      # unknown stays the conservative direction
+                continue
             try:
                 alive = settled_owner_state(o)
             except UnknownOwner:
