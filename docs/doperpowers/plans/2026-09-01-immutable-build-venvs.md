@@ -460,15 +460,133 @@ git commit -m "f5(ptc): path-independent build identity + versioned --no-editabl
 
 ---
 
-### Task 2: The launcher twin + real-uv integration proof
+### Task 2: The launcher twin + real-uv integration proof + lock-retry (both twins)
 
 **Files:**
 - Modify: `bin/ptc-launch`
-- Test: `test/integration/test_provision_upgrade.py` (rewrite)
+- Modify: `src/ptc/venv.py` (Task-1 review findings routed here: lock-retry in `ensure_venv`, provisioned-build fallback in `spawn_venv`)
+- Test: `test/integration/test_provision_upgrade.py` (rewrite), `test/unit/test_venv.py` (three additions), `test/unit/test_plugin_packaging.py` (twin-test migration per Step 4)
 
 **Interfaces:**
-- Consumes: from Task 1 the payload/identity semantics (schema 3, sorted-json 12-hex build id, `--no-editable` sync) — the launcher re-implements them stdlib-only and MUST stay semantically identical.
-- Produces: `bin/ptc-launch` provisions `~/.ptc/venvs/<build_id>/` and execs `<venv>/bin/python -m ptc.mcp` from it. Its module-level functions (loaded by the integration test): `payload() -> dict`, `build_id() -> str`, `venv_dir() -> Path` (the versioned target), `current() -> bool`, `provision() -> None`.
+- Consumes: from Task 1 the payload/identity semantics (schema 3, sorted-json 12-hex build id, `--no-editable` sync) — the launcher re-implements them stdlib-only and MUST stay semantically identical. Task 1's `ensure_venv` lock branch is REPLACED here (see Step 0) — an Important review finding against Task 1, routed to this task because the twins must change together.
+- Produces: `bin/ptc-launch` provisions `~/.ptc/venvs/<build_id>/` and execs `<venv>/bin/python -m ptc.mcp` from it. Its module-level functions (loaded by the integration test): `payload() -> dict`, `build_id() -> str`, `venv_dir() -> Path` (the versioned target), `current() -> bool`, `provision() -> None`. `venv.spawn_venv()` gains the provisioned-build middle rung (Task 3's meta recording is unaffected — it records whatever `spawn_venv()` answers).
+
+- [ ] **Step 0: Fix the Task-1 lock semantics in `ptc.venv` (review finding, Important)**
+
+The Task-1 `ensure_venv` waits for a held lock to clear and then re-checks only ITS OWN
+build — but under per-build directories the holder is usually provisioning a DIFFERENT
+build (old and new adapters overlap across every rollout), so the waiter raised
+"lock held and build still absent" in the common case. Replace `ensure_venv`'s body from
+the `lock = …` line down with a bounded take-the-lock retry loop:
+
+```python
+    lock = ptc_home() / "provision.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    import time
+    polls = 1200                       # 10 min at 0.5 s — same budget as before
+    while True:
+        if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
+            return vd / "bin" / "python"
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            # The holder is usually provisioning a DIFFERENT build (rollout overlap), so
+            # a cleared lock says nothing about ours — keep trying to TAKE it ourselves.
+            polls -= 1
+            if polls <= 0:
+                raise RuntimeError(
+                    "venv provisioning lock held and build still absent; "
+                    f"remove {lock} if no other ptc process is running")
+            time.sleep(0.5)
+            continue
+        try:
+            if not ((vd / "bin" / "python").exists() and _stamp_matches(vd, payload)):
+                uv = _uv()
+                run([uv, "venv", str(vd), "--python", "3.12", "--seed", "--clear"],
+                    check=True)
+                run([uv, "sync", "--locked", "--inexact", "--no-dev", "--no-editable",
+                     "--extra", "kernel", "--project", str(PKG_ROOT)],
+                    check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(vd)})
+                (vd / ".ptc-version").write_text(json.dumps(payload))
+        finally:
+            lock.rmdir()
+        return vd / "bin" / "python"
+```
+
+(the early `if (vd / "bin" / "python").exists() and _stamp_matches(...)` fast path before
+the lock section is subsumed by the loop's top — delete the pre-lock copy). The two
+existing lock tests keep passing with unchanged expectations (walk them: the contended
+test's fake sleep clears the lock and creates the build, and the loop's top check returns
+without provisioning after exactly one sleep; the budget test's lock never clears, so
+1200 sleeps then the RuntimeError). Add the new behavior's own pin to
+`test/unit/test_venv.py`:
+
+```python
+def test_waiter_provisions_its_own_build_after_holder_releases(monkeypatch, tmp_path):
+    """The lock holder was provisioning a DIFFERENT build; when it releases, the waiter
+    must take the lock and provision its own rather than raise (rollout overlap)."""
+    _project(monkeypatch, tmp_path)
+    lock = tmp_path / "home" / "provision.lock"
+    lock.mkdir(parents=True)
+    calls: list = []
+    monkeypatch.setattr(time, "sleep", lambda s: lock.rmdir())
+    py = venv.ensure_venv(run=_fake_run_factory(calls))
+    assert any(c[1] == "venv" for c in calls), "waiter must provision its own build"
+    assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"
+```
+
+Also in this step, two small Task-1 review remainders:
+
+(a) `spawn_venv` gains the middle rung — a checkout CLI run whose `ptc setup` provisioned
+the current build must spawn kernels from it (nothing provisions the legacy path any
+more, so without this the CLI-standalone flow breaks on a fresh machine):
+
+```python
+def spawn_venv() -> Path:
+    """The venv kernels are spawned from: our own build when we run provisioned; else the
+    current source's provisioned build when one is standing (a checkout CLI after
+    `ptc setup`); else the legacy shared directory (dev runs and the test fixtures that
+    symlink it — no test home carries a provisioned build, so fixtures keep resolving to
+    their symlink)."""
+    rv = runtime_venv()
+    if rv is not None:
+        return rv
+    try:
+        bd = build_venv_dir(build_id())
+    except OSError:
+        return venv_dir()
+    return bd if (bd / "bin" / "python").exists() else venv_dir()
+```
+
+with its pin in `test/unit/test_venv.py`:
+
+```python
+def test_spawn_venv_prefers_a_standing_provisioned_build(monkeypatch, tmp_path):
+    from ptc.paths import venv_dir as legacy_dir
+    _project(monkeypatch, tmp_path)
+    monkeypatch.setattr(venv, "runtime_venv", lambda: None)
+    assert venv.spawn_venv() == legacy_dir()          # nothing provisioned yet
+    venv.ensure_venv(run=_fake_run_factory([]))
+    assert venv.spawn_venv() == venv.build_venv_dir(venv.build_id())
+```
+
+(b) restore the lock-only-change pin: at the end of
+`test_build_id_changes_with_source_content`, append
+
+```python
+    after_src = venv.build_id()
+    (root / "uv.lock").write_text("version = 1\n# a dependency was pinned down\n")
+    assert venv.build_id() != after_src, "a lock-only change is a new build"
+```
+
+Run: `uv run pytest test/unit/test_venv.py -v` — expected: all pass (the two new tests
+red-first per TDD: write them, watch them fail against the Task-1 code, then apply the
+implementation above). Commit:
+
+```bash
+git add src/ptc/venv.py test/unit/test_venv.py
+git commit -m "f5(ptc): lock-retry for per-build provisioning + spawn falls back to the standing provisioned build (i1 review)"
+```
 
 - [ ] **Step 1: Rewrite the integration test first**
 
@@ -618,24 +736,30 @@ def provision() -> None:
 
 
 def main() -> None:
-    if not current():
-        lock = HOME / "provision.lock"
-        lock.parent.mkdir(parents=True, exist_ok=True)
+    # Take-the-lock retry, not wait-then-recheck: the holder is usually provisioning a
+    # DIFFERENT build (old and new adapters overlap across a rollout), so a cleared lock
+    # says nothing about ours. Same loop shape as ptc.venv.ensure_venv — keep the twins
+    # in step.
+    lock = HOME / "provision.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    polls = 1200
+    while not current():
         try:
             lock.mkdir()
-            try:
-                provision()
-            finally:
-                lock.rmdir()
         except FileExistsError:
-            for _ in range(1200):
-                if not lock.exists():
-                    break
-                time.sleep(0.5)
-            if not current():
-                print("ptc-launch: build absent and provisioning lock held; "
-                      f"remove {lock} if nothing is provisioning", file=sys.stderr)
+            polls -= 1
+            if polls <= 0:
+                print("ptc-launch: build absent and provisioning lock held past its "
+                      f"budget; remove {lock} if nothing is provisioning",
+                      file=sys.stderr)
                 sys.exit(1)
+            time.sleep(0.5)
+            continue
+        try:
+            if not current():
+                provision()
+        finally:
+            lock.rmdir()
     os.environ["PTC_LAUNCHER"] = os.path.abspath(__file__)
     py = venv_dir() / "bin" / "python"
     os.execv(str(py), [str(py), "-m", "ptc.mcp"])
