@@ -43,7 +43,14 @@ Allowing `mcp__plugin_ptc_ptc__exec` IS the security decision: from then on, mod
 Python runs with your OS permissions, outside Claude Code's per-tool permission prompts
 and sandbox, and Claude children spawned from the kernel default to `bypassPermissions`.
 The mutation footer and `~/.ptc/kernels/<session>/audit.jsonl` give visibility, not
-enforcement. Use a worktree or container for untrusted work.
+enforcement — plus an opt-in deny tripwire (`~/.ptc/policy.json`, env `PTC_POLICY`), which
+is a tripwire, never a sandbox. Its rules are yours (PTC ships none) and they trip `bash`,
+`write`, `edit`, and `web_fetch` — per redirect hop — with an audited `PermissionError`;
+raw Python in the kernel stays ungoverned by design, and a malformed policy file fails
+governed calls loudly rather than pretending to protect. A kernel that was already running
+before you wrote the policy predates enforcement, so attaching to it is refused with both
+exits named: `restart()` to govern it (the namespace is lost) or remove the policy file to
+keep the ungoverned namespace. Use a worktree or container for untrusted work.
 
 The kernel inherits the MCP adapter's environment verbatim, credential-bearing `CLAUDE_*`
 variables included. Nothing in PTC enumerates that environment into a log, an audit record

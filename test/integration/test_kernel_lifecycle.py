@@ -358,3 +358,43 @@ def test_protocol_zero_kernel_recycles_once_with_notice(ptc_home):
     assert "protocol change" in (again.expired_notice or "")
     assert read_meta("proto").get("protocol") == 1
     kill_kernel("proto")
+
+
+def test_policy_present_refuses_ungoverned_attach_then_recovers(ptc_home):
+    """Spec acceptance 6: refusal is an explicit error naming both exits; removing the
+    policy re-attaches with the namespace intact."""
+    import json
+
+    import pytest
+    import ptc.kernel as kernel
+    from ptc.client import Completed, KernelClient
+    from ptc.discovery import read_meta, write_meta
+    from ptc.paths import Config
+    from ptc.policy import PolicyGateRefusal
+    cfg = Config.from_env()
+    kernel.ensure_kernel("gate", cwd=str(ptc_home), config=cfg)
+    kc = KernelClient("gate")
+    out = kc.exec_cell("kept = 'intact'", timeout_s=60, config=cfg)
+    assert isinstance(out, Completed)
+    # simulate a pre-governance kernel: strip the governed marker bootstrap wrote
+    meta = {k: v for k, v in read_meta("gate").items() if k != "governed"}
+    (ptc_home / "kernels" / "gate" / "meta.json").write_text(json.dumps(meta))
+    (ptc_home / "policy.json").write_text(json.dumps(
+        {"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
+    with pytest.raises(PolicyGateRefusal, match="restart\\(\\)"):
+        kernel.ensure_kernel("gate", cwd=str(ptc_home), config=cfg)
+    (ptc_home / "policy.json").unlink()
+    info = kernel.ensure_kernel("gate", cwd=str(ptc_home), config=cfg)
+    assert info.spawned is False
+    out = kc.exec_cell("print(kept)", timeout_s=60, config=cfg)
+    assert "intact" in out.output
+    kernel.kill_kernel("gate")
+
+
+def test_bootstrap_records_the_governed_marker(ptc_home):
+    import ptc.kernel as kernel
+    from ptc.discovery import read_meta
+    from ptc.paths import Config
+    kernel.ensure_kernel("marked", cwd=str(ptc_home), config=Config.from_env())
+    assert read_meta("marked").get("governed") is True
+    kernel.kill_kernel("marked")

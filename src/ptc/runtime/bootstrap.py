@@ -401,6 +401,11 @@ def install(config_json: str) -> str:
         _peek.install_peek(STATE.kernel_dir, ip.user_ns)
     except Exception:
         pass   # peek is a convenience: its absence must never fail bootstrap
+    try:
+        from ptc.discovery import write_meta
+        write_meta(STATE.key, governed=True)
+    except Exception:
+        pass   # the marker is a capability record; its absence only costs a gate refusal
     threading.Thread(target=_watchdog, daemon=True, name="ptc-watchdog").start()
     from . import bind
     bind(ip)

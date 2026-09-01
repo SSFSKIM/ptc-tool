@@ -83,3 +83,31 @@ def test_spawn_records_the_venv_it_launched_from(monkeypatch, tmp_path):
     assert len(argv) == 1
     launched_from = Path(argv[0][0]).parent.parent            # <venv>/bin/python
     assert read_meta("k")["venv"] == str(launched_from)
+
+
+def test_policy_gate_fires_only_for_ungoverned_kernel_with_standing_policy(monkeypatch, tmp_path):
+    import json
+    import ptc.kernel as kernel
+    from ptc.discovery import write_meta
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.delenv("PTC_POLICY", raising=False)
+    write_meta("k", cwd="/x")                     # no `governed` key: a pre-i3 kernel
+    assert kernel._policy_gate("k") is None       # no policy file → no gate
+    import itertools
+    import os as _os
+    _tick = itertools.count(1)
+    def put(text):
+        f = tmp_path / "policy.json"
+        f.write_text(text)
+        now = __import__("time").time() + next(_tick)   # force a visible mtime step
+        _os.utime(f, (now, now))                        # (the cache keys on mtime)
+    put(json.dumps({"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
+    msg = kernel._policy_gate("k")
+    assert "restart()" in msg and "remove the policy" in msg
+    put('{"version": 1, "deny": []}')
+    assert kernel._policy_gate("k") is None       # empty policy does not gate
+    put("garbage")
+    assert "restart()" in kernel._policy_gate("k")  # malformed gates exactly like active
+    write_meta("k", governed=True)
+    put(json.dumps({"version": 1, "deny": [{"tools": ["bash"], "pattern": "^rm "}]}))
+    assert kernel._policy_gate("k") is None       # governed kernel attaches under policy

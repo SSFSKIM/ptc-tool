@@ -11,6 +11,7 @@ from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
 from .ownership import UnknownOwner
 from .paths import Config
 from .peek_client import PeekUnavailable, peek_kernel
+from .policy import PolicyGateRefusal
 from .shape import render, to_dict
 from .venv import ensure_venv, stamp_current, stamp_payload, venv_python
 
@@ -59,10 +60,12 @@ def main(argv=None) -> int:
     """`_run`, with the one error that is a STATE report rather than a crash spelled out.
 
     `UnknownOwner` means a command declined to act on a kernel it could not identify — it
-    changed nothing, and that is a sentence for the user, not a traceback."""
+    changed nothing, and that is a sentence for the user, not a traceback. A
+    `PolicyGateRefusal` is the same shape of answer: an ungoverned kernel was not attached
+    to under a standing policy, and the message names the two ways out."""
     try:
         return _run(argv)
-    except UnknownOwner as e:
+    except (UnknownOwner, PolicyGateRefusal) as e:
         print(f"ptc: {e}", file=sys.stderr)
         return 1
 

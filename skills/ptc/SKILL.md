@@ -212,6 +212,12 @@ it, so it is a deliberate one-shot, never a loop body.
   `llm`, `web_fetch`, `web_search`, `history`, `workflow`, `asyncio`. Do not invent
   wrappers such as `call_skill(...)` or `run_subagent(...)`.
 - The kernel is your notebook, not the project's runtime.
+- An optional deny policy at `~/.ptc/policy.json` (env `PTC_POLICY`) trips `bash`,
+  `write`, `edit`, and `web_fetch` (per redirect hop) with an audited PermissionError.
+  It is the user's file — the plugin ships no rules — and it is a tripwire, not a
+  sandbox: raw Python in the kernel remains ungoverned by design (audit over guard
+  rails). A malformed file fails governed calls loudly rather than pretending to
+  protect.
 - A kernel restart loses variables and handles, but not agent sessions: the on-disk
   registry survives, so `agent.list()` then `agent.resume(sid)` reopens a child. Expiry
   does the same silently (idle TTL, a plugin upgrade rebuilding the venv), and a live

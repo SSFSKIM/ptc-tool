@@ -88,6 +88,28 @@ def _protocol_mismatch(key: str) -> str | None:
             f"current {PTC_PROTOCOL})")
 
 
+def _policy_gate(key: str) -> str | None:
+    """Refuse to hand a policy-present user an ungoverned kernel (spec: upgrade skew).
+
+    The wrappers bind at BOOTSTRAP, so a live kernel from a pre-governance build ignores
+    whatever policy.json says — a silent bypass wearing a survivability feature's
+    clothes. Refusal, not recycle: the namespace may be worth more than the policy, and
+    that trade is the USER's — both exits are named. No policy (the default) gates
+    nothing; a malformed file gates exactly like an active one (it cannot be believed,
+    which is not the same as absent).
+    """
+    from .policy import file_state
+    if file_state() not in ("active", "malformed"):
+        return None
+    if read_meta(key).get("governed"):
+        return None
+    from .policy import policy_path
+    return (f"kernel {key} predates policy enforcement and a policy file stands at "
+            f"{policy_path()} — refusing to attach an ungoverned kernel: restart() to "
+            "govern it (namespace is lost), or remove the policy file to keep the "
+            "ungoverned namespace")
+
+
 def _build_note(key: str) -> str | None:
     """One header line when an attach crosses builds — known and different on both sides.
     The kernel keeps running old code deliberately; the note is what keeps that a choice."""
@@ -190,6 +212,13 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
         # standing in the way.
         stale = (_venv_gone(key) or _protocol_mismatch(key)) if attachable else None
         if attachable and stale is None:
+            # Asked BEFORE the attach, and only on the attach path: a spawn brings up a
+            # governed kernel by definition, and `restart_kernel` kills first — so the
+            # refusal below always leaves the user the exit it names.
+            gate = _policy_gate(key)
+            if gate is not None:
+                from .policy import PolicyGateRefusal
+                raise PolicyGateRefusal(gate)
             # Attaching to a live kernel is the only chance to repair a meta.json that
             # was written before anyone knew the Claude session id (a CLI exec keyed off
             # an env rung, an MCP attach after the CLI spawned the kernel): history() and

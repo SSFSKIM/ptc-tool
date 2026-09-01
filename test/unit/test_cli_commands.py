@@ -452,3 +452,16 @@ def test_cli_peek_says_predates_on_unavailable(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "peek_kernel", boom)
     assert cli.main(["peek", "n"]) == 1
     assert "predates peek" in capsys.readouterr().err
+
+
+def test_policy_gate_refusal_is_a_sentence_not_a_traceback(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    monkeypatch.setenv("PTC_SESSION", "gatecli")
+    import ptc.cli as cli
+    from ptc.policy import PolicyGateRefusal
+    def boom(*a, **kw):
+        raise PolicyGateRefusal("kernel gatecli predates policy enforcement — restart() or remove the policy")
+    monkeypatch.setattr(cli, "ensure_kernel", boom)
+    assert cli.main(["exec", "1+1"]) == 1
+    err = capsys.readouterr().err
+    assert "restart()" in err and "Traceback" not in err
