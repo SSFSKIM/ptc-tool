@@ -28,7 +28,7 @@ from .paths import (
     private_open,
     secure_dir,
 )
-from .venv import build_identity, spawn_venv, venv_python
+from .venv import build_identity, spawn_venv
 
 
 @dataclass
@@ -215,13 +215,17 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                "PTC_HOME": str(kernels_root().parent)}
         log = private_open(kd / "kernel.log", "ab")
         epoch = str(int(time.time()))
-        # Read beside the interpreter it names and BEFORE the fork, so meta.json records
-        # the build this kernel really launched from rather than whatever the venv became
-        # while it was starting (`_build_note` compares against it for the rest of this
-        # kernel's life).
+        # Both read beside the interpreter they name and BEFORE the fork, and each bound
+        # ONCE: meta.json must record the build and the venv this kernel really launched
+        # from, not whatever either became while it was starting. Re-resolving the venv at
+        # write_meta time would let a provision landing mid-bootstrap record a directory
+        # the kernel never ran from, and that never self-heals — `_venv_gone` and GC's
+        # reference set read it for the rest of this kernel's life (as `_build_note`
+        # reads `build`).
         build = build_identity()
+        sv = spawn_venv()
         proc = subprocess.Popen(
-            [str(venv_python()), "-m", "ipykernel_launcher", "-f", str(conn)],
+            [str(sv / "bin" / "python"), "-m", "ipykernel_launcher", "-f", str(conn)],
             cwd=work, env=env, stdout=log, stderr=log,
             stdin=subprocess.DEVNULL, start_new_session=True)
         try:
@@ -279,7 +283,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                        cwd=work, depth=cfg.depth, max_depth=cfg.max_depth,
                        idle_hours=cfg.idle_hours, max_concurrency=cfg.max_concurrency,
                        epoch=epoch, build=build,
-                       venv=str(spawn_venv()), protocol=PTC_PROTOCOL)
+                       venv=str(sv), protocol=PTC_PROTOCOL)
             from .client import run_bootstrap
             run_bootstrap(key, cfg)
             (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
