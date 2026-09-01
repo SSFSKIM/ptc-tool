@@ -37,32 +37,41 @@ def test_launcher_stamp_matches_venv_module():
 
 
 def test_launcher_and_library_run_the_same_provisioning_commands(monkeypatch, tmp_path):
-    """One venv, two provisioners: the launcher builds it before the package is importable
+    """One build, two provisioners: the launcher builds it before the package is importable
     and the library rebuilds it afterwards, and each accepts the other's stamp. So the
     stamp has to be backed by the same BUILD — agreeing about a venv the two filled
     differently (a lock-respecting sync on one side, a fresh resolution on the other) is
-    worse than not agreeing at all."""
+    worse than not agreeing at all.
+
+    The two run under different PTC_HOMEs, so the versioned target each writes to is
+    normalized away before comparing; everything else in the command lines must be equal
+    verbatim. Both read the SAME source tree, so both must name the same build id.
+    """
     import subprocess
 
     from ptc import venv
 
-    def recorder(calls, home):
+    def recorder(calls, home, bid):
+        target = str(home / "venvs" / bid)
+
         def run(cmd, **kw):
-            calls.append([("<venv>" if x == str(home / "venv") else x) for x in cmd[1:]])
-            (home / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+            calls.append([("<venv>" if x == target else x) for x in cmd[1:]])
+            if cmd[1] == "venv":          # what `uv venv` makes, so the stamp write lands
+                (Path(cmd[2]) / "bin").mkdir(parents=True, exist_ok=True)
         return run
 
     launcher_home, library_home = tmp_path / "a", tmp_path / "b"
-    launched: list = []
     monkeypatch.setenv("PTC_HOME", str(launcher_home))
-    monkeypatch.setattr(subprocess, "run", recorder(launched, launcher_home))
-    _load_launcher().provision()
+    mod = _load_launcher()
+    launched: list = []
+    monkeypatch.setattr(subprocess, "run", recorder(launched, launcher_home,
+                                                    mod.build_id()))
+    mod.provision()
 
     library: list = []
     monkeypatch.setenv("PTC_HOME", str(library_home))
-    (library_home / "venv" / "bin").mkdir(parents=True)
-    (library_home / "venv" / "bin" / "python").write_text("#!fake\n")
-    venv.ensure_venv(run=recorder(library, library_home))
+    monkeypatch.setattr(venv, "PKG_ROOT", mod.PKG)
+    venv.ensure_venv(run=recorder(library, library_home, venv.build_id()))
 
     assert launched == library and launched, launched
 
@@ -172,7 +181,6 @@ def test_launcher_expands_a_user_path_in_ptc_home(monkeypatch, tmp_path):
 
     assert mod.HOME.is_absolute() and "~" not in str(mod.HOME)
     assert mod.HOME == ptc_home(), "launcher and package must provision one home"
-    assert mod.VENV == ptc_home() / "venv"
 
 
 def test_launcher_default_home_is_the_package_default(monkeypatch, tmp_path):

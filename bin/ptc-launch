@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Provision ~/.ptc/venv if missing/stale, then exec the ptc MCP adapter from it.
+"""Provision ~/.ptc/venvs/<build_id>/ if missing, then exec the ptc MCP adapter from it.
 
-Stamp payload MUST stay byte-identical to ptc.venv.stamp_payload().
+Stamp payload MUST stay semantically identical to ptc.venv.stamp_payload(): this script is
+its stdlib-only twin, run before the package is importable, and a payload that disagrees
+gives the two provisioners two different build ids for one source tree.
 """
 import hashlib
 import json
@@ -18,9 +20,6 @@ from pathlib import Path
 _RAW_HOME = os.environ.get("PTC_HOME")
 HOME = (Path(_RAW_HOME).expanduser().resolve() if _RAW_HOME
         else Path.home() / ".ptc")
-VENV = HOME / "venv"
-PY = VENV / "bin" / "python"
-STAMP = VENV / ".ptc-version"
 #: The package root, which is ALSO the plugin root — `.claude-plugin/plugin.json` sits
 #: beside `pyproject.toml`. That is not tidiness: a marketplace install caches only the
 #: directory holding the manifest, so with the Python package one level outside it, the
@@ -31,54 +30,87 @@ PKG = Path(__file__).resolve().parent.parent             # bin/ptc-launch -> ptc
 
 
 def payload() -> dict:
+    """Semantically identical to ptc.venv.stamp_payload() — keep the twins in step.
+
+    What the build is MADE FROM and nothing about where it sits: source paths are hashed
+    relative to the package, so the same source in two plugin-cache directories is one
+    build rather than a needless rebuild that kills every running kernel.
+    """
     def sha(name):
         return hashlib.sha256((PKG / name).read_bytes()).hexdigest()
-    return {"schema": 2, "pyproject_sha": sha("pyproject.toml"),
-            "lock_sha": sha("uv.lock"), "pkg": str(PKG)}
+    base = PKG / "src" / "ptc"
+    parts = ["{}:{}".format(p.relative_to(base).as_posix(),
+                            hashlib.sha256(p.read_bytes()).hexdigest())
+             for p in sorted(base.rglob("*.py"))]
+    src_sha = hashlib.sha256("\n".join(parts).encode()).hexdigest()
+    return {"schema": 3, "pyproject_sha": sha("pyproject.toml"),
+            "lock_sha": sha("uv.lock"), "src_sha": src_sha}
+
+
+def build_id() -> str:
+    return hashlib.sha256(
+        json.dumps(payload(), sort_keys=True).encode()).hexdigest()[:12]
+
+
+def venv_dir() -> Path:
+    return HOME / "venvs" / build_id()
 
 
 def current() -> bool:
+    vd = venv_dir()
     try:
-        return PY.exists() and json.loads(STAMP.read_text()) == payload()
+        return (vd / "bin" / "python").exists() and \
+            json.loads((vd / ".ptc-version").read_text()) == payload()
     except (OSError, json.JSONDecodeError):
         return False
 
 
 def provision() -> None:
+    vd = venv_dir()
     uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-    # --clear: uv refuses to create a venv where one already exists, which is the state
-    # every upgrade starts from. It still declines to wipe a non-venv directory.
-    subprocess.run([uv, "venv", str(VENV), "--python", "3.12", "--seed", "--clear"],
+    # --clear is harmless on a fresh directory and load-bearing on a retry over a
+    # half-provisioned one (uv refuses to create over an existing venv).
+    subprocess.run([uv, "venv", str(vd), "--python", "3.12", "--seed", "--clear"],
                    check=True)
-    # Installs the checked-in uv.lock, not a fresh resolution of pyproject.toml — see
-    # ptc.venv.ensure_venv, whose two commands this must stay identical to.
-    subprocess.run([uv, "sync", "--locked", "--inexact", "--no-dev", "--extra", "kernel",
-                    "--project", str(PKG)],
-                   check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(VENV)})
-    STAMP.write_text(json.dumps(payload()))
+    # The checked-in uv.lock, copied in (--no-editable): the build outlives the plugin
+    # cache directory it was provisioned from. See ptc.venv.ensure_venv, whose two
+    # commands this must stay identical to.
+    subprocess.run([uv, "sync", "--locked", "--inexact", "--no-dev", "--no-editable",
+                    "--extra", "kernel", "--project", str(PKG)],
+                   check=True, env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(vd)})
+    # The stamp goes in LAST: it is what marks the directory complete, so a provision that
+    # dies midway leaves a build nothing will mistake for finished.
+    (vd / ".ptc-version").write_text(json.dumps(payload()))
 
 
 def main() -> None:
-    if not current():
-        lock = HOME / "provision.lock"
-        lock.parent.mkdir(parents=True, exist_ok=True)
+    # Take-the-lock retry, not wait-then-recheck: the holder is usually provisioning a
+    # DIFFERENT build (old and new adapters overlap across a rollout), so a cleared lock
+    # says nothing about ours. Same loop shape as ptc.venv.ensure_venv — keep the twins
+    # in step.
+    lock = HOME / "provision.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    polls = 1200                       # 10 min at 0.5 s
+    while not current():
         try:
             lock.mkdir()
-            try:
-                provision()
-            finally:
-                lock.rmdir()
         except FileExistsError:
-            for _ in range(1200):
-                if not lock.exists():
-                    break
-                time.sleep(0.5)
-            if not current():
-                print("ptc-launch: venv stale and provisioning lock held; "
-                      f"remove {lock} if nothing is provisioning", file=sys.stderr)
+            if polls <= 0:
+                print("ptc-launch: build absent and provisioning lock held past its "
+                      f"budget; remove {lock} if nothing is provisioning",
+                      file=sys.stderr)
                 sys.exit(1)
+            polls -= 1
+            time.sleep(0.5)
+            continue
+        try:
+            if not current():
+                provision()
+        finally:
+            lock.rmdir()
     os.environ["PTC_LAUNCHER"] = os.path.abspath(__file__)
-    os.execv(str(PY), [str(PY), "-m", "ptc.mcp"])
+    py = venv_dir() / "bin" / "python"
+    os.execv(str(py), [str(py), "-m", "ptc.mcp"])
 
 
 if __name__ == "__main__":
