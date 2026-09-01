@@ -62,7 +62,7 @@ PKG = Path(__file__).resolve().parent.parent.parent
 def main():
     cache = PKG / ".venv-kernel"
     assert (cache / "bin" / "python").exists(), \
-        "cached test venv missing — run `uv run pytest test/unit/test_paths.py -q` once first"
+        "cached test venv missing — run `uv run pytest test/integration/test_kernel_lifecycle.py -q` once first (it builds .venv-kernel via the kernel_venv fixture)"
     tmp = Path(tempfile.mkdtemp(prefix="s8-"))
     home = tmp / "home"; home.mkdir()
     (home / "venv").symlink_to(cache.resolve())
@@ -86,8 +86,15 @@ def _serve(sock, ns):
         except Exception as e:
             c.sendall((json.dumps({"error": str(e)}) + "\n").encode())
         c.close()
+import hashlib, tempfile
 _p = %r
-_s = socket.socket(socket.AF_UNIX); _s.bind(_p); os.chmod(_p, 0o600); _s.listen(4)
+_real = os.path.join(tempfile.gettempdir(),
+                     "ptc-peek-" + hashlib.sha256(_p.encode()).hexdigest()[:12] + ".sock")
+for _q in (_real, _p):
+    try: os.unlink(_q)
+    except OSError: pass
+_s = socket.socket(socket.AF_UNIX); _s.bind(_real); os.chmod(_real, 0o600); _s.listen(4)
+os.symlink(_real, _p)   # AF_UNIX 104-byte cap: publish a symlink, bind short (ships as-is)
 threading.Thread(target=_serve, args=(_s, globals()), daemon=True).start()
 print("daemon up")
 ''' % str(kernel_dir("s8") / "peek.sock")
@@ -203,6 +210,11 @@ def test_round_trip_repr_and_cap(tmp_path):
     assert r == {"repr": "42", "truncated": False}
     r = peek_client.peek_kernel_path(sock_path, "x")
     assert r["truncated"] is True and len(r["repr"]) == peek.REPR_CAP
+    # the published name is a SYMLINK to a short real socket (AF_UNIX 104-byte cap —
+    # this very tmp_path is longer than the cap, which is the point), owner-only
+    import os as _os
+    assert sock_path.is_symlink()
+    assert (_os.stat(sock_path.resolve()).st_mode & 0o777) == 0o600
 
 
 def test_error_paths_travel_as_error_replies(tmp_path):
@@ -265,6 +277,7 @@ import json
 import os
 import socket
 import threading
+from pathlib import Path
 
 REPR_CAP = 4000
 _EVAL_JOIN_S = 5.0
@@ -353,14 +366,29 @@ def _serve(sock: socket.socket, namespace) -> None:
 
 def install_peek(kernel_dir, namespace) -> None:
     """Serve `kernel_dir/peek.sock`. Failure is swallowed: peek is a convenience and
-    must never fail bootstrap."""
+    must never fail bootstrap.
+
+    The REAL socket binds at a short deterministic tmpdir path and `peek.sock` is a
+    SYMLINK to it: AF_UNIX caps sun_path at 104 bytes on macOS, and a kernel dir under a
+    pytest tmp_path (or a long PTC_HOME, or a subagent-suffixed key) blows past it —
+    bind fails, the belt below swallows it, and peek is silently absent. connect()
+    resolves symlinks, so the client and every consumer see only `peek.sock`. The real
+    path is derived by hash, so a respawn of the same key lands on the same file and the
+    unlink-before-bind covers the previous incarnation.
+    """
+    import hashlib
+    import tempfile
     path = kernel_dir / "peek.sock"
+    real = (Path(tempfile.gettempdir())
+            / f"ptc-peek-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}.sock")
     try:
-        path.unlink(missing_ok=True)    # a previous incarnation's stale socket
+        real.unlink(missing_ok=True)    # a previous incarnation's stale socket
+        path.unlink(missing_ok=True)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(path))
-        os.chmod(path, 0o600)
+        sock.bind(str(real))
+        os.chmod(real, 0o600)           # owner-only even in a world-writable tmpdir
         sock.listen(4)
+        path.symlink_to(real)
     except OSError:
         return
     threading.Thread(target=_serve, args=(sock, namespace), daemon=True,
@@ -417,13 +445,13 @@ def peek_kernel(key: str, expr: str, timeout_s: float = 6.0) -> dict:
 - [ ] **Step 5: Run the unit tests to verify they pass**
 
 Run: `uv run pytest test/unit/test_peek.py -v`
-Expected: PASS (12 tests).
+Expected: PASS (18 collected items — the two parametrized tests expand to 6 each).
 
 - [ ] **Step 6: Wire the daemon into bootstrap**
 
 In `src/ptc/runtime/bootstrap.py::install`, after the display shim / hook registrations
-(beside the other `try/except`-belted installs — find `_install_display_shim()` and place
-this adjacently), add:
+(find the `_install_display_shim()` call and place this adjacently — `ip` and
+`STATE.kernel_dir` are both in scope there), add:
 
 ```python
     try:
@@ -519,7 +547,26 @@ def test_peek_description_carries_the_contract():
 def test_instructions_mention_peek_and_queue():
     from ptc.mcp import INSTRUCTIONS
     assert "peek" in INSTRUCTIONS and "queue=True" in INSTRUCTIONS
+
+
+def test_pre_peek_message_is_exact(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    import ptc.mcp as mcp
+    monkeypatch.setattr("ptc.kernel.kernel_alive", lambda key: True)
+    monkeypatch.setattr("ptc.discovery.read_meta", lambda key: {"build": "abc123def456"})
+    from ptc.peek_client import PeekUnavailable
+    def raise_unavailable(key, expr):
+        raise PeekUnavailable("no socket")
+    monkeypatch.setattr("ptc.peek_client.peek_kernel", raise_unavailable)
+    text = mcp._peek_text("k", "x")
+    assert text == "[kernel build abc123def456 predates peek — restart() to upgrade]"
 ```
+
+Also in this file: `test_every_tool_ships_a_nonempty_description` pins the exact tool set
+— extend it to `{"exec", "wait", "interrupt", "restart", "kernels", "peek"}` or Task 3
+fails its own Step 6. (Note for the `_peek_text` monkeypatches: they patch the SOURCE
+modules; `_peek_text` imports inside the function body, so source-module patches bind —
+that function-local import style is deliberate, keep it when implementing Step 3.)
 
 (Both tokens go green in THIS task: Step 3 adds the peek+queue sentence to INSTRUCTIONS —
 the `queue=` parameter itself lands in Task 4, but the digest line is doctrine and ships
@@ -553,10 +600,15 @@ def test_cli_peek_says_predates_on_unavailable(monkeypatch, capsys, tmp_path):
 
 In `test/integration/test_subagent_keying.py`, add a case following the file's existing
 dispatch-path pattern (it drives `MCPServer.call_tool` with a `_meta` dict and a hook
-mapping file): parent kernel sets `TOKEN = 'parent-secret'`; write a tooluse mapping for
-a fake subagent; call the `peek` tool with `expr="TOKEN"` and that `_meta`; assert the
-reply does NOT contain `parent-secret` (the subagent's own kernel has no such name — a
-NameError error reply is the correct outcome, and IS the isolation proof).
+mapping file). The mapping is CONSUMED on first resolution and `peek` never spawns a
+kernel, so the recipe needs two mappings and a spawn: parent kernel sets
+`TOKEN = 'parent-secret'`; write TWO mapping files with the SAME `agent_id` under
+different tool_use_ids; dispatch an `exec` (code `pass`) with the first `_meta` to spawn
+the subagent's kernel; then call `peek` with `expr="TOKEN"` and the second `_meta`;
+assert the reply carries `NameError` AND does not contain `parent-secret` — the
+subagent's own live kernel answered, and it has no such name. That pair of assertions is
+the acceptance-4 proof; either alone is weaker (no-NameError could mean key resolution
+without a live sub kernel; no-secret alone could mean a dead-kernel message).
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -586,7 +638,7 @@ def _peek_text(key: str, expr: str) -> str:
 
 
 async def peek_tool(expr: str, session: str | None = None, ctx: Context = None) -> list:
-    """Read a value while the kernel is BUSY — the one channel that works mid-cell
+    """Read a value while the kernel is busy — the one channel that works mid-cell
     (wait tails output; peek reads variables). `expr` is a Name/attribute/constant-index
     chain evaluated against the live namespace, repr capped at 4000 chars; no calls, no
     assignments — refused before evaluation. Not a boundary: attribute access and repr
@@ -600,6 +652,9 @@ async def peek_tool(expr: str, session: str | None = None, ctx: Context = None) 
 Register it: the tuple loop at the bottom gains `(peek_tool, "peek")`. Add one sentence
 to `INSTRUCTIONS` (before the skill-pointer sentence): `peek(expr) reads a variable's
 repr while a cell runs; exec(queue=True) waits for the slot instead of returning busy.`
+Doctrine consistency in the same touch: the INSTRUCTIONS line `Tools: exec, wait,
+interrupt, restart, kernels.` gains `peek`; the `src/ptc/mcp.py` module docstring's
+five-tool list gains it too.
 
 - [ ] **Step 4: Implement the CLI verb**
 
@@ -824,9 +879,13 @@ extend the closing sentence:
                f"that cell's, not the result of what you just tried to run — "
                f"wait(cell_id={outcome.cell_id}) tells you when the kernel frees, and "
                "collects that output only for the cell's own submitter. " if has_id else "")
-            + "interrupt() to stop it, resubmit after it finishes, or pass queue=True "
-              "to wait for the slot. Nothing was queued.", [])
+            + ("interrupt() to stop it, or resubmit after it finishes. Nothing was queued."
+               if outcome.reason == "queue-timeout" else
+               "interrupt() to stop it, resubmit after it finishes, or pass queue=True "
+               "to wait for the slot. Nothing was queued."), [])
 ```
+
+(a queue-timeout caller already passed queue=True — telling them to pass it is noise)
 
 `src/ptc/mcp.py` — `exec_tool` gains `queue: bool = False` (before `ctx`), the docstring
 gains one sentence after the busy sentence: `queue=True waits for the slot instead
@@ -843,6 +902,14 @@ as a notification).`, and the call site becomes:
 `src/ptc/cli.py` — the exec subparser gains
 `sp.add_argument("--queue", action="store_true", help="wait for the kernel's slot instead of exiting busy")`,
 and the exec branch routes through `exec_cell_queued` when `a.queue`.
+
+Doctrine consistency in the same touch: `src/ptc/shape.py::to_dict`'s Busy branch gains
+`"queued_s": outcome.queued_s` (the `--json` caller must see what the text render says);
+the INSTRUCTIONS sentence `if the kernel is busy, wait or interrupt — nothing queues`
+becomes `if the kernel is busy, wait or interrupt — nothing queues silently;
+exec(queue=True) waits for the slot`; and `skills/ptc/SKILL.md`'s busy bullet ("wait for
+it or interrupt; nothing queues silently") gains `— or pass queue=True to the MCP exec
+to wait for the slot`.
 
 - [ ] **Step 4: Run the named unit files**
 
