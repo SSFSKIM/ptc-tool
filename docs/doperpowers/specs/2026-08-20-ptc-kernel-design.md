@@ -282,8 +282,9 @@ adapter (same client library, same result shaping, text output).
 
 ```
 ptc setup                       # provision/refresh ~/.ptc/venv
-ptc exec [-s KEY] [-t SECS] [--json] [CODE | -]   # run a cell (CODE arg, or stdin with -)
+ptc exec [-s KEY] [-t SECS] [--queue] [--json] [CODE | -]   # run a cell (CODE arg, or stdin with -); --queue waits for the slot
 ptc wait  -s KEY CELL_ID [-t SECS] [--since N] [--until REGEX] [--json]   # --json: the machine-readable result object
+ptc peek [-s KEY] [--json] EXPR # read a variable's repr while a cell runs (chains only, no calls)
 ptc interrupt [-s KEY]
 ptc restart   [-s KEY]
 ptc list                        # kernels + last-used + alive
@@ -765,7 +766,10 @@ Log). The plain busy render gains one hint line: `pass queue=True to wait for th
 **Peek.** An inspection channel that works while the kernel is busy — the
 feedback's actual pain ("can't even check a counter behind a long cell"; output tailing
 already works via `wait`, but expression values do not). Bootstrap starts a daemon thread
-serving `~/.ptc/kernels/<key>/peek.sock` (0600, inside the 0700 kernel dir): one JSON line
+serving `~/.ptc/kernels/<key>/peek.sock` — as shipped, that published name is a SYMLINK to
+the real 0600 socket bound at a short hashed tmpdir path, because AF_UNIX caps sun_path at
+104 bytes on both ends and kernel dirs routinely exceed it (S8 verdict below; the
+containment consequence is the logged tmpdir-race debt item): one JSON line
 in (`{"expr": …}`), one out (`{"repr": …, "truncated": bool}` or `{"error": …}`). The
 expression is AST-restricted to Name / Attribute / constant-Subscript chains — no calls,
 no assignments — which makes casual mutation inexpressible, and the claim stops there:
@@ -1691,6 +1695,25 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   real kernels at Task 5.
   Date/Author: 2026-09-01 / Claude (SDE controller).
 
+- Decision: initiative 2 SHIPPED as v0.4.0 (commits 38f6d57..f279e32 + doc touch).
+  Five-task SDE run (S8 spike PROMOTE at 6-15 ms under a busy kernel; peek runtime;
+  surfaces; queued admission; acceptance — all five criteria PASS live). Two design
+  corrections were forced by tests mid-flight and are now the shipped contract: the
+  AF_UNIX sun_path cap (104 bytes) binds BOTH ends, so the real socket lives at a hashed
+  tmpdir path and `peek.sock` is a symlink the CLIENT resolves itself (the plan's
+  "connect() resolves symlinks" premise was wrong twice over — the plan reviewer caught
+  the server half by live bind experiment, the executor caught the client half by test);
+  and a dead kernel's backlog can accept a connection then EOF with zero bytes, so the
+  client distinguishes accepted-but-silent from answered-garbage. Final review (fable):
+  SHIP, no P1/P2; the doc stragglers folded into the ship commit. Debt logged on the
+  tracker: tmpdir pre-creation race (Linux shared /tmp only; shelf lstat guard),
+  `xs[-1]` refusal (UnaryOp grammar widening needs a spec edit first), queue-timeout
+  render calling a pending-unconfirmed holder "running". Dismissed with reasons: adapter
+  REPR_CAP literal (the real skew axis is kernel build, and truncation truth travels in
+  the reply), soft budget under lock contention (bounded by the same submit-lock timeout
+  plain exec lives under). Suite 570 passed / 7 skipped.
+  Date/Author: 2026-09-01 / Claude (SDE controller).
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2336,6 +2359,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-01 (initiative 2 shipped, v0.4.0): queued admission + peek live — `exec(queue=True)`/`ptc exec --queue` wait-then-submit in front of the untouched F2 machinery with an honest `queue-timeout`, and a sixth MCP tool `peek` (CLI `ptc peek`) reading AST-restricted variable reprs from a busy kernel over a symlink-published socket (sun_path cap corrected on both ends mid-flight). Subagent auto-keying covers peek via the extended hook matcher. This section's peek containment sentence and the CLI table were corrected in the ship commit; the Decision Log entry above carries the delivery record and triaged debt. Suite 570 passed.
 
 - 2026-09-01 (initiative 1 shipped, v0.3.0): immutable per-build venvs live — versioned self-contained builds (`~/.ptc/venvs/<build_id>/`, `--no-editable`, path-independent identity), lock-retry provisioning twins, attach across builds gated only by venv-gone/protocol with the build-drift notice, and startup GC (unreferenced + aged, deferred for live provisional spawns, lock-serialized). Delivered by a five-task subagent run with per-task reviews, a fable final whole-branch review (two blockers fixed in one wave), and live acceptance of all four spec criteria. Suite 534 passed. Decision Log entry above carries the full delivery record and the triaged debt log.
 

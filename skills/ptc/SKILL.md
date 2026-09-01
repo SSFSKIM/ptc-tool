@@ -7,7 +7,7 @@ description: Persistent per-session IPython kernel for programmatic tool calling
 
 You have a persistent IPython kernel for this session (session id: `${CLAUDE_SESSION_ID}`).
 Run Python in it with the `mcp__plugin_ptc_ptc__exec` tool. If `mcp__plugin_ptc_ptc__exec`
-(or its siblings `wait`/`interrupt`/`restart`/`kernels`) is not yet visible, it is deferred —
+(or its siblings `wait`/`peek`/`interrupt`/`restart`/`kernels`) is not yet visible, it is deferred —
 load it first with ToolSearch, e.g. `select:mcp__plugin_ptc_ptc__exec,mcp__plugin_ptc_ptc__wait`.
 Variables, imports, and functions persist across calls, turns, compaction, and `--resume`,
 until the kernel's idle TTL (default 24 h, `PTC_IDLE_HOURS`) or a restart. If results ever
