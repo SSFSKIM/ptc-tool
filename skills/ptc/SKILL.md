@@ -25,35 +25,20 @@ next native Edit of it will demand a fresh Read — prefer one lane per file wit
 
 ## Working discipline
 
-- Assign large results to named variables; print compact summaries. Output truncates
-  (~12k chars) with a path to the full log.
-- Never poll with `time.sleep` in a cell. If a cell yields `running`, call
-  `mcp__plugin_ptc_ptc__wait` with the cell id; call `mcp__plugin_ptc_ptc__interrupt` to
-  stop a runaway cell — it comes back with that cell's own tail, so there is nothing left
-  to wait for afterwards.
-- If the kernel reports `busy`, another cell is running — wait for it or interrupt; nothing
-  queues silently — or pass `queue=True` to the MCP exec to wait for the slot.
-- While a cell runs, `peek` (MCP tool / `ptc peek <expr>`) reads a variable's repr from
-  the live namespace — chains only, no calls; wait() tails output, peek reads values.
-  Kernels from pre-peek builds have no channel; restart() upgrades them.
-- One session key is one kernel. Subagents you dispatch are keyed to kernels of their own
-  automatically (the plugin's PreToolUse hook names the caller to the adapter), so they
-  do not contend with you; to deliberately SHARE your kernel with one, pass your own
-  `session=` key in its prompt. Other parallel callers (another window, a bare CLI) still
-  need their own `session="<name>"`. And a `busy` that names a cell you did not submit
-  means that cell belongs to another caller — its output is theirs, never your result.
-- To be notified instead of re-calling `wait`: call `wait` once with `timeout_s` above
-  the cell's expected runtime. A call still running at ~2 minutes is moved to a background
-  task automatically and the cell's result arrives as a task notification when it settles —
-  keep working meanwhile. If the budget elapses first, the result says `running` — re-arm.
-  (The MCP tools take `timeout_s=`; the in-kernel `bash()` takes `timeout=`.)
-  Add `until=r"..."` to be woken at an EVENT instead of at settle: the wait returns the
-  moment new output first matches that regex, so the notification carries the matching tail.
-  (Host without MCP auto-backgrounding: run the blocking CLI wait —
+The MCP tool descriptions already carry the call-time contracts — the `running` yield and
+`wait`, `busy` and `queue=True`, `peek`, `interrupt`, session keying, `timeout_s=` on the
+tools versus `timeout=` inside the kernel. This section is only what they cannot say.
+
+- Never poll with `time.sleep` in a cell: let the cell yield and `wait` on it. One `wait`
+  with `timeout_s` above the cell's expected runtime is auto-backgrounded and comes back
+  as a notification; if the budget elapses first the result says `running` — re-arm.
+- Host without MCP auto-backgrounding: run the blocking CLI wait —
   `PTC_YIELD_S=3600 ptc wait <cell_id>` — in a background Bash instead; read its output,
   not just the exit code, since a `running` yield also exits 0. Subagents: never this
   fallback — the CLI resolves to the parent's kernel, not your auto-keyed one; re-arm
-  the MCP wait instead.)
+  the MCP wait instead.
+- A `busy` that names a cell you did not submit belongs to another caller — its output is
+  theirs, never your result.
 - Run a project's code in the project's own environment (its venv, its npm scripts) via
   `bash(...)`; never install project dependencies into the kernel.
 
