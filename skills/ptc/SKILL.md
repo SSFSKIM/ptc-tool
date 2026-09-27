@@ -10,7 +10,8 @@ Run Python in it with the `mcp__plugin_ptc_ptc__exec` tool. If `mcp__plugin_ptc_
 (or its siblings `wait`/`peek`/`interrupt`/`restart`/`kernels`) is not yet visible, it is deferred —
 load it first with ToolSearch, e.g. `select:mcp__plugin_ptc_ptc__exec,mcp__plugin_ptc_ptc__wait`.
 Variables, imports, and functions persist across calls, turns, compaction, and `--resume`,
-until the kernel's idle TTL (default 24 h, `PTC_IDLE_HOURS`) or a restart. If results ever
+until the kernel's idle TTL (default 24 h, `PTC_IDLE_HOURS`; a subagent's own auto-keyed
+kernel gets 1 h, `PTC_SUB_IDLE_HOURS`) or a restart. If results ever
 look like another session's namespace, pass `session="${CLAUDE_SESSION_ID}"` explicitly to
 `exec`.
 

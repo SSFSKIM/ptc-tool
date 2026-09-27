@@ -38,7 +38,14 @@ import subprocess
 from dataclasses import dataclass
 
 from .ownership import hook_birth_identity
-from .paths import kernel_dir, private_write_text, run_dir, safe_key, secure_dir
+from .paths import (
+    SUB_KEY_MARK,
+    kernel_dir,
+    private_write_text,
+    run_dir,
+    safe_key,
+    secure_dir,
+)
 
 #: One nonce per adapter PROCESS, drawn once at import.
 #:
@@ -172,7 +179,7 @@ def resolve(explicit: str | None = None, ppid: int | None = None, env=None,
     # No session id: the parent's sent this kernel's `history()` and `agent.fork()` to the
     # PARENT's conversation, and a subagent's own is a sidechain with no resumable id to put
     # here instead — None routes them to the documented alias-keyed error.
-    return Resolved(safe_key(f"{base.key}--sub-{agent_id}"), base.source + "+subagent",
+    return Resolved(safe_key(f"{base.key}{SUB_KEY_MARK}{agent_id}"), base.source + "+subagent",
                     None, cwd, base.degraded)
 
 

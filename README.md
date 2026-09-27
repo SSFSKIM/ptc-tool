@@ -81,6 +81,13 @@ survives `--resume` until the idle TTL (default 24 h; `PTC_IDLE_HOURS`), a `rest
 the machine rebooting. A restart loses the Python namespace but not child agent sessions —
 those live in `agents.json` and stay resumable through `agent.list()` / `agent.resume()`.
 
+A subagent's auto-keyed kernel (`<key>--sub-<agent_id>`) idles out after 1 h instead
+(`PTC_SUB_IDLE_HOURS`, never longer than `PTC_IDLE_HOURS`): it serves one subagent run and
+has no `--resume` to wait for. Each key's directory under `~/.ptc/kernels/` outlives its
+kernel so the next attach can report the expiry; the MCP server sweeps them at startup once
+the kernel is confirmed gone and nothing in the directory has changed for 7 days (1 day for
+a subagent key). A main key whose `agents.json` still lists child sessions is kept.
+
 `list | doctor` inspect this machine's kernels from any shell; `exec | wait | interrupt |
 kill | restart` act on one kernel. Those five take `--session`; with none given the CLI
 picks the newest live kernel and prints which one it picked. `kill --all` ends every
@@ -127,6 +134,7 @@ host session id, every result header says so (`[keying: adapter-local]`).
 | PTC_YIELD_S | 300 | exec/wait yield timeout |
 | PTC_MAX_OUTPUT_CHARS | 12000 | result cap (server clamp 50000) |
 | PTC_IDLE_HOURS | 24 | kernel TTL |
+| PTC_SUB_IDLE_HOURS | 1 | TTL for a subagent's auto-keyed kernel (capped by PTC_IDLE_HOURS) |
 | PTC_MAX_CONCURRENCY | 8 | SDK-call semaphore |
 | PTC_MAX_DEPTH | 1 | agent recursion brake |
 | PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks, plugins and plugin-provided skills (the default `--disable hooks --disable plugins` removes all three); credential stripping from the codex child's environment is unconditional and this knob does not affect it |

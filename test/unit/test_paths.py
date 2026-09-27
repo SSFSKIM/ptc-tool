@@ -52,14 +52,17 @@ def test_ptc_home_expands_a_user_path(monkeypatch):
 def test_config_defaults():
     cfg = Config.from_env(env={})
     assert (cfg.yield_s, cfg.max_output_chars, cfg.idle_hours) == (300.0, 12_000, 24.0)
+    assert cfg.sub_idle_hours == 1.0
     assert (cfg.max_concurrency, cfg.max_depth, cfg.depth) == (8, 1, 0)
     assert cfg.session is None
 
 
 def test_config_env_and_clamp():
     env = {"PTC_YIELD_S": "5", "PTC_MAX_OUTPUT_CHARS": "999999", "PTC_DEPTH": "2",
-           "PTC_SESSION": "abc", "PTC_IDLE_HOURS": "0.01", "PTC_MAX_OUTPUT_CHARS_BAD": "x"}
+           "PTC_SESSION": "abc", "PTC_IDLE_HOURS": "0.01", "PTC_MAX_OUTPUT_CHARS_BAD": "x",
+           "PTC_SUB_IDLE_HOURS": "0.25"}
     cfg = Config.from_env(env=env)
+    assert cfg.sub_idle_hours == 0.25
     assert cfg.yield_s == 5.0
     assert cfg.max_output_chars == MAX_OUTPUT_CLAMP  # clamped
     assert cfg.depth == 2 and cfg.session == "abc" and cfg.idle_hours == 0.01

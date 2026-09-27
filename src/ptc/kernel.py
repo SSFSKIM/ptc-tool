@@ -23,6 +23,7 @@ from .paths import (
     PTC_PROTOCOL,
     Config,
     cells_dir,
+    is_sub_key,
     kernel_dir,
     kernels_root,
     private_open,
@@ -192,6 +193,13 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                   claude_session_id: str | None = None,
                   config: Config | None = None) -> KernelInfo:
     cfg = config or Config.from_env()
+    # The 24 h default exists so a `--resume` finds its namespace standing; a subagent's
+    # kernel has no resume to wait for, and idling a day on its memory is what left a
+    # dozen of them holding gigabytes. Applied here rather than at any one caller so an
+    # MCP spawn, a CLI spawn and a restart all bring a sub key up under the same bound —
+    # and as a min, so a PTC_IDLE_HOURS shorter still is never lengthened.
+    if is_sub_key(key) and cfg.sub_idle_hours < cfg.idle_hours:
+        cfg = replace(cfg, idle_hours=cfg.sub_idle_hours)
     # secure_dir, not mkdir: kernel state is owner-only, and a directory from before this
     # rule (or from a laxer umask) has its mode repaired here on every ensure — including
     # the attach path below, which is the only ensure a long-lived kernel ever sees again.
@@ -516,3 +524,97 @@ def list_kernels() -> list[dict]:
             "last_used": last_used,
         })
     return rows
+
+
+#: How long a key's directory outlives its kernel. A main key's expiry notice and agent
+#: registry are for a `--resume` that may come days later; a subagent's key has nobody
+#: left to read either once its run is over.
+KERNEL_DIR_GRACE_S = 7 * 24 * 3600.0
+SUB_KERNEL_DIR_GRACE_S = 24 * 3600.0
+
+
+def _last_activity(kd: Path) -> float:
+    """The newest mtime of any FILE under `kd` — cell logs, the expiry marker, meta.json.
+    Directory mtimes are left out: they move when anything is deleted, including by
+    cleanup itself, and would restart the grace on a key nobody used. So are the lock
+    files: taking a lock creates one, and the sweep's own lock would otherwise make every
+    key look used the moment it is re-checked."""
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(kd):
+        for name in files:
+            if name in ("lock", "submit.lock"):
+                continue
+            try:
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def _holds_agent_rows(kd: Path) -> bool:
+    try:
+        rows = json.loads((kd / "agents.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(rows, list) and bool(rows)
+
+
+def gc_kernel_dirs(*, grace_s: float = KERNEL_DIR_GRACE_S,
+                   sub_grace_s: float = SUB_KERNEL_DIR_GRACE_S,
+                   now: float | None = None) -> list[str]:
+    """Delete key directories whose kernel is gone for good. Returns the keys removed.
+
+    Expiry and `kill` deliberately leave the directory standing — the marker in it is how
+    the next attach learns its namespace died — so without this every key ever used stays
+    on disk forever, and a subagent fan-out adds one per agent.
+
+    A directory goes only when its owner is ABSENT or SETTLED dead (an unreadable identity
+    keeps it — deleting a live kernel's state is the one mistake this must not make), no
+    file in it has changed for the grace (the short one for a subagent key), its key lock
+    is free (a held lock is someone mid-spawn or mid-kill: "not now", never "wait"), and —
+    for a main key — it holds no agent registry rows: `agents.json` is the documented way
+    back to child sessions after the kernel is gone, and it is kept for as long as the key.
+    Everything is re-checked under the lock. The dead kernel's background bash groups and
+    leftover children are reaped first, as `kill_kernel` would: this directory is the only
+    record of them.
+    """
+    import shutil
+
+    from .lock import flock_path
+    from .ownership import UnknownOwner
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    root = kernels_root()
+    if not root.is_dir():
+        return removed
+
+    def collectable(kd: Path, key: str) -> bool:
+        sub = is_sub_key(key)
+        if not sub and _holds_agent_rows(kd):
+            return False
+        if now - _last_activity(kd) < (sub_grace_s if sub else grace_s):
+            return False
+        try:
+            return not settled_owner_state(read_owner(key))
+        except UnknownOwner:
+            return False
+
+    for kd in sorted(root.iterdir()):
+        if kd.is_symlink() or not kd.is_dir():
+            continue
+        key = kd.name
+        try:
+            if not collectable(kd, key):
+                continue
+            with flock_path(kernel_dir(key) / "lock", timeout=0):
+                if not collectable(kd, key):
+                    continue
+                o = read_owner(key)
+                if o:
+                    bgroups.reap_leaderless_group(o.pid)
+                bgroups.reap(kd)
+                shutil.rmtree(kd)
+            removed.append(key)
+        except (OSError, TimeoutError, ValueError):
+            continue           # one unremovable key must not stop the sweep
+    return removed

@@ -168,11 +168,24 @@ def safe_key(raw: str) -> str:
     return "key-" + key if key.strip(".") == "" else key
 
 
+#: What `discovery.resolve` appends to a subagent caller's key (`<base>--sub-<agent_id>`).
+#: The kernel under such a key serves one subagent run and is unreachable once that run
+#: ends — except by a SendMessage continuation of the same agent — so nothing about it
+#: wants the main session's `--resume`-length lifetime: it gets the short TTL
+#: (`Config.sub_idle_hours`) and the short directory grace (`kernel.gc_kernel_dirs`).
+SUB_KEY_MARK = "--sub-"
+
+
+def is_sub_key(key: str) -> bool:
+    return SUB_KEY_MARK in key
+
+
 @dataclass
 class Config:
     yield_s: float = 300.0
     max_output_chars: int = 12_000
     idle_hours: float = 24.0
+    sub_idle_hours: float = 1.0
     max_concurrency: int = 8
     max_depth: int = 1
     depth: int = 0
@@ -207,6 +220,7 @@ class Config:
             yield_s=num("PTC_YIELD_S", float, 300.0),
             max_output_chars=min(num("PTC_MAX_OUTPUT_CHARS", int, 12_000), MAX_OUTPUT_CLAMP),
             idle_hours=num("PTC_IDLE_HOURS", float, 24.0),
+            sub_idle_hours=num("PTC_SUB_IDLE_HOURS", float, 1.0),
             max_concurrency=max_concurrency,
             max_depth=num("PTC_MAX_DEPTH", int, 1),
             depth=num("PTC_DEPTH", int, 0),

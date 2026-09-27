@@ -324,6 +324,11 @@ def main() -> None:
         gc_builds()
     except Exception:
         pass   # GC must never cost a session its adapter
+    try:
+        from .kernel import gc_kernel_dirs
+        gc_kernel_dirs()
+    except Exception:
+        pass
     server.run()          # stdio transport
 
 
