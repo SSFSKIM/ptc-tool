@@ -434,3 +434,25 @@ def test_the_subagent_key_is_a_legal_kernel_directory_name(monkeypatch, tmp_path
     r = _base_env_resolve(tool_use_id="toolu_1")
 
     assert safe_key(r.key) == r.key and kernel_dir(r.key).name == r.key
+
+
+def test_a_long_base_keeps_the_subagent_marker(monkeypatch, tmp_path):
+    """safe_key truncates from the end, so appending the marker BEFORE it cut the marker
+    off a long base and the kernel was classified main — 24 h TTL, 7-day directory grace."""
+    from ptc.paths import KEY_MAX, is_sub_key, kernel_dir
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    for base in ("b" * KEY_MAX, "c" * KEY_MAX):
+        _write_mapping(tmp_path, "toolu_long", "agent_" + "9" * 58)
+        r = _base_env_resolve(env={"PTC_SESSION": base}, tool_use_id="toolu_long")
+        assert is_sub_key(r.key) and r.key.endswith("--sub-agent_" + "9" * 58)
+        assert len(r.key) <= KEY_MAX and safe_key(r.key) == r.key
+        assert kernel_dir(r.key).name == r.key
+    b = sub_key_of("b" * KEY_MAX)
+    c = sub_key_of("c" * KEY_MAX)
+    assert b != c, "two long bases collapsed onto one subagent key"
+
+
+def sub_key_of(base):
+    from ptc.paths import sub_key
+    return sub_key(base, "agent_1")

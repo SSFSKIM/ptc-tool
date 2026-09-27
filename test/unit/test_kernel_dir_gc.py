@@ -85,6 +85,23 @@ def test_an_unreadable_owner_keeps_the_directory(home, monkeypatch):
     assert kd.exists()
 
 
+def test_an_owner_file_that_cannot_be_read_or_decoded_is_not_an_absent_owner(home):
+    """read_owner answers None for a bad file as well as a missing one; only the missing
+    one means nobody owns the key."""
+    garbled = _key(home, "garbled")
+    (garbled / "owner.json").write_text("{not json")
+    locked = _key(home, "unreadable")
+    (locked / "owner.json").write_text("{}")
+    os.chmod(locked / "owner.json", 0)
+    dangling = _key(home, "dangling")
+    (dangling / "owner.json").symlink_to(home / "nowhere")
+    try:
+        assert kernel.gc_kernel_dirs() == []
+        assert garbled.exists() and locked.exists() and dangling.exists()
+    finally:
+        os.chmod(locked / "owner.json", 0o600)
+
+
 def test_grace_is_a_week_for_main_keys_and_a_day_for_subagent_keys(home):
     main_recent = _key(home, "s1", age_s=3 * DAY)
     sub_recent = _key(home, "s1--sub-agent_a", age_s=3 * 3600)

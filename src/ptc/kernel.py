@@ -189,17 +189,26 @@ def _kernel_info_roundtrip(conn: Path, timeout: float = 20.0) -> None:
         kc.stop_channels()
 
 
+def _lifetime_config(key: str, cfg: Config, recorded_ttl: bool) -> Config:
+    """The 24 h default exists so a `--resume` finds its namespace standing; a subagent's
+    kernel has no resume to wait for, and idling a day on its memory is what left a dozen
+    of them holding gigabytes. Applied in ensure_kernel rather than at any one caller so an
+    MCP spawn and a CLI spawn bring a sub key up under the same bound — and as a min, so a
+    PTC_IDLE_HOURS shorter still is never lengthened. A restart keeps the TTL the kernel
+    was created with (`recorded_ttl`): clamping again with the RESTARTER's sub_idle_hours
+    would reverse a decision that was not theirs."""
+    if not recorded_ttl and is_sub_key(key) and cfg.sub_idle_hours < cfg.idle_hours:
+        return replace(cfg, idle_hours=cfg.sub_idle_hours)
+    return cfg
+
+
 def ensure_kernel(key: str, *, cwd: str | None = None,
                   claude_session_id: str | None = None,
-                  config: Config | None = None) -> KernelInfo:
-    cfg = config or Config.from_env()
-    # The 24 h default exists so a `--resume` finds its namespace standing; a subagent's
-    # kernel has no resume to wait for, and idling a day on its memory is what left a
-    # dozen of them holding gigabytes. Applied here rather than at any one caller so an
-    # MCP spawn, a CLI spawn and a restart all bring a sub key up under the same bound —
-    # and as a min, so a PTC_IDLE_HOURS shorter still is never lengthened.
-    if is_sub_key(key) and cfg.sub_idle_hours < cfg.idle_hours:
-        cfg = replace(cfg, idle_hours=cfg.sub_idle_hours)
+                  config: Config | None = None,
+                  recorded_ttl: bool = False) -> KernelInfo:
+    """`recorded_ttl`: `config.idle_hours` is the TTL this key's kernel was already living
+    under (`restart_kernel` read it back from meta.json), and is kept as it is."""
+    cfg = _lifetime_config(key, config or Config.from_env(), recorded_ttl)
     # secure_dir, not mkdir: kernel state is owner-only, and a directory from before this
     # rule (or from a laxer umask) has its mode repaired here on every ensure — including
     # the attach path below, which is the only ensure a long-lived kernel ever sees again.
@@ -494,6 +503,8 @@ def restart_kernel(key: str, **kw) -> KernelInfo:
                 and getattr(cfg, name) != value:
             cfg = replace(cfg, **{name: value})
     kw["config"] = cfg
+    ttl = recorded["idle_hours"]
+    kw["recorded_ttl"] = isinstance(ttl, (int, float)) and not isinstance(ttl, bool)
     return ensure_kernel(key, **kw)
 
 
@@ -594,8 +605,14 @@ def gc_kernel_dirs(*, grace_s: float = KERNEL_DIR_GRACE_S,
             return False
         if now - _last_activity(kd) < (sub_grace_s if sub else grace_s):
             return False
+        o = read_owner(key)
+        # `read_owner` answers None for a file it could not read or decode as well as for
+        # one that is not there, and only the second is an absent owner: an owner.json
+        # standing unreadable names a process nobody has identified, and may be live.
+        if o is None and os.path.lexists(kd / "owner.json"):
+            return False
         try:
-            return not settled_owner_state(read_owner(key))
+            return not settled_owner_state(o)
         except UnknownOwner:
             return False
 

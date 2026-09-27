@@ -112,3 +112,25 @@ def test_an_explicit_config_still_supplies_everything_meta_does_not(monkeypatch,
         "an explicit config released the kernel's own lifetime settings"
     assert (cfg.depth, cfg.max_depth) == (1, 2), \
         "an explicit config released the recursion brake"
+
+
+def test_a_subagent_kernels_recorded_ttl_survives_a_restart_unclamped(monkeypatch, restarted):
+    """ensure_kernel clamps a sub key to sub_idle_hours at spawn; a restart must bring the
+    kernel back under the TTL it was created with, not re-clamp with the restarter's."""
+    _plain_env(monkeypatch)
+    monkeypatch.setenv("PTC_SUB_IDLE_HOURS", "0.1")
+    write_meta("base--sub-agent_1", idle_hours=0.5)
+    seen = {}
+    monkeypatch.setattr(kernel, "ensure_kernel", lambda key, **kw: seen.update(kw))
+    kernel.restart_kernel("base--sub-agent_1")
+    assert seen["config"].idle_hours == 0.5 and seen["recorded_ttl"] is True
+
+
+
+def test_the_sub_clamp_applies_at_spawn_and_not_to_a_recorded_ttl():
+    cfg = Config(idle_hours=24.0, sub_idle_hours=1.0)
+    assert kernel._lifetime_config("b--sub-a", cfg, recorded_ttl=False).idle_hours == 1.0
+    assert kernel._lifetime_config("b--sub-a", cfg, recorded_ttl=True).idle_hours == 24.0
+    assert kernel._lifetime_config("main", cfg, recorded_ttl=False).idle_hours == 24.0
+    shorter = Config(idle_hours=0.2, sub_idle_hours=1.0)
+    assert kernel._lifetime_config("b--sub-a", shorter, recorded_ttl=False).idle_hours == 0.2

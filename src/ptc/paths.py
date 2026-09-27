@@ -180,6 +180,25 @@ def is_sub_key(key: str) -> bool:
     return SUB_KEY_MARK in key
 
 
+def sub_key(base: str, agent_id: str) -> str:
+    """`<base>--sub-<agent_id>`, with the marker guaranteed to survive.
+
+    `is_sub_key` is what gives a subagent's kernel its short TTL and short directory
+    grace, so the marker is load-bearing. Passing the joined string through `safe_key`
+    truncates a long base's key from the END — the marker and the agent id are exactly
+    what goes. The base is shortened instead (a digest of the whole of it standing in for
+    what was cut, so two long bases still cannot share a key) and the suffix appended
+    after. `agent_id` is the host's `[A-Za-z0-9_-]{1,64}`, so the result is already a
+    clean name within KEY_MAX, and a key that fit before is byte-identical to what it was.
+    """
+    suffix = f"{SUB_KEY_MARK}{agent_id}"
+    joined = f"{base}{suffix}"
+    if len(joined) <= KEY_MAX:
+        return safe_key(joined)
+    digest = hashlib.sha256(base.encode()).hexdigest()[:16]
+    return safe_key(f"{base[:KEY_MAX - len(suffix) - len(digest) - 2]}-h{digest}{suffix}")
+
+
 @dataclass
 class Config:
     yield_s: float = 300.0

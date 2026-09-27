@@ -365,3 +365,35 @@ def test_a_birth_marked_record_is_not_refuted_by_an_lstart_fallback(monkeypatch,
     monkeypatch.setattr(ownership, "_birth", lambda pid: "8675310")
     assert start_time_matches(me, "btime=8675309") is False
     assert settled_owner_state(Owner(me, "btime=8675309", time.time(), "n", "e1")) is False
+
+
+def test_a_waiter_on_an_unlinked_lock_file_retakes_the_lock_at_the_path(tmp_path):
+    """GC removes a dead key's directory — lock file included — while holding that lock.
+    A caller already blocked on the old file woke holding an inode nothing else could
+    reach, while the next caller made a fresh file and locked THAT: two holders, one key."""
+    import shutil
+    import threading
+
+    kd = tmp_path / "kernels" / "k"
+    lock = kd / "lock"
+    inside = threading.Event()
+    release = threading.Event()
+
+    def waiter():
+        with flock_path(lock):
+            inside.set()
+            release.wait(5)
+
+    with flock_path(lock):
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.3)                  # the waiter has opened the old file and blocks
+        shutil.rmtree(kd)                # the sweep, under the lock
+    assert inside.wait(5)
+    try:
+        with pytest.raises(TimeoutError):
+            with flock_path(lock, timeout=0.3):
+                pass                     # a second holder: the race this closes
+    finally:
+        release.set()
+        t.join(5)
