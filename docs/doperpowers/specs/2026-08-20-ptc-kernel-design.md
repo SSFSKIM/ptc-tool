@@ -658,6 +658,7 @@ recorded as a residual, not shipped.
 | `PTC_YIELD_S` | `300` | default `exec`/`wait` timeout_s |
 | `PTC_MAX_OUTPUT_CHARS` | `12000` | default result cap |
 | `PTC_IDLE_HOURS` | `24` | kernel self-reap (the TTL qualifying all persistence promises) |
+| `PTC_SUB_IDLE_HOURS` | `1` | self-reap cap for subagent-keyed (`--sub-`) kernels — unreachable once their subagent finishes, so the resume-sized TTL does not apply; restart keeps the recorded TTL |
 | `PTC_CODEX_INHERIT` | unset | `1` restores the user's full Codex surface in `provider="codex"` children — PTC otherwise spawns `codex app-server --disable hooks --disable plugins`, which also removes plugin-provided skills. Credential stripping from the codex child's environment is unconditional and this knob does not affect it. |
 | `PTC_POLICY` | `~/.ptc/policy.json` | deny-policy file path (v0.3 initiative 3); absent file = empty policy |
 
@@ -1741,6 +1742,21 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   already renders in the cell's error output). Suite 607 passed / 7 skipped.
   Date/Author: 2026-09-01 / Claude (SDE controller).
 
+- Decision: v0.5.1 — subagent kernels idle out in 1 h; dead key directories are swept
+  (4bbafc0, fix wave 493fd11). Diagnosed from a 16 GB machine in heavy swap: 15 idle
+  `--sub-` kernels held ~5.7 GB footprint, two orphaned at 2.3 / 1.4 GB. The TTL was not
+  broken — every one was inside the 24 h window, which exists for `--resume` continuity a
+  subagent kernel never needs. `sub_idle_hours` (default 1, `PTC_SUB_IDLE_HOURS`) caps
+  sub-keyed kernels in `ensure_kernel`; restart preserves the recorded TTL. `gc_kernel_dirs`
+  runs at adapter startup beside `gc_builds`: removes a key dir only when the owner file is
+  absent or its owner confirmed dead, no file changed for 7 d (1 d for sub keys), the key
+  lock is free, and a main key has no `agents.json`. Review (medium) found four real
+  holes, all fixed: GC unlinking a held lock (waiters now verify the locked inode is the
+  one at the path and retry), unreadable owner treated as absent, restart re-clamping, and
+  `safe_key` truncating the `--sub-` marker off long keys (new `paths.sub_key`). Re-review:
+  correct. Suite: unit 555, integration 66 passed.
+  Date/Author: 2026-09-28 / Claude.
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2386,6 +2402,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-09-28 (sub-kernel TTL + key-dir GC, v0.5.1): subagent-keyed kernels self-reap after 1 h idle (`PTC_SUB_IDLE_HOURS`) instead of the resume-sized 24 h, and adapter startup sweeps key directories whose owner is gone and whose files are past a grace period. Key locks now retry when the locked file was unlinked under them. Decision Log entry carries the review record.
 
 - 2026-09-01 (initiative 3 shipped, v0.5.0): governed side effects live — bounded unified diffs (≤2000 chars, note-inclusive) in the shaped `diff:` block and audit.jsonl for `write`/`edit`, the opt-in deny policy (schema v1, closed `tools` set — a clause this section gained in the ship pass after the final review caught unknown names loading as unfirable protection), per-hop web_fetch denial with both URLs audited, and the upgrade-skew attach gate (`governed` meta marker, two-exit refusal). The README's skew claim was corrected in the fix wave: refusal keys on the kernel's build predating enforcement, not policy write time. Decision Log entry above carries the delivery record and triaged debt. Suite 607 passed. This closes the v0.3 line — all three structural items from the second live-usage report are shipped (v0.3.0, v0.4.0, v0.5.0).
 
