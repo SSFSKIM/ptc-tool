@@ -153,9 +153,9 @@ def test_no_rule_touches_a_cell_in_flight(kernel_state, monkeypatch):
     monkeypatch.setattr(bootstrap, "under_pressure", lambda: True)
     monkeypatch.setattr(STATE, "current_cell", 7)
     rules = _rules(idle_hours=0.001, stop_grace_min=0.001)
-    assert bootstrap._expiry_reason(rules) is None
+    assert bootstrap._sample(rules) is None
     (kernel_state / "cells" / "7.json").write_text("{}")       # the record lands
-    assert bootstrap._expiry_reason(rules) is not None
+    assert bootstrap._sample(rules) is not None
 
 
 def test_the_marker_is_read_from_the_kernel_directory(kernel_state, monkeypatch):
@@ -166,8 +166,68 @@ def test_the_marker_is_read_from_the_kernel_directory(kernel_state, monkeypatch)
     marker = kernel_state / bootstrap.STOP_MARKER
     marker.write_text("{}")
     os.utime(marker, (now - 2000, now - 2000))  # stopped after the last cell, long ago
-    reason = bootstrap._expiry_reason(rules)
-    assert reason is not None and "subagent stopped" in reason
+    reason, _ = bootstrap._sample(rules)
+    assert "subagent stopped" in reason
+
+
+# --- the decision is atomic with cell admission ---------------------------------------
+
+@pytest.fixture
+def expiring(kernel_state, monkeypatch, tmp_path):
+    """A kernel idle long past a heavy window, with the exit replaced by a recorder. The
+    key lock is real: it lives under PTC_HOME, beside the kernel directory."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("PTC_HOME", str(home))
+    (home / "kernels" / "k").mkdir(parents=True)
+    monkeypatch.setattr(STATE, "key", "k")
+    monkeypatch.setattr(STATE, "last_activity", time.time() - 3600)
+    exits = []
+    monkeypatch.setattr(bootstrap, "_reap_and_exit", lambda: exits.append(True))
+    return exits
+
+
+def test_a_cell_admitted_while_the_footprint_is_read_is_not_killed(expiring, kernel_state,
+                                                                    monkeypatch):
+    """The footprint and pressure reads let other threads run, and `_pre_run_cell` admits
+    a cell through the submit lock without ever taking the key lock — so a cell started
+    mid-sample was killed on a verdict about an idle kernel. The admission happens inside
+    the sample here, deterministically."""
+    def footprint_admitting_a_cell():
+        bootstrap._admit(9)
+        return 50 * 2**30
+
+    monkeypatch.setattr(bootstrap, "footprint", footprint_admitting_a_cell)
+    bootstrap._expire_if_idle(_rules(heavy_idle_min=1))
+    assert expiring == [], "the watchdog exited under a cell it had just let start"
+    assert not (kernel_state / "expired.marker").exists()
+
+
+def test_an_idle_heavy_kernel_still_goes(expiring, kernel_state, monkeypatch):
+    monkeypatch.setattr(bootstrap, "footprint", lambda: 50 * 2**30)
+    bootstrap._expire_if_idle(_rules(heavy_idle_min=1))
+    assert expiring == [True]
+    assert "of memory" in (kernel_state / "expired.marker").read_text()
+
+
+def test_no_cell_can_start_between_the_final_check_and_the_exit(expiring, monkeypatch):
+    """Once the watchdog has committed, a cell arriving waits on admission until the exit
+    takes it — it never starts in a kernel that is already going."""
+    import threading
+
+    monkeypatch.setattr(bootstrap, "footprint", lambda: 50 * 2**30)
+    started = []
+
+    def exit_while_a_cell_arrives():
+        t = threading.Thread(target=lambda: (bootstrap._admit(9), started.append(9)))
+        t.start()
+        t.join(0.3)
+        expiring.append(not started)            # the arriving cell was held off
+        exit_while_a_cell_arrives.thread = t
+
+    monkeypatch.setattr(bootstrap, "_reap_and_exit", exit_while_a_cell_arrives)
+    bootstrap._expire_if_idle(_rules(heavy_idle_min=1))
+    exit_while_a_cell_arrives.thread.join(5)    # the stub returns, so admission frees
+    assert expiring == [True], "a cell started after the watchdog committed to exiting"
 
 
 # --- the measurements themselves -------------------------------------------------------

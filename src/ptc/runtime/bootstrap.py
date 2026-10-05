@@ -102,12 +102,21 @@ def _cell_no(ip, info) -> int:
     return int(ip.execution_count)
 
 
+def _admit(n: int) -> None:
+    """Put cell `n` in flight. Under `STATE.admission`, so it lands either wholly before the
+    watchdog's final idle check — which then sees it and keeps the kernel — or after the
+    kernel has committed to exiting, when it blocks here until the exit takes it: a cell
+    that never started, the same as one that arrived just after the expiry."""
+    with STATE.admission:
+        STATE.current_cell = n
+        STATE.last_activity = time.time()
+
+
 def _pre_run_cell(info):
     ip = _ip()
     n = _cell_no(ip, info)
-    STATE.current_cell = n
+    _admit(n)
     STATE.cell_started = time.perf_counter()
-    STATE.last_activity = time.time()
     STATE.cell_images = []
     STATE.cell_mutations = []
     secure_dir(cells())
@@ -276,7 +285,7 @@ def _expiry(now: float, rules: _Rules, *, last_activity: float, stopped_at: floa
 
     Pure, so every rule can be pinned without a kernel; `footprint` and `pressured` are
     callables, asked only once the idle time makes their answer matter. The caller owns the
-    in-flight half (`_expiry_reason`).
+    in-flight half (`_sample`).
 
     The stop grace counts from the STOP, not from the last cell: a subagent that spent its
     last fifty minutes on other tools still gets its grace for a SendMessage continuation.
@@ -312,14 +321,28 @@ def _stopped_at() -> float | None:
         return None
 
 
-def _expiry_reason(rules: _Rules) -> str | None:
-    """`_expiry` behind the in-flight half. `last_activity` is stamped when a cell STARTS,
-    so without it the watchdog kills any cell that runs longer than the TTL, mid-execution
-    (I1) — and every early rule only makes that window shorter."""
+def _sample(rules: _Rules) -> tuple[str, float] | None:
+    """`_expiry` behind the in-flight half: (why, the `last_activity` it judged), or None.
+
+    `last_activity` is stamped when a cell STARTS, so without the in-flight half the
+    watchdog kills any cell that runs longer than the TTL, mid-execution (I1) — and every
+    early rule only makes that window shorter. This is only the SAMPLE: the marker stat,
+    the footprint and the pressure read all let other threads run, so a cell can be
+    admitted while they do, and the verdict is binding only once `_still_idle` confirms
+    it under the admission lock.
+    """
+    seen = STATE.last_activity
     if _in_flight():
         return None
-    return _expiry(time.time(), rules, last_activity=STATE.last_activity,
-                   stopped_at=_stopped_at(), footprint=footprint, pressured=under_pressure)
+    why = _expiry(time.time(), rules, last_activity=seen, stopped_at=_stopped_at(),
+                  footprint=footprint, pressured=under_pressure)
+    return None if why is None else (why, seen)
+
+
+def _still_idle(seen: float) -> bool:
+    """The sample still stands: nothing in flight and no cell started or ended since.
+    Cheap on purpose — it runs under `STATE.admission`, which every cell start waits on."""
+    return not _in_flight() and STATE.last_activity == seen
 
 
 #: Total grace the exit paths give the agent backends to let go of their children. Small on
@@ -430,28 +453,44 @@ def _reap_and_exit() -> None:
     os._exit(0)
 
 
-def _watchdog():
+def _expire_if_idle(rules: _Rules) -> None:
+    """One watchdog tick: returns if the kernel stays, never returns if it goes.
+
+    The key lock is what a SPAWNER takes; cell admission goes through the adapter's submit
+    lock and `_pre_run_cell`, which take neither. So the key lock alone never made "idle"
+    and "exit" atomic against a cell starting: one admitted while the sample ran — or
+    while the lock was being taken — was killed on a verdict about a kernel with nothing
+    in flight. The admission lock closes that: the expensive sample runs outside it, and
+    the cheap re-validation runs inside it and is held through to the exit.
+
+    Holding it through the exit has one cost, bounded and only in exactly that race: a
+    cell blocked in `_admit` holds up the event loop, so `_reap_and_exit`'s backend
+    release waits out its budget before the group kill.
+    """
     from ptc.lock import key_lock
+    sampled = _sample(rules)
+    if sampled is None:
+        return
+    why, seen = sampled
+    with key_lock(STATE.key), STATE.admission:
+        if not _still_idle(seen):
+            return
+        # The marker is the next attach's notice, so it says WHICH rule fired — a namespace
+        # that died for its memory reads differently from one that timed out.
+        (STATE.kernel_dir / "expired.marker").write_text(f"{why} at {time.strftime('%F %T')}")
+        (STATE.kernel_dir / "owner.json").unlink(missing_ok=True)
+        (STATE.kernel_dir / "ready").unlink(missing_ok=True)
+        # Exit WHILE holding the flock: process death releases it atomically, so a
+        # concurrent spawner can never observe a half-dead kernel (F5).
+        _reap_and_exit()
+
+
+def _watchdog():
     rules = _Rules.from_config(STATE.config)
     while True:
         time.sleep(rules.tick())
-        if _expiry_reason(rules) is None:
-            continue
         try:
-            with key_lock(STATE.key):
-                # Asked again under the lock: a cell may have started while it was taken.
-                reason = _expiry_reason(rules)
-                if reason is None:
-                    continue
-                # The marker is the next attach's notice, so it says WHICH rule fired — a
-                # namespace that died for its memory reads differently from one that timed out.
-                (STATE.kernel_dir / "expired.marker").write_text(
-                    f"{reason} at {time.strftime('%F %T')}")
-                (STATE.kernel_dir / "owner.json").unlink(missing_ok=True)
-                (STATE.kernel_dir / "ready").unlink(missing_ok=True)
-                # Exit WHILE holding the flock: process death releases it atomically,
-                # so a concurrent spawner can never observe a half-dead kernel (F5).
-                _reap_and_exit()
+            _expire_if_idle(rules)
         except Exception:
             continue  # cleanup failed: keep ownership and retry next tick — never
                       # exit leaving partial state behind (F5)
