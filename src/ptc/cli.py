@@ -8,6 +8,7 @@ from .client import KernelClient
 from .discovery import read_meta
 from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
+from .memory import human
 from .ownership import UnknownOwner
 from .paths import Config
 from .peek_client import PeekUnavailable, peek_kernel
@@ -111,7 +112,8 @@ def _run(argv=None) -> int:
             print(json.dumps({"kernels": rows}))
             return 0
         for r in rows:
-            print(f"{r['key']}  pid={r['pid']}  alive={r['alive']}  cwd={r['cwd']}")
+            mem = human(r["footprint"]) if r.get("footprint") else "-"
+            print(f"{r['key']}  pid={r['pid']}  alive={r['alive']}  mem={mem}  cwd={r['cwd']}")
         return 0
     if a.cmd == "doctor":
         # Inspection only: doctor REPORTS what setup would do and provisions nothing.

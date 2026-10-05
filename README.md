@@ -88,6 +88,17 @@ kernel so the next attach can report the expiry; the MCP server sweeps them at s
 the kernel is confirmed gone and nothing in the directory has changed for 7 days (1 day for
 a subagent key). A main key whose `agents.json` still lists child sessions is kept.
 
+Two things end an idle kernel before its TTL. When a subagent stops, a `SubagentStop` hook
+marks its kernel and the kernel goes 10 min later (`PTC_STOP_GRACE_MIN`) — long enough for
+a SendMessage continuation, and any cell run after the stop restores the normal TTL. And a
+kernel holding a lot of memory goes early: ≥ 1 GB after 30 min idle (`PTC_HEAVY_MB`,
+`PTC_HEAVY_IDLE_MIN`), or ≥ 512 MB after 5 min idle while macOS reports memory pressure
+(`PTC_PRESSURE_MB`, `PTC_PRESSURE_IDLE_MIN`). Memory is the kernel's physical footprint
+(compressed and swapped pages included; RSS on Linux, which has no pressure rule). A cell
+in flight is never expired, and the next call's notice says which rule fired. Results from
+a kernel holding ≥ 512 MB show it in the header (`mem 5.2G`), and `kernels` lists each live
+kernel's footprint.
+
 `list | doctor` inspect this machine's kernels from any shell; `exec | wait | interrupt |
 kill | restart` act on one kernel. Those five take `--session`; with none given the CLI
 picks the newest live kernel and prints which one it picked. `kill --all` ends every
@@ -135,6 +146,10 @@ host session id, every result header says so (`[keying: adapter-local]`).
 | PTC_MAX_OUTPUT_CHARS | 12000 | result cap (server clamp 50000) |
 | PTC_IDLE_HOURS | 24 | kernel TTL |
 | PTC_SUB_IDLE_HOURS | 1 | TTL for a subagent's auto-keyed kernel (capped by PTC_IDLE_HOURS) |
+| PTC_STOP_GRACE_MIN | 10 | how long a subagent's kernel outlives the subagent's stop |
+| PTC_HEAVY_MB / PTC_HEAVY_IDLE_MIN | 1024 / 30 | idle kernels at or over this footprint expire after this long (`0` MB disables) |
+| PTC_PRESSURE_MB / PTC_PRESSURE_IDLE_MIN | 512 / 5 | the same rule while macOS reports memory pressure (`0` MB disables) |
+| PTC_MEM_NOTE_MB | 512 | footprint at which result headers show the kernel's memory (`0` disables) |
 | PTC_MAX_CONCURRENCY | 8 | SDK-call semaphore |
 | PTC_MAX_DEPTH | 1 | agent recursion brake |
 | PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks, plugins and plugin-provided skills (the default `--disable hooks --disable plugins` removes all three); credential stripping from the codex child's environment is unconditional and this knob does not affect it |

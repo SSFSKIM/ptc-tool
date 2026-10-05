@@ -116,6 +116,15 @@ def _pre_run_cell(info):
     _write_json_atomic(cells() / "current.json", {"cell_id": n, "started_at": time.time()})
 
 
+def _own_footprint() -> int | None:
+    """`memory.footprint()` that cannot end a cell: the record below is the only thing
+    that does (`_safe`), and a measurement is never worth a kernel stuck busy."""
+    try:
+        return footprint()
+    except Exception:                       # noqa: BLE001
+        return None
+
+
 def _post_run_cell(result):
     n = getattr(result, "execution_count", None) or STATE.current_cell
     dur = int((time.perf_counter() - STATE.cell_started) * 1000)
@@ -133,8 +142,11 @@ def _post_run_cell(result):
     rr = None
     if getattr(result, "result", None) is not None:
         rr = _safe(lambda: repr(result.result), "repr")[:_MAX_REPR]
+    # The footprint rides in the record so the renderer can show a kernel that is holding a
+    # lot (`shape._header`) — the agent that loaded it is the one able to `del` it.
     record = {"status": status, "duration_ms": dur, "result_repr": rr, "error": error,
-              "images": list(STATE.cell_images), "mutations": list(STATE.cell_mutations)}
+              "images": list(STATE.cell_images), "mutations": list(STATE.cell_mutations),
+              "footprint": _own_footprint()}
     _write_json_atomic(cells() / f"{n}.json", record)
     STATE.last_activity = time.time()
     for t in _tees:

@@ -227,6 +227,9 @@ class Config:
     heavy_idle_min: float = 30.0
     pressure_mb: float = 512.0
     pressure_idle_min: float = 5.0
+    # Renderer-side, like max_output_chars: the footprint at which a result header starts
+    # showing the kernel's memory.
+    mem_note_mb: float = 512.0
     max_concurrency: int = 8
     max_depth: int = 1
     depth: int = 0
@@ -263,6 +266,7 @@ class Config:
             idle_hours=num("PTC_IDLE_HOURS", float, 24.0),
             sub_idle_hours=num("PTC_SUB_IDLE_HOURS", float, 1.0),
             **{f: num(name, float, getattr(cls, f)) for f, name in EXPIRY_ENV.items()},
+            mem_note_mb=num("PTC_MEM_NOTE_MB", float, 512.0),
             max_concurrency=max_concurrency,
             max_depth=num("PTC_MAX_DEPTH", int, 1),
             depth=num("PTC_DEPTH", int, 0),

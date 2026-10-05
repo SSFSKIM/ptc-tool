@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .cells import CellRecord
 from .client import Busy, Completed, NotFound, Running
+from .memory import human
 from .paths import Config, cells_dir
 
 
@@ -117,10 +118,26 @@ def diff_block(mutations: list, budget: int | None = None) -> str | None:
     return text
 
 
-def _header(cell_id, status: str, dur_ms: int | None, degraded: bool) -> str:
+def _header(cell_id, status: str, dur_ms: int | None, degraded: bool,
+            mem: str | None = None) -> str:
     dur = f" · {dur_ms / 1000:.1f}s" if dur_ms is not None else ""
+    held = f" · mem {mem}" if mem else ""
     deg = " · [keying: adapter-local]" if degraded else ""
-    return f"[cell {cell_id} · {status}{dur}{deg}]"
+    return f"[cell {cell_id} · {status}{dur}{held}{deg}]"
+
+
+def mem_note(footprint: int | None, config: Config) -> str | None:
+    """The kernel's footprint for the header, only once it is worth the agent's attention.
+
+    The agent that loaded a namespace is the only one that knows what in it is still
+    needed, so a heavy kernel says so where every result is read; a light one says nothing,
+    which keeps the header the same shape it has always had for ordinary work. Also the
+    agent's warning that the memory-aware idle expiry is in reach.
+    """
+    if footprint is None or config.mem_note_mb <= 0 \
+            or footprint < config.mem_note_mb * 2**20:
+        return None
+    return human(footprint)
 
 
 #: Busy tri-state (client.py): "running" always carries a real id; "pending-unconfirmed"
@@ -212,7 +229,8 @@ def render(outcome, key: str, config: Config, degraded: bool = False) -> Rendere
     # pointed the reader of a truncated body at a file that no longer exists.
     full_log = outcome.log_path or log_path / f"{outcome.cell_id}.log"
     cap = config.max_output_chars
-    lines = [_header(outcome.cell_id, rec.status, rec.duration_ms, degraded)]
+    lines = [_header(outcome.cell_id, rec.status, rec.duration_ms, degraded,
+                     mem_note(rec.footprint, config))]
     # Everything that trails the body is rendered FIRST and inside the same budget: what
     # the footer, the error summary and the result line take, the body no longer has.
     # Rendered last and unbounded, any of the three walks straight past max_output_chars —
@@ -259,6 +277,8 @@ def to_dict(outcome, key: str) -> dict:
     return {"status": r.status, "cell_id": outcome.cell_id, "duration_ms": r.duration_ms,
             "output": outcome.output, "result_repr": r.result_repr, "error": r.error,
             "images": r.images, "mutations": r.mutations,
+            # bytes the kernel held when the cell ended; None where it could not be read
+            "footprint": r.footprint,
             # the archive, for a cell settled from a previous epoch — the live path names
             # a file that was moved away with the epoch that wrote it
             "full_log": str(outcome.log_path or cells_dir(key) / f"{outcome.cell_id}.log")}

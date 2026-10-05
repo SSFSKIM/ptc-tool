@@ -15,14 +15,24 @@ class CellRecord:
     error: dict | None
     images: list
     mutations: list
+    #: The kernel's memory footprint in bytes when the cell ended (`ptc.memory.footprint`);
+    #: None from a kernel that could not measure it or predates the field.
+    footprint: int | None = None
+
+
+_RECORD_FIELDS = frozenset(CellRecord.__dataclass_fields__)
 
 
 def read_record(key: str, cell_id: int) -> CellRecord | None:
+    """Fields this build does not know are dropped rather than refused: a live record is
+    the only thing that ends a cell for its reader, so one written by a kernel from a later
+    build must still parse, or the cell reads as running forever. A missing REQUIRED field
+    is still a record nobody can render, and is None like a torn file."""
     p = cells_dir(key) / f"{cell_id}.json"
     try:
         d = json.loads(p.read_text())
-        return CellRecord(**d)
-    except (OSError, json.JSONDecodeError, TypeError):
+        return CellRecord(**{k: v for k, v in d.items() if k in _RECORD_FIELDS})
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
         return None
 
 

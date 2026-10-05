@@ -79,8 +79,8 @@ def _until_dead(key: str, patience: float = 30.0) -> bool:
 
 def test_a_heavy_idle_kernel_expires_early_and_the_notice_says_why(ptc_home, monkeypatch):
     """Footprint over PTC_HEAVY_MB and idle past PTC_HEAVY_IDLE_MIN: gone long before its
-    24 h TTL, while a light kernel under the same rules stays, and the next attach is told
-    it died for its memory."""
+    24 h TTL, while a light kernel under the same rules stays. The heavy kernel's results
+    showed what it held, and the next attach is told it died for its memory."""
     from ptc.discovery import read_meta
     from ptc.kernel import kill_kernel
 
@@ -90,9 +90,9 @@ def test_a_heavy_idle_kernel_expires_early_and_the_notice_says_why(ptc_home, mon
     monkeypatch.setenv("PTC_PRESSURE_MB", "0")               # this machine's state is not ours
     r = asyncio.run(exec_tool(code="blob = b'\\x01' * (600 * 2**20)", session="heavy",
                               timeout_s=60))
-    assert "ok" in r[0].text
+    assert "ok" in r[0].text and " · mem " in r[0].text.splitlines()[0], r[0].text
     r = asyncio.run(exec_tool(code="x = 1", session="light", timeout_s=60))
-    assert "ok" in r[0].text
+    assert "ok" in r[0].text and " · mem " not in r[0].text.splitlines()[0], r[0].text
     assert read_meta("heavy")["heavy_mb"] == 400.0
 
     assert _until_dead("heavy"), "the heavy idle kernel was never expired"
