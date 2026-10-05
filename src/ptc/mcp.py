@@ -12,6 +12,7 @@ from .client import KernelClient
 from .discovery import read_meta
 from .discovery import resolve as _resolve
 from .kernel import ensure_kernel, kill_kernel, list_kernels, restart_kernel
+from .memory import human
 from .paths import MAX_OUTPUT_CLAMP, Config
 from .shape import render
 
@@ -295,13 +296,14 @@ async def peek_tool(expr: str, session: str | None = None, ctx: Context = None) 
 
 
 async def kernels_tool() -> list:
-    """List every live kernel: key, pid, alive, depth, last-used, cwd — what exists before
-    choosing a session= value."""
+    """List every live kernel: key, pid, alive, memory, depth, last-used, cwd — what exists
+    before choosing a session= value."""
     rows = await asyncio.to_thread(list_kernels)
     import datetime
     def _ts(v):
         return datetime.datetime.fromtimestamp(v).strftime("%m-%d %H:%M") if v else "-"
-    lines = [f"{r['key']}  pid={r['pid']}  alive={r['alive']}  depth={r['depth']}  "
+    lines = [f"{r['key']}  pid={r['pid']}  alive={r['alive']}  "
+             f"mem={human(r['footprint']) if r.get('footprint') else '-'}  depth={r['depth']}  "
              f"last_used={_ts(r.get('last_used'))}  cwd={r['cwd']}"
              for r in rows] or ["(no kernels)"]
     return [TextContent(type="text", text="\n".join(lines))]

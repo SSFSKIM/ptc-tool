@@ -11,7 +11,9 @@ Run Python in it with the `mcp__plugin_ptc_ptc__exec` tool. If `mcp__plugin_ptc_
 load it first with ToolSearch, e.g. `select:mcp__plugin_ptc_ptc__exec,mcp__plugin_ptc_ptc__wait`.
 Variables, imports, and functions persist across calls, turns, compaction, and `--resume`,
 until the kernel's idle TTL (default 24 h, `PTC_IDLE_HOURS`; a subagent's own auto-keyed
-kernel gets 1 h, `PTC_SUB_IDLE_HOURS`) or a restart. If results ever
+kernel gets 1 h, `PTC_SUB_IDLE_HOURS`, and 10 min once the subagent stops) or a restart.
+A kernel holding ≥ 1 GB idles out after 30 min (sooner under memory pressure); once a
+result header shows `mem`, `del` what you no longer need or keep it on disk. If results ever
 look like another session's namespace, pass `session="${CLAUDE_SESSION_ID}"` explicitly to
 `exec`.
 

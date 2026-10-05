@@ -142,10 +142,12 @@ def test_the_early_expiry_rules_travel_with_the_kernel(monkeypatch, restarted):
     kernel spawned with a short heavy window must not come back from a plain-shell restart
     holding gigabytes for the default half hour."""
     _plain_env(monkeypatch)
+    monkeypatch.setenv("PTC_MEM_NOTE_MB", "64")
     recorded = {"stop_grace_min": 2.0, "heavy_mb": 300.0, "heavy_idle_min": 3.0,
                 "pressure_mb": 0.0, "pressure_idle_min": 1.0}
-    write_meta("rc5", idle_hours=0.5, **recorded)
+    write_meta("rc5", idle_hours=0.5, mem_note_mb=9999.0, **recorded)
 
     cfg = restarted("rc5")
 
     assert {f: getattr(cfg, f) for f in EXPIRY_ENV} == recorded
+    assert cfg.mem_note_mb == 64.0, "the renderer's threshold is the caller's, not the kernel's"

@@ -307,3 +307,38 @@ def test_render_places_diff_between_result_and_footer(tmp_path):
     assert text.index("result:") < text.index("diff:")
     assert text.index("body text") < text.index("diff:")
     assert "edited /p/a.py" in text or "edit" in text      # footer still fingerprints
+
+
+def test_the_header_shows_a_heavy_kernels_memory_and_only_then():
+    """The agent that loaded the namespace is the one who can `del` it, so a kernel over
+    the threshold says what it holds on every result; under it the header is unchanged."""
+    cfg = Config.from_env(env={})
+    heavy = render(Completed(4, _rec(footprint=int(5.2 * 2**30)), "x\n"), "k", cfg)
+    assert heavy.text.startswith("[cell 4 · ok · 1.2s · mem 5.2G]")
+    for light in (100 * 2**20, None):
+        r = render(Completed(4, _rec(footprint=light), "x\n"), "k", cfg)
+        assert r.text.startswith("[cell 4 · ok · 1.2s]"), light
+    lowered = Config.from_env(env={"PTC_MEM_NOTE_MB": "64"})
+    assert "mem 100M" in render(Completed(4, _rec(footprint=100 * 2**20), ""), "k", lowered).text
+    off = Config.from_env(env={"PTC_MEM_NOTE_MB": "0"})
+    assert "mem" not in render(Completed(4, _rec(footprint=50 * 2**30), ""), "k", off).text
+    assert to_dict(Completed(4, _rec(footprint=123), ""), "k")["footprint"] == 123
+
+
+def test_a_record_with_fields_this_build_does_not_know_still_parses(tmp_path, monkeypatch):
+    """A record is the only thing that ends a cell for its reader: one from a later
+    kernel build must parse, and one from before `footprint` existed reads as None."""
+    import json
+
+    from ptc.cells import read_record
+    from ptc.paths import cells_dir, secure_dir
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    d = secure_dir(cells_dir("k"))
+    base = dict(status="ok", duration_ms=1, result_repr=None, error=None, images=[],
+                mutations=[])
+    (d / "1.json").write_text(json.dumps(base))
+    (d / "2.json").write_text(json.dumps({**base, "footprint": 7, "from_the_future": 1}))
+    (d / "3.json").write_text(json.dumps({"status": "ok"}))
+    assert read_record("k", 1).footprint is None
+    assert read_record("k", 2).footprint == 7
+    assert read_record("k", 3) is None, "a record missing required fields parsed"

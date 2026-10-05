@@ -11,6 +11,7 @@ from pathlib import Path
 from . import bgroups
 from .discovery import read_meta, write_meta
 from .lock import key_lock
+from .memory import footprint
 from .ownership import (
     Owner,
     owner_alive,
@@ -316,10 +317,10 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             # the shared agent/llm/web semaphore, and `depth`/`max_depth` are the two
             # halves of the recursion brake — so they are properties of this kernel for the
             # whole of its life and a restart reads every one of them back
-            # (`restart_kernel`). `yield_s` and `max_output_chars` are read per request by
-            # the client and the renderer and are deliberately absent: pinning them here
-            # would make a restart silently change what a later, unrelated caller's own
-            # timeout meant.
+            # (`restart_kernel`). `yield_s`, `max_output_chars` and `mem_note_mb` are read
+            # per request by the client and the renderer and are deliberately absent:
+            # pinning them here would make a restart silently change what a later,
+            # unrelated caller's own timeout meant.
             #
             # `venv` and `protocol` are not configuration at all: they record WHERE this
             # kernel stands and WHAT it speaks, which is what the attach gates above have
@@ -444,9 +445,9 @@ def kill_kernel(key: str) -> bool:
 #: to have to be believed. They are the fields the spawn consumes kernel-side — the
 #: watchdog's `idle_hours` and early-expiry rules, the shared semaphore's
 #: `max_concurrency`, and the recursion brake's `depth`/`max_depth` — and `ensure_kernel`
-#: records exactly this set. Everything else in Config (`yield_s`, `max_output_chars`) is
-#: read per request by the client and the renderer and belongs to whoever is asking;
-#: `session` and `cwd` have their own handling.
+#: records exactly this set. Everything else in Config (`yield_s`, `max_output_chars`,
+#: `mem_note_mb`) is read per request by the client and the renderer and belongs to
+#: whoever is asking; `session` and `cwd` have their own handling.
 _KERNEL_LIFETIME_FIELDS = {
     "idle_hours": (int, float),
     **{f: (int, float) for f in EXPIRY_ENV},
@@ -531,10 +532,14 @@ def list_kernels() -> list[dict]:
                             default=(o.spawned_at if o else None))
         except OSError:
             last_used = o.spawned_at if o else None
+        alive = bool(o and owner_alive(o) and (kd / "ready").exists())
         rows.append({
             "key": kd.name,
             "pid": o.pid if o else None,
-            "alive": bool(o and owner_alive(o) and (kd / "ready").exists()),
+            "alive": alive,
+            # Measured only behind the identity check above: a pid read off a dead
+            # kernel's record may name somebody else's process by now.
+            "footprint": footprint(o.pid) if alive else None,
             "cwd": meta.get("cwd"),
             "depth": meta.get("depth", 0),
             "spawned_at": o.spawned_at if o else None,
