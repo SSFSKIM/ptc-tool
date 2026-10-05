@@ -191,3 +191,12 @@ def test_launcher_default_home_is_the_package_default(monkeypatch, tmp_path):
     monkeypatch.setattr(paths, "_HOME", None)
 
     assert _load_launcher().HOME == Path.home() / ".ptc"
+
+
+def test_hooks_manifest_registers_subagent_stop():
+    """Without it a finished subagent's kernel keeps its namespace for the full sub TTL."""
+    cfg = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
+    hook = cfg["hooks"]["SubagentStop"][0]["hooks"][0]
+    assert hook["type"] == "command"
+    assert "${CLAUDE_PLUGIN_ROOT}/hooks/subagent_stop.py" in hook["command"]
+    assert (PLUGIN / "hooks" / "subagent_stop.py").exists()

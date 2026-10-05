@@ -105,3 +105,49 @@ def test_a_heavy_idle_kernel_expires_early_and_the_notice_says_why(ptc_home, mon
     kill_kernel("heavy")
     kill_kernel("light")
 
+
+def test_a_stopped_subagents_kernel_expires_after_the_grace(ptc_home, monkeypatch):
+    """The SubagentStop hook marks the finished subagent's kernel and its own watchdog
+    expires it after PTC_STOP_GRACE_MIN — well inside the 1 h sub TTL — while a sibling
+    subagent's kernel that did not stop is untouched."""
+    import json
+    import os
+    import subprocess
+    import types
+    from pathlib import Path
+
+    from mcp.server.mcpserver import Context
+
+    import ptc.mcp as mcp_mod
+    from ptc.kernel import kill_kernel
+
+    monkeypatch.setenv("PTC_SESSION", "stopbase")
+    monkeypatch.setenv("PTC_STOP_GRACE_MIN", "0.05")         # 3 s
+    run = ptc_home / "run"
+    run.mkdir(parents=True, exist_ok=True)
+    for tid, agent in (("toolu_s1", "agent_done"), ("toolu_s2", "agent_busy")):
+        (run / f"tooluse-{tid}.json").write_text(json.dumps(
+            {"agent_id": agent, "agent_type": "general-purpose", "written_at": 1}))
+
+    def ctx(tid):
+        return Context(request_context=types.SimpleNamespace(
+            meta={"claudecode/toolUseId": tid}))
+
+    for tid in ("toolu_s1", "toolu_s2"):
+        out = asyncio.run(mcp_mod.server.call_tool("exec", {"code": "x = 1"}, ctx(tid)))
+        assert "ok" in out.content[0].text
+    done, busy = "stopbase--sub-agent_done", "stopbase--sub-agent_busy"
+    time.sleep(4)                       # past the grace: nothing happens without a stop
+    assert kernel_alive(done) and kernel_alive(busy)
+
+    hook = Path(__file__).resolve().parents[2] / "hooks" / "subagent_stop.py"
+    r = subprocess.run(["python3", str(hook)], input=json.dumps({"agent_id": "agent_done"}),
+                       text=True, capture_output=True, timeout=20,
+                       env={**os.environ, "PTC_HOME": str(ptc_home)})
+    assert r.returncode == 0, r.stderr
+
+    assert _until_dead(done), "the stopped subagent's kernel outlived its grace"
+    assert kernel_alive(busy), "a subagent that did not stop lost its kernel"
+    note = (ptc_home / "kernels" / done / "expired.marker").read_text()
+    assert "subagent stopped" in note, note
+    kill_kernel(busy)

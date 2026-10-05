@@ -360,3 +360,98 @@ def test_pre_hook_is_stdlib_only():
                  else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
         for name in names:
             assert name.split(".")[0] in sys.stdlib_module_names, name
+
+
+# --- SubagentStop: the finished subagent's kernel gets a short grace -------------------
+# The kernel's own watchdog acts on the marker; the hook only has to find the right
+# directories, write nothing anywhere else, and never block the stop it fires for.
+
+STOP_HOOK = PLUGIN / "hooks" / "subagent_stop.py"
+
+
+def _run_stop_hook(home, payload, *, text=True):
+    return subprocess.run(["python3", str(STOP_HOOK)], input=payload, capture_output=True,
+                          text=text, env={**os.environ, "PTC_HOME": str(home)}, timeout=20)
+
+
+def _kernel_dirs(home, *names):
+    for n in names:
+        (home / "kernels" / n).mkdir(parents=True)
+    return home / "kernels"
+
+
+def test_stop_hook_marks_only_that_subagents_kernel(tmp_path):
+    """Matched by the `--sub-<agent_id>` suffix — a long base is digest-shortened by
+    `sub_key`, so the suffix is the one part of the key the hook can rely on."""
+    root = _kernel_dirs(tmp_path, "base--sub-agent_7", "x" * 60 + "-h0123--sub-agent_7",
+                        "base--sub-agent_77", "base--sub-agent_8", "base", "agent_7")
+    r = _run_stop_hook(tmp_path, json.dumps({
+        "session_id": "s", "agent_id": "agent_7", "agent_type": "general-purpose"}))
+    assert r.returncode == 0 and r.stdout == "", (r.stdout, r.stderr)
+    marked = sorted(p.parent.name for p in root.glob("*/subagent-stopped"))
+    assert marked == sorted(["base--sub-agent_7", "x" * 60 + "-h0123--sub-agent_7"])
+    f = root / "base--sub-agent_7" / "subagent-stopped"
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert json.loads(f.read_text())["agent_id"] == "agent_7"
+
+
+def test_stop_hook_restamps_a_second_stop(tmp_path):
+    """A subagent continued by SendMessage stops again: the grace restarts from then."""
+    root = _kernel_dirs(tmp_path, "b--sub-agent_7")
+    f = root / "b--sub-agent_7" / "subagent-stopped"
+    f.write_text("{}")
+    os.utime(f, (1000.0, 1000.0))
+    assert _run_stop_hook(tmp_path, json.dumps({"agent_id": "agent_7"})).returncode == 0
+    assert f.stat().st_mtime > time.time() - 60
+
+
+def test_stop_hook_without_a_kernel_is_a_no_op(tmp_path):
+    """Most subagents never touch ptc: no kernels root, or no matching key, writes nothing
+    and creates nothing — a missing directory is a kernel that is gone."""
+    assert _run_stop_hook(tmp_path, json.dumps({"agent_id": "agent_7"})).returncode == 0
+    assert not (tmp_path / "kernels").exists()
+    _kernel_dirs(tmp_path, "main")
+    assert _run_stop_hook(tmp_path, json.dumps({"agent_id": "agent_7"})).returncode == 0
+    assert [p.name for p in (tmp_path / "kernels").iterdir()] == ["main"]
+    assert not list(tmp_path.rglob("subagent-stopped"))
+
+
+def test_stop_hook_refuses_ids_that_are_not_names_and_symlinked_keys(tmp_path):
+    root = _kernel_dirs(tmp_path, "b--sub-ok")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "b--sub-agent_9").symlink_to(elsewhere)
+    for agent in ("../b--sub-ok", "a/b", "agent 7", "a" * 65, "", None, 7):
+        r = _run_stop_hook(tmp_path, json.dumps({"agent_id": agent}))
+        assert r.returncode == 0, (agent, r.stderr)
+    assert _run_stop_hook(tmp_path, json.dumps({"agent_id": "agent_9"})).returncode == 0
+    assert not list(tmp_path.rglob("subagent-stopped")), "marked through a bad id or link"
+
+
+def test_stop_hook_never_blocks_a_stop(tmp_path):
+    """SubagentStop can block the stop it fires for: whatever arrives, rc 0, no output."""
+    for payload in (b"", b"not json", b"{}", b"5", b"[]", b"\xff\xfe not utf-8"):
+        r = _run_stop_hook(tmp_path, payload, text=False)
+        assert r.returncode == 0 and r.stdout == b"", (payload, r.stderr)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("")
+    assert _run_stop_hook(blocked, json.dumps({"agent_id": "a1"})).returncode == 0
+
+
+def test_stop_hook_is_stdlib_only():
+    """It runs on every subagent stop, before ~/.ptc/venv is guaranteed to exist."""
+    tree = ast.parse(STOP_HOOK.read_text())
+    for node in ast.walk(tree):
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+        for name in names:
+            assert name.split(".")[0] in sys.stdlib_module_names, name
+
+
+def test_stop_hook_marker_names_agree_with_the_package():
+    """The hook restates two names it cannot import; the watchdog and `sub_key` own them."""
+    from ptc.paths import SUB_KEY_MARK
+    from ptc.runtime.bootstrap import STOP_MARKER
+    src = STOP_HOOK.read_text()
+    assert f'_SUB_KEY_MARK = "{SUB_KEY_MARK}"' in src
+    assert f'STOP_MARKER = "{STOP_MARKER}"' in src
