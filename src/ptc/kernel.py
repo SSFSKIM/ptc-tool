@@ -277,7 +277,6 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             [str(sv / "bin" / "python"), "-m", "ipykernel_launcher", "-f", str(conn)],
             cwd=work, env=env, stdout=log, stderr=log,
             stdin=subprocess.DEVNULL, start_new_session=True)
-        _reap_when_done(proc)
         try:
             # Ownership is published IMMEDIATELY, before the readiness checks rather than
             # after them. A spawner killed inside that window (the adapter shut down, a
@@ -340,13 +339,21 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             run_bootstrap(key, cfg)
             (kd / "ready").write_text(epoch)   # ready means BOOTSTRAPPED
         except BaseException:
+            # The child is still UNREAPED here, so its pid — and the group it leads — cannot
+            # have been handed to anyone else even if it already exited: the kill reaches
+            # this kernel or nothing. Only then is it reaped (`_reap_when_done`).
             kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=_REAP_WAIT_S)
+            except subprocess.TimeoutExpired:
+                _reap_when_done(proc)          # unkillable for now: reap it whenever it goes
             for name in ("owner.json", "ready", "connection.json"):
                 try:
                     (kd / name).unlink(missing_ok=True)
                 except OSError:
                     pass
             raise
+        _reap_when_done(proc)
         # The notice is spent HERE, past the last thing that can fail the spawn — every
         # path above leaves the marker standing for the retry to find. Deliberately
         # outside the handler: a marker that cannot be unlinked must not take a kernel
@@ -360,16 +367,25 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
         return KernelInfo(key, proc.pid, conn, True, expired)
 
 
+#: How long a failed spawn waits for the kernel it just SIGKILLed to be reaped.
+_REAP_WAIT_S = 5.0
+
+
 def _reap_when_done(proc: subprocess.Popen) -> None:
     """wait() for the kernel from a daemon thread, so its exit leaves no zombie behind.
 
     The spawner is the kernel's parent, and the MCP adapter lives for the whole session: a
     kernel that died under it — expired, killed, crashed — stayed `<defunct>` until the
-    adapter itself exited, because nothing kept the Popen to wait on. Reaping changes no
-    answer anything here depends on: identity is pid + birth stamp (`owner_state`), which
-    already reads a zombie as dead, and a reaped pid reads the same way. The thread only
-    ever blocks in waitpid on this one pid; a CLI spawner exits past it (daemon), and its
-    kernel is reparented and reaped by init as before.
+    adapter itself exited, because nothing kept the Popen to wait on. The thread only ever
+    blocks in waitpid on this one pid; a CLI spawner exits past it (daemon), and its kernel
+    is reparented and reaped by init as before.
+
+    Started only once the spawn has SUCCEEDED, never before: the failure path signals
+    `proc.pid` by number, and an unreaped zombie is what keeps that number this kernel's.
+    Reaped early, a child that died during startup freed its pid for reuse and the abort's
+    group kill could land on whoever took it. Past `ready` nothing signals the pid on the
+    strength of this Popen any more — later kills go through the owner record, whose birth
+    stamp reads a reaped (or reused) pid as dead.
     """
     import threading
     threading.Thread(target=proc.wait, daemon=True, name=f"ptc-reap-{proc.pid}").start()
