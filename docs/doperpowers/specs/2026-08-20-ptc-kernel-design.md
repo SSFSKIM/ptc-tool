@@ -659,6 +659,10 @@ recorded as a residual, not shipped.
 | `PTC_MAX_OUTPUT_CHARS` | `12000` | default result cap |
 | `PTC_IDLE_HOURS` | `24` | kernel self-reap (the TTL qualifying all persistence promises) |
 | `PTC_SUB_IDLE_HOURS` | `1` | self-reap cap for subagent-keyed (`--sub-`) kernels — unreachable once their subagent finishes, so the resume-sized TTL does not apply; restart keeps the recorded TTL |
+| `PTC_STOP_GRACE_MIN` | `10` | after the SubagentStop hook marks a `--sub-` kernel, it self-reaps this long after the stop unless a cell runs after the marker (a SendMessage continuation keeps it) |
+| `PTC_HEAVY_MB` / `PTC_HEAVY_IDLE_MIN` | `1024` / `30` | an idle kernel whose physical footprint is at or over the MB threshold self-reaps after this many idle minutes; `0` MB disables; recorded and kept across restart |
+| `PTC_PRESSURE_MB` / `PTC_PRESSURE_IDLE_MIN` | `512` / `5` | the same rule while macOS reports memory pressure (`kern.memorystatus_vm_pressure_level` ≥ 2); macOS only; `0` MB disables |
+| `PTC_MEM_NOTE_MB` | `512` | footprint at which result headers and the kernel listing show `mem`; renderer-side, so not recorded |
 | `PTC_CODEX_INHERIT` | unset | `1` restores the user's full Codex surface in `provider="codex"` children — PTC otherwise spawns `codex app-server --disable hooks --disable plugins`, which also removes plugin-provided skills. Credential stripping from the codex child's environment is unconditional and this knob does not affect it. |
 | `PTC_POLICY` | `~/.ptc/policy.json` | deny-policy file path (v0.3 initiative 3); absent file = empty policy |
 
@@ -1757,6 +1761,28 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   correct. Suite: unit 555, integration 66 passed.
   Date/Author: 2026-09-28 / Claude.
 
+- Decision: v0.5.2 — idle kernels expire on memory and on their subagent's stop, not only
+  on time (2acc239, 04b2b4d, 72718ad, 74f8823; fix wave eb38c4d, 824a61b). Diagnosed on a
+  32 GB machine at 400 MB free with 11 GB compressed: one `--sub-` kernel held 5.2 GB
+  footprint (≈20 MB RSS — almost all compressed) of parsed transcript records, idle for the
+  whole 1 h sub TTL after its last cell. Time-only expiry cannot tell a finished owner or a
+  heavy namespace from an idle one. A `SubagentStop` hook marks `*--sub-<agent_id>` dirs and
+  the watchdog gives a 10 min grace from the stop (not a kill: SendMessage can resume the
+  subagent; a cell after the marker restores the normal TTL). Idle kernels ≥ 1 GB
+  `phys_footprint` (`proc_pid_rusage` V2; RSS undercounts compressed pages) expire after
+  30 min, ≥ 512 MB after 5 min under macOS memory pressure. The expiry notice names the
+  rule. Cell records carry `footprint`; headers and `kernels` show `mem` ≥ 512 MB. The
+  adapter now reaps kernel children (they lingered as zombies). `read_record` tolerates
+  unknown fields rather than bumping PTC_PROTOCOL (which would restart every kernel on
+  upgrade); an older adapter reading a newer record still fails, reachable only when two
+  builds share a key. Review (high) found two real holes, both fixed: the memory sample ran
+  between the in-flight check and the exit, so a cell admitted mid-sample could be killed
+  (now `STATE.admission` makes the exit decision atomic with `_pre_run_cell`), and the
+  reaper thread started before spawn success, letting startup-failure cleanup signal a
+  reused pid (now reaped only after `ready`; failure path kills then waits). Re-review:
+  correct. Suite: unit + integration 656 passed.
+  Date/Author: 2026-10-04 / Claude.
+
 ## Surprises & Discoveries
 
 - Observation: Prime Agent's model surface is exactly one tool (`ipython`) with **no cell
@@ -2402,6 +2428,8 @@ round, supports stopping.
 - 2026-08-24: async doctrine simplified — a long-budget `wait` auto-backgrounds at the harness's 2-minute threshold (measured) and its result returns as a task notification; SKILL.md leads with that, CLI-in-background-Bash kept as the no-auto-background fallback. Also: MCP server declaration moved inline into plugin.json (root `.mcp.json` doubled as broken project-scope config in checkout sessions); v0.1.1.
 - 2026-08-30: dogfooding wave 1 — Busy render no longer invites adopting another submitter's output; `bash()` accepts an argv list (runs without a shell); SKILL.md gains shared-kernel session isolation, argv-form, and timeout-vocabulary doctrine; Monitor-counterpart `wait(until=)` sketched as issue #1; v0.1.2.
 - 2026-08-30: `wait(until=)` shipped (issue #1 item 1) — event-triggered early return with an honest bounded window; one codex review round (3 findings, all fixed); v0.1.3.
+
+- 2026-10-04 (memory-aware expiry, v0.5.2): a finished subagent's kernel self-reaps 10 min after its stop (`SubagentStop` hook), and idle kernels holding ≥ 1 GB (≥ 512 MB under macOS memory pressure) self-reap early; results and the kernel listing show `mem` for heavy kernels; the adapter reaps exited kernel processes. Decision Log entry carries the review record.
 
 - 2026-09-28 (sub-kernel TTL + key-dir GC, v0.5.1): subagent-keyed kernels self-reap after 1 h idle (`PTC_SUB_IDLE_HOURS`) instead of the resume-sized 24 h, and adapter startup sweeps key directories whose owner is gone and whose files are past a grace period. Key locks now retry when the locked file was unlinked under them. Decision Log entry carries the review record.
 
