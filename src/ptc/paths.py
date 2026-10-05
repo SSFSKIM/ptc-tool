@@ -199,12 +199,34 @@ def sub_key(base: str, agent_id: str) -> str:
     return safe_key(f"{base[:KEY_MAX - len(suffix) - len(digest) - 2]}-h{digest}{suffix}")
 
 
+#: The Config fields behind the watchdog's early-expiry rules, by their environment names.
+#: Kernel-lifetime like `idle_hours`: passed to the kernel at spawn, recorded in meta.json
+#: and read back on restart (`kernel._KERNEL_LIFETIME_FIELDS`).
+EXPIRY_ENV = {
+    "stop_grace_min": "PTC_STOP_GRACE_MIN",
+    "heavy_mb": "PTC_HEAVY_MB",
+    "heavy_idle_min": "PTC_HEAVY_IDLE_MIN",
+    "pressure_mb": "PTC_PRESSURE_MB",
+    "pressure_idle_min": "PTC_PRESSURE_IDLE_MIN",
+}
+
+
 @dataclass
 class Config:
     yield_s: float = 300.0
     max_output_chars: int = 12_000
     idle_hours: float = 24.0
     sub_idle_hours: float = 1.0
+    # The watchdog's early-expiry rules (`runtime.bootstrap._expiry`), on top of the TTL.
+    # A subagent's kernel gets `stop_grace_min` once its subagent has stopped; any kernel
+    # idle `heavy_idle_min` while holding `heavy_mb` goes, and sooner — `pressure_idle_min`
+    # at `pressure_mb` — while the machine is short of memory. A non-positive MB threshold
+    # turns its rule off.
+    stop_grace_min: float = 10.0
+    heavy_mb: float = 1024.0
+    heavy_idle_min: float = 30.0
+    pressure_mb: float = 512.0
+    pressure_idle_min: float = 5.0
     max_concurrency: int = 8
     max_depth: int = 1
     depth: int = 0
@@ -240,6 +262,7 @@ class Config:
             max_output_chars=min(num("PTC_MAX_OUTPUT_CHARS", int, 12_000), MAX_OUTPUT_CLAMP),
             idle_hours=num("PTC_IDLE_HOURS", float, 24.0),
             sub_idle_hours=num("PTC_SUB_IDLE_HOURS", float, 1.0),
+            **{f: num(name, float, getattr(cls, f)) for f, name in EXPIRY_ENV.items()},
             max_concurrency=max_concurrency,
             max_depth=num("PTC_MAX_DEPTH", int, 1),
             depth=num("PTC_DEPTH", int, 0),

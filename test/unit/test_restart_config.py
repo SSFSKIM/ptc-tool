@@ -18,7 +18,7 @@ import pytest
 
 from ptc import kernel
 from ptc.discovery import write_meta
-from ptc.paths import Config, kernel_dir, secure_dir
+from ptc.paths import EXPIRY_ENV, Config, kernel_dir, secure_dir
 
 
 @pytest.fixture
@@ -46,7 +46,8 @@ def restarted(monkeypatch, tmp_path):
 
 def _plain_env(monkeypatch) -> None:
     """The restarting process: a terminal that never heard of this kernel's settings."""
-    for name in ("PTC_IDLE_HOURS", "PTC_MAX_CONCURRENCY", "PTC_DEPTH", "PTC_MAX_DEPTH"):
+    for name in ("PTC_IDLE_HOURS", "PTC_MAX_CONCURRENCY", "PTC_DEPTH", "PTC_MAX_DEPTH",
+                 *EXPIRY_ENV.values()):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PTC_YIELD_S", "42")
     monkeypatch.setenv("PTC_MAX_OUTPUT_CHARS", "99")
@@ -134,3 +135,17 @@ def test_the_sub_clamp_applies_at_spawn_and_not_to_a_recorded_ttl():
     assert kernel._lifetime_config("main", cfg, recorded_ttl=False).idle_hours == 24.0
     shorter = Config(idle_hours=0.2, sub_idle_hours=1.0)
     assert kernel._lifetime_config("b--sub-a", shorter, recorded_ttl=False).idle_hours == 0.2
+
+
+def test_the_early_expiry_rules_travel_with_the_kernel(monkeypatch, restarted):
+    """The stop grace and the memory thresholds are watchdog settings like the TTL: a
+    kernel spawned with a short heavy window must not come back from a plain-shell restart
+    holding gigabytes for the default half hour."""
+    _plain_env(monkeypatch)
+    recorded = {"stop_grace_min": 2.0, "heavy_mb": 300.0, "heavy_idle_min": 3.0,
+                "pressure_mb": 0.0, "pressure_idle_min": 1.0}
+    write_meta("rc5", idle_hours=0.5, **recorded)
+
+    cfg = restarted("rc5")
+
+    assert {f: getattr(cfg, f) for f in EXPIRY_ENV} == recorded

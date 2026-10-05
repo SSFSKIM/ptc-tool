@@ -20,6 +20,7 @@ from .ownership import (
     write_owner,
 )
 from .paths import (
+    EXPIRY_ENV,
     PTC_PROTOCOL,
     Config,
     cells_dir,
@@ -258,6 +259,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                "PTC_DEPTH": str(cfg.depth), "PTC_MAX_DEPTH": str(cfg.max_depth),
                "PTC_IDLE_HOURS": str(cfg.idle_hours),
                "PTC_MAX_CONCURRENCY": str(cfg.max_concurrency),
+               **{name: str(getattr(cfg, f)) for f, name in EXPIRY_ENV.items()},
                "PTC_HOME": str(kernels_root().parent)}
         log = private_open(kd / "kernel.log", "ab")
         epoch = str(int(time.time()))
@@ -308,15 +310,16 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             #
             # The configuration recorded here is exactly the KERNEL-LIFETIME set, and the
             # rule that decides membership is what the kernel LIVES under travels with the
-            # kernel; what the caller RENDERS with stays the caller's. These four are
-            # consumed once, kernel-side, by the code the spawn brings up — `idle_hours`
-            # arms the TTL watchdog, `max_concurrency` sizes the shared agent/llm/web
-            # semaphore, and `depth`/`max_depth` are the two halves of the recursion brake
-            # — so they are properties of this kernel for the whole of its life and a
-            # restart reads every one of them back (`restart_kernel`). `yield_s` and
-            # `max_output_chars` are read per request by the client and the renderer and
-            # are deliberately absent: pinning them here would make a restart silently
-            # change what a later, unrelated caller's own timeout meant.
+            # kernel; what the caller RENDERS with stays the caller's. These are consumed
+            # once, kernel-side, by the code the spawn brings up — `idle_hours` and the
+            # early-expiry rules (`EXPIRY_ENV`) arm the watchdog, `max_concurrency` sizes
+            # the shared agent/llm/web semaphore, and `depth`/`max_depth` are the two
+            # halves of the recursion brake — so they are properties of this kernel for the
+            # whole of its life and a restart reads every one of them back
+            # (`restart_kernel`). `yield_s` and `max_output_chars` are read per request by
+            # the client and the renderer and are deliberately absent: pinning them here
+            # would make a restart silently change what a later, unrelated caller's own
+            # timeout meant.
             #
             # `venv` and `protocol` are not configuration at all: they record WHERE this
             # kernel stands and WHAT it speaks, which is what the attach gates above have
@@ -328,6 +331,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
                            "claude_session_id"),
                        cwd=work, depth=cfg.depth, max_depth=cfg.max_depth,
                        idle_hours=cfg.idle_hours, max_concurrency=cfg.max_concurrency,
+                       **{f: getattr(cfg, f) for f in EXPIRY_ENV},
                        epoch=epoch, build=build,
                        venv=str(sv), protocol=PTC_PROTOCOL)
             from .client import run_bootstrap
@@ -437,13 +441,15 @@ def kill_kernel(key: str) -> bool:
 
 
 #: The Config fields a kernel LIVES under, each paired with the type a recorded value has
-#: to have to be believed. They are the fields the spawn consumes kernel-side — the TTL
-#: watchdog's `idle_hours`, the shared semaphore's `max_concurrency`, and the recursion
-#: brake's `depth`/`max_depth` — and `ensure_kernel` records exactly this set. Everything
-#: else in Config (`yield_s`, `max_output_chars`) is read per request by the client and the
-#: renderer and belongs to whoever is asking; `session` and `cwd` have their own handling.
+#: to have to be believed. They are the fields the spawn consumes kernel-side — the
+#: watchdog's `idle_hours` and early-expiry rules, the shared semaphore's
+#: `max_concurrency`, and the recursion brake's `depth`/`max_depth` — and `ensure_kernel`
+#: records exactly this set. Everything else in Config (`yield_s`, `max_output_chars`) is
+#: read per request by the client and the renderer and belongs to whoever is asking;
+#: `session` and `cwd` have their own handling.
 _KERNEL_LIFETIME_FIELDS = {
     "idle_hours": (int, float),
+    **{f: (int, float) for f in EXPIRY_ENV},
     "max_concurrency": int,
     "max_depth": int,
     "depth": int,

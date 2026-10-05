@@ -68,3 +68,40 @@ def test_a_subagent_keyed_kernel_gets_the_short_ttl(ptc_home, monkeypatch):
     assert (ptc_home / "kernels" / sub_key / "expired.marker").exists()
     assert kernel_alive("ttlbase"), "the parent's kernel took the subagent TTL"
     kill_kernel("ttlbase")
+
+
+def _until_dead(key: str, patience: float = 30.0) -> bool:
+    deadline = time.time() + patience
+    while kernel_alive(key) and time.time() < deadline:
+        time.sleep(0.5)
+    return not kernel_alive(key)
+
+
+def test_a_heavy_idle_kernel_expires_early_and_the_notice_says_why(ptc_home, monkeypatch):
+    """Footprint over PTC_HEAVY_MB and idle past PTC_HEAVY_IDLE_MIN: gone long before its
+    24 h TTL, while a light kernel under the same rules stays, and the next attach is told
+    it died for its memory."""
+    from ptc.discovery import read_meta
+    from ptc.kernel import kill_kernel
+
+    monkeypatch.delenv("PTC_IDLE_HOURS", raising=False)
+    monkeypatch.setenv("PTC_HEAVY_MB", "400")
+    monkeypatch.setenv("PTC_HEAVY_IDLE_MIN", "0.05")         # 3 s
+    monkeypatch.setenv("PTC_PRESSURE_MB", "0")               # this machine's state is not ours
+    r = asyncio.run(exec_tool(code="blob = b'\\x01' * (600 * 2**20)", session="heavy",
+                              timeout_s=60))
+    assert "ok" in r[0].text
+    r = asyncio.run(exec_tool(code="x = 1", session="light", timeout_s=60))
+    assert "ok" in r[0].text
+    assert read_meta("heavy")["heavy_mb"] == 400.0
+
+    assert _until_dead("heavy"), "the heavy idle kernel was never expired"
+    assert kernel_alive("light"), "a light kernel was expired by the memory rule"
+    note = (ptc_home / "kernels" / "heavy" / "expired.marker").read_text()
+    assert "of memory" in note, note
+    r2 = asyncio.run(exec_tool(code="print('blob' in dir())", session="heavy", timeout_s=60))
+    assert "previous kernel expired" in r2[0].text and "of memory" in r2[0].text
+    assert "False" in r2[0].text
+    kill_kernel("heavy")
+    kill_kernel("light")
+
