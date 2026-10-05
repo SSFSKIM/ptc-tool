@@ -53,6 +53,8 @@ def test_config_defaults():
     cfg = Config.from_env(env={})
     assert (cfg.yield_s, cfg.max_output_chars, cfg.idle_hours) == (300.0, 12_000, 24.0)
     assert cfg.sub_idle_hours == 1.0
+    assert (cfg.stop_grace_min, cfg.heavy_mb, cfg.heavy_idle_min) == (10.0, 1024.0, 30.0)
+    assert (cfg.pressure_mb, cfg.pressure_idle_min) == (512.0, 5.0)
     assert (cfg.max_concurrency, cfg.max_depth, cfg.depth) == (8, 1, 0)
     assert cfg.session is None
 
@@ -63,6 +65,9 @@ def test_config_env_and_clamp():
            "PTC_SUB_IDLE_HOURS": "0.25"}
     cfg = Config.from_env(env=env)
     assert cfg.sub_idle_hours == 0.25
+    assert Config.from_env(env={"PTC_HEAVY_MB": "300", "PTC_STOP_GRACE_MIN": "0.5",
+                                "PTC_PRESSURE_IDLE_MIN": "banana"}) == Config(
+        heavy_mb=300.0, stop_grace_min=0.5)
     assert cfg.yield_s == 5.0
     assert cfg.max_output_chars == MAX_OUTPUT_CLAMP  # clamped
     assert cfg.depth == 2 and cfg.session == "abc" and cfg.idle_hours == 0.01

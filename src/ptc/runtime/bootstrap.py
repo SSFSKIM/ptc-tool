@@ -11,9 +11,11 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
-from ptc.paths import private_open, private_write_text, secure_dir
+from ptc.memory import footprint, human, under_pressure
+from ptc.paths import Config, private_open, private_write_text, secure_dir
 
 from .state import STATE, cells
 
@@ -209,11 +211,103 @@ def _in_flight() -> bool:
     return n is not None and not (cells() / f"{n}.json").exists()
 
 
-def _is_idle(ttl: float) -> bool:
-    """Idle is BOTH halves: nothing running AND nothing happening for `ttl` seconds.
-    `last_activity` is stamped when a cell STARTS, so without the in-flight half the
-    watchdog kills any cell that runs longer than the TTL, mid-execution (I1)."""
-    return not _in_flight() and time.time() - STATE.last_activity > ttl
+#: Left in a subagent kernel's directory by `hooks/subagent_stop.py` when the run that owned
+#: the kernel ends; its mtime is the moment of the stop.
+STOP_MARKER = "subagent-stopped"
+
+
+@dataclass(frozen=True)
+class _Rules:
+    """When an idle kernel goes, in seconds and bytes — read once from the bootstrap config.
+
+    The TTL alone is blind to two things the kernel can know: that the subagent it served
+    has finished (`stop_grace_s`), and that it is sitting on a lot of memory (`heavy_*`,
+    and the stricter `pressure_*` while the machine is short). A rule whose byte threshold
+    is None is off. Defaults are Config's, for a payload from before a field existed.
+    """
+    ttl_s: float
+    stop_grace_s: float
+    heavy_bytes: int | None
+    heavy_idle_s: float
+    pressure_bytes: int | None
+    pressure_idle_s: float
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "_Rules":
+        def val(name: str) -> float:
+            return float(cfg.get(name, getattr(Config, name)))
+
+        def mb(name: str) -> int | None:
+            v = val(name)
+            return int(v * 2**20) if v > 0 else None
+
+        return cls(ttl_s=val("idle_hours") * 3600,
+                   stop_grace_s=val("stop_grace_min") * 60,
+                   heavy_bytes=mb("heavy_mb"), heavy_idle_s=val("heavy_idle_min") * 60,
+                   pressure_bytes=mb("pressure_mb"),
+                   pressure_idle_s=val("pressure_idle_min") * 60)
+
+    def tick(self) -> float:
+        """A tenth of the shortest window, within [0.5, 30] s: a 3.6 s test TTL is seen
+        promptly, and a footprint read every 30 s is nothing next to what it guards."""
+        windows = [self.ttl_s, self.stop_grace_s]
+        if self.heavy_bytes is not None:
+            windows.append(self.heavy_idle_s)
+        if self.pressure_bytes is not None:
+            windows.append(self.pressure_idle_s)
+        return min(30.0, max(min(windows) / 10, 0.5))
+
+
+def _expiry(now: float, rules: _Rules, *, last_activity: float, stopped_at: float | None,
+            footprint, pressured) -> str | None:
+    """Why an IDLE kernel should go now — the notice's opening words — or None to keep it.
+
+    Pure, so every rule can be pinned without a kernel; `footprint` and `pressured` are
+    callables, asked only once the idle time makes their answer matter. The caller owns the
+    in-flight half (`_expiry_reason`).
+
+    The stop grace counts from the STOP, not from the last cell: a subagent that spent its
+    last fifty minutes on other tools still gets its grace for a SendMessage continuation.
+    It applies only while the marker is newer than `last_activity` — a cell run after the
+    stop means somebody is using the kernel again, and that alone restores the normal TTL.
+    """
+    idle = now - last_activity
+    if idle > rules.ttl_s:
+        return f"expired after {idle / 3600:.2f} h idle"
+    if stopped_at is not None and stopped_at > last_activity \
+            and now - stopped_at > rules.stop_grace_s:
+        return (f"expired {(now - stopped_at) / 60:.0f} min after its subagent stopped "
+                f"({idle / 3600:.2f} h idle)")
+    heavy = rules.heavy_bytes is not None and idle > rules.heavy_idle_s
+    tight = rules.pressure_bytes is not None and idle > rules.pressure_idle_s
+    if not (heavy or tight):
+        return None
+    held = footprint()
+    if held is None:                    # unmeasurable is not heavy
+        return None
+    if heavy and held >= rules.heavy_bytes:
+        return f"expired after {idle / 60:.0f} min idle holding {human(held)} of memory"
+    if tight and held >= rules.pressure_bytes and pressured():
+        return (f"expired after {idle / 60:.0f} min idle holding {human(held)} of memory "
+                "while the system was under memory pressure")
+    return None
+
+
+def _stopped_at() -> float | None:
+    try:
+        return os.stat(STATE.kernel_dir / STOP_MARKER).st_mtime
+    except OSError:
+        return None
+
+
+def _expiry_reason(rules: _Rules) -> str | None:
+    """`_expiry` behind the in-flight half. `last_activity` is stamped when a cell STARTS,
+    so without it the watchdog kills any cell that runs longer than the TTL, mid-execution
+    (I1) — and every early rule only makes that window shorter."""
+    if _in_flight():
+        return None
+    return _expiry(time.time(), rules, last_activity=STATE.last_activity,
+                   stopped_at=_stopped_at(), footprint=footprint, pressured=under_pressure)
 
 
 #: Total grace the exit paths give the agent backends to let go of their children. Small on
@@ -326,19 +420,21 @@ def _reap_and_exit() -> None:
 
 def _watchdog():
     from ptc.lock import key_lock
-    hours = float(STATE.config.get("idle_hours", 24.0))
-    ttl = hours * 3600
+    rules = _Rules.from_config(STATE.config)
     while True:
-        time.sleep(min(30.0, max(ttl / 10, 0.5)))
-        if not _is_idle(ttl):
+        time.sleep(rules.tick())
+        if _expiry_reason(rules) is None:
             continue
-        idle = time.time() - STATE.last_activity
         try:
             with key_lock(STATE.key):
-                if not _is_idle(ttl):
+                # Asked again under the lock: a cell may have started while it was taken.
+                reason = _expiry_reason(rules)
+                if reason is None:
                     continue
+                # The marker is the next attach's notice, so it says WHICH rule fired — a
+                # namespace that died for its memory reads differently from one that timed out.
                 (STATE.kernel_dir / "expired.marker").write_text(
-                    f"expired after {idle / 3600:.2f} h idle at {time.strftime('%F %T')}")
+                    f"{reason} at {time.strftime('%F %T')}")
                 (STATE.kernel_dir / "owner.json").unlink(missing_ok=True)
                 (STATE.kernel_dir / "ready").unlink(missing_ok=True)
                 # Exit WHILE holding the flock: process death releases it atomically,

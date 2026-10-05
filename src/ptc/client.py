@@ -28,7 +28,7 @@ from .ownership import (
     settled_owner_state,
     start_time_matches,
 )
-from .paths import Config, kernel_dir, private_write_text, secure_dir
+from .paths import EXPIRY_ENV, Config, kernel_dir, private_write_text, secure_dir
 from .venv import venv_python  # noqa: F401  (imported for kernel spawn parity)
 
 
@@ -946,6 +946,7 @@ def run_bootstrap(key: str, config: Config) -> None:
         "max_concurrency": config.max_concurrency,
         "depth": config.depth,
         "max_depth": config.max_depth,
+        **{f: getattr(config, f) for f in EXPIRY_ENV},
     })
     code = f"import ptc.runtime.bootstrap as _ptc_b; _ptc_b.install({payload!r})"
     out = KernelClient(key)._exec_raw(code, timeout_s=60)
