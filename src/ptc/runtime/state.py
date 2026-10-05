@@ -1,4 +1,5 @@
 """Mutable in-kernel state shared by hooks and the runtime API."""
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,10 @@ class _State:
     #: watchdog THREAD reach objects that live on it (`bootstrap._release_backends_now`).
     #: None where install() ran with no loop under it.
     loop: object | None = None
+    #: Held by `bootstrap._admit` while it puts a cell in flight, and by the watchdog from
+    #: its final idle check through to the exit — which makes "still idle" and "go" one
+    #: step that no cell can start in the middle of (`bootstrap._expire_if_idle`).
+    admission: threading.Lock = field(default_factory=threading.Lock)
 
 
 STATE = _State()
