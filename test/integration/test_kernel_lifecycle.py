@@ -398,3 +398,28 @@ def test_bootstrap_records_the_governed_marker(ptc_home):
     kernel.ensure_kernel("marked", cwd=str(ptc_home), config=Config.from_env())
     assert read_meta("marked").get("governed") is True
     kernel.kill_kernel("marked")
+
+
+
+def _exists(pid: int) -> bool:
+    """`kill(pid, 0)` succeeds on a zombie and fails once it is reaped. Deliberately no
+    subprocess here: every new Popen reaps the ABANDONED Popens of this process as a side
+    effect (`subprocess._cleanup`), which would hide the leak in a test that a long-lived
+    adapter — spawning nothing between kernels — never gets."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def test_a_dead_kernel_does_not_linger_as_its_spawners_zombie(ptc_home):
+    """The adapter is the kernel's parent for a whole session; a kernel killed or expired
+    under it stayed `<defunct>` until the adapter exited, because nothing wait()ed it."""
+    info = ensure_kernel("zr1", cwd=str(ptc_home))
+    assert info.spawned and _exists(info.pid)
+    assert kill_kernel("zr1")
+    deadline = time.monotonic() + 10
+    while _exists(info.pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _exists(info.pid), f"kernel {info.pid} was left behind as a zombie"

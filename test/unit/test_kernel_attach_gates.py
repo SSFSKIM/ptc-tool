@@ -64,6 +64,9 @@ def test_spawn_records_the_venv_it_launched_from(monkeypatch, tmp_path):
     class _Proc:
         pid = 424242
 
+        def wait(self):                  # the spawner's reaper thread waits on it
+            return 0
+
     argv: list[list[str]] = []
     monkeypatch.setattr(kernel.subprocess, "Popen",
                         lambda cmd, **kw: (argv.append(cmd), _Proc())[1])
