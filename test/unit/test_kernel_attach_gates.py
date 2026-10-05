@@ -64,7 +64,7 @@ def test_spawn_records_the_venv_it_launched_from(monkeypatch, tmp_path):
     class _Proc:
         pid = 424242
 
-        def wait(self):                  # the spawner's reaper thread waits on it
+        def wait(self, timeout=None):    # the failed spawn reaps what it killed
             return 0
 
     argv: list[list[str]] = []
