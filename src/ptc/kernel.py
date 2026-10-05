@@ -277,6 +277,7 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             [str(sv / "bin" / "python"), "-m", "ipykernel_launcher", "-f", str(conn)],
             cwd=work, env=env, stdout=log, stderr=log,
             stdin=subprocess.DEVNULL, start_new_session=True)
+        _reap_when_done(proc)
         try:
             # Ownership is published IMMEDIATELY, before the readiness checks rather than
             # after them. A spawner killed inside that window (the adapter shut down, a
@@ -357,6 +358,21 @@ def ensure_kernel(key: str, *, cwd: str | None = None,
             except OSError:
                 pass
         return KernelInfo(key, proc.pid, conn, True, expired)
+
+
+def _reap_when_done(proc: subprocess.Popen) -> None:
+    """wait() for the kernel from a daemon thread, so its exit leaves no zombie behind.
+
+    The spawner is the kernel's parent, and the MCP adapter lives for the whole session: a
+    kernel that died under it — expired, killed, crashed — stayed `<defunct>` until the
+    adapter itself exited, because nothing kept the Popen to wait on. Reaping changes no
+    answer anything here depends on: identity is pid + birth stamp (`owner_state`), which
+    already reads a zombie as dead, and a reaped pid reads the same way. The thread only
+    ever blocks in waitpid on this one pid; a CLI spawner exits past it (daemon), and its
+    kernel is reparented and reaped by init as before.
+    """
+    import threading
+    threading.Thread(target=proc.wait, daemon=True, name=f"ptc-reap-{proc.pid}").start()
 
 
 def kill_process_tree(pid: int) -> None:

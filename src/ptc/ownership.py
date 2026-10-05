@@ -163,12 +163,13 @@ _EXITED_STATES = frozenset("ZXx")
 def _has_exited(pid: int) -> bool:
     """Has `pid` already run to completion while its process-table entry lingers?
 
-    The kernel is spawned `start_new_session=True` and its `Popen` is never retained, so
-    nothing ever `wait()`s it: a kernel that dies while its spawning adapter lives stays a
-    ZOMBIE for as long as that adapter does. `kill(pid, 0)` succeeds on a zombie and Linux
-    goes on serving its ORIGINAL start ticks out of `/proc`, so the birth identity still
-    matched and `owner_state` called a corpse alive — `_follow` reported Running forever
-    and `ensure_kernel` attached to it.
+    The kernel's spawner is its parent, and until `kernel._reap_when_done` nothing ever
+    `wait()`ed it: a kernel that died while its spawning adapter lived stayed a ZOMBIE for
+    as long as that adapter did — and a spawner from before that change, or one whose
+    reaper has not been scheduled yet, still leaves one for a while. `kill(pid, 0)`
+    succeeds on a zombie and Linux goes on serving its ORIGINAL start ticks out of
+    `/proc`, so the birth identity still matched and `owner_state` called a corpse alive —
+    `_follow` reported Running forever and `ensure_kernel` attached to it.
 
     Linux reads the state field of the same line the birth stamp comes from. macOS gets
     there by a different road than the obvious one: `proc_bsdinfo.pbi_status` would name
