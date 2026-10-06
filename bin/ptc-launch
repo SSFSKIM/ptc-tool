@@ -131,13 +131,15 @@ def main() -> None:
         # Provisioned in its own session, logging to a file: a first `uv sync` can outlast
         # Claude Code's 30 s connect timeout, and the kill that ends this process must not
         # end the build with it (nor break it with EPIPE on a closed stderr). The build
-        # finishes regardless, and the next connect finds it standing.
+        # finishes regardless, and the next connect finds it standing. A bare Popen.wait,
+        # not subprocess.run: run kills its child on any exception, and the SIGINT that
+        # opens Claude Code's kill sequence arrives here as KeyboardInterrupt.
         log = HOME / "provision.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "ab") as out:
-            rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--provision"],
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                                start_new_session=True).returncode
+            rc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--provision"],
+                                  stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                  start_new_session=True).wait()
         if rc != 0 or not current():
             print(f"ptc-launch: provisioning failed (exit {rc}); see {log}",
                   file=sys.stderr)
