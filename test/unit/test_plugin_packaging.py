@@ -18,6 +18,8 @@ import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
+
 from ptc.venv import stamp_payload
 
 PLUGIN = Path(__file__).resolve().parent.parent.parent        # the package IS the plugin root
@@ -202,11 +204,17 @@ def test_hooks_manifest_registers_subagent_stop():
     assert (PLUGIN / "hooks" / "subagent_stop.py").exists()
 
 
-def test_a_launcher_killed_mid_provision_still_leaves_a_finished_build(tmp_path):
+@pytest.mark.parametrize("kill", ["sigterm", "sigint", "killpg"])
+def test_a_launcher_killed_mid_provision_still_leaves_a_finished_build(tmp_path, kill):
     """Claude Code gives an MCP server 30 s to answer and kills it after; a first `uv sync`
     routinely takes longer. The build must finish anyway, so the NEXT connect finds it
     standing instead of starting over (or, as with the old `mkdir` lock, finding a lock
-    the killed launcher never released). Driven with a fake `uv` whose sync is slow."""
+    the killed launcher never released). Driven with a fake `uv` whose sync is slow.
+
+    Each way the launcher can die: SIGTERM; SIGINT, which Claude Code sends first and
+    which Python turns into an exception the launcher must not answer by killing the
+    build; and a kill of the launcher's whole process group, which only the build's own
+    session keeps it out of."""
     import os
     import shutil
     import signal
@@ -232,9 +240,13 @@ def test_a_launcher_killed_mid_provision_still_leaves_a_finished_build(tmp_path)
 
     launcher = subprocess.Popen([sys.executable, str(src / "bin" / "ptc-launch")],
                                 env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=kill == "killpg")
     time.sleep(0.8)                                  # inside the slow sync
-    launcher.send_signal(signal.SIGTERM)
+    if kill == "killpg":
+        os.killpg(launcher.pid, signal.SIGKILL)
+    else:
+        launcher.send_signal({"sigterm": signal.SIGTERM, "sigint": signal.SIGINT}[kill])
     launcher.wait(timeout=5)
     stamps = list(home.glob("venvs/*/.ptc-version"))
     assert stamps == [], "the kill must land mid-provision for this test to mean anything"
