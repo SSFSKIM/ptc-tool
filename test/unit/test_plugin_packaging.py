@@ -200,3 +200,47 @@ def test_hooks_manifest_registers_subagent_stop():
     assert hook["type"] == "command"
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/subagent_stop.py" in hook["command"]
     assert (PLUGIN / "hooks" / "subagent_stop.py").exists()
+
+
+def test_a_launcher_killed_mid_provision_still_leaves_a_finished_build(tmp_path):
+    """Claude Code gives an MCP server 30 s to answer and kills it after; a first `uv sync`
+    routinely takes longer. The build must finish anyway, so the NEXT connect finds it
+    standing instead of starting over (or, as with the old `mkdir` lock, finding a lock
+    the killed launcher never released). Driven with a fake `uv` whose sync is slow."""
+    import os
+    import shutil
+    import signal
+    import subprocess
+    import time
+
+    src = tmp_path / "plugin"
+    src.mkdir()
+    for name in ("pyproject.toml", "uv.lock"):
+        shutil.copy(PLUGIN / name, src / name)
+    shutil.copytree(PLUGIN / "src", src / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(PLUGIN / "bin", src / "bin")
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    uv = fakebin / "uv"
+    uv.write_text("#!/bin/sh\n"
+                  "if [ \"$1\" = venv ]; then mkdir -p \"$2/bin\" && : > \"$2/bin/python\"; "
+                  "else sleep 2; fi\n")
+    uv.chmod(0o755)
+    home = tmp_path / "home"
+    env = {**os.environ, "PTC_HOME": str(home),
+           "PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}"}
+
+    launcher = subprocess.Popen([sys.executable, str(src / "bin" / "ptc-launch")],
+                                env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)                                  # inside the slow sync
+    launcher.send_signal(signal.SIGTERM)
+    launcher.wait(timeout=5)
+    stamps = list(home.glob("venvs/*/.ptc-version"))
+    assert stamps == [], "the kill must land mid-provision for this test to mean anything"
+
+    deadline = time.monotonic() + 15
+    while not list(home.glob("venvs/*/.ptc-version")) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    (stamp,) = home.glob("venvs/*/.ptc-version")
+    assert json.loads(stamp.read_text())["schema"] == 3

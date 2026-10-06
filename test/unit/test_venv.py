@@ -39,6 +39,18 @@ def _must_not_provision(cmd, **kw):
     raise AssertionError("must not provision")
 
 
+def _hold_lock(tmp_path) -> int:
+    """Another provisioner holding the lock: an flock on its own open file description,
+    which conflicts with ours even inside one process."""
+    import fcntl
+    import os
+    lock = tmp_path / "home" / "provision.flock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
 def _project(monkeypatch, tmp_path):
     """An isolated PTC_HOME plus a source tree to compute a build identity from."""
     monkeypatch.setenv("PTC_HOME", str(tmp_path / "home"))
@@ -167,18 +179,17 @@ def test_ensure_venv_without_source_raises_runtime_error(monkeypatch, tmp_path):
 
 
 def test_waits_for_contended_lock_then_returns_without_provisioning(monkeypatch, tmp_path):
-    """The lock dir already exists (another process is provisioning it). On
-    our first poll it finishes: lock gone, venv python + a current stamp in
-    place. We must pick that up and return without ever calling run."""
+    """Another process holds the lock (it is provisioning). On our first poll it
+    finishes: lock released, venv python + a current stamp in place. We must pick that
+    up and return without ever calling run."""
     _project(monkeypatch, tmp_path)
-    lock = tmp_path / "home" / "provision.lock"
-    lock.mkdir(parents=True)
+    fd = _hold_lock(tmp_path)
 
     sleep_calls: list = []
 
     def fake_sleep(seconds):
         sleep_calls.append(seconds)
-        lock.rmdir()
+        os.close(fd)
         vd = venv.build_venv_dir(venv.build_id())
         p = vd / "bin"
         p.mkdir(parents=True, exist_ok=True)
@@ -197,8 +208,7 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     is a fixed 1200-iteration poll loop (1200 * 0.5s sleep), not a wall-clock
     check. A lock that never clears must exhaust every iteration and raise."""
     _project(monkeypatch, tmp_path)
-    lock = tmp_path / "home" / "provision.lock"
-    lock.mkdir(parents=True)
+    fd = _hold_lock(tmp_path)
 
     sleep_calls: list = []
     monkeypatch.setattr(time, "sleep", lambda seconds: sleep_calls.append(seconds))
@@ -206,18 +216,46 @@ def test_raises_when_lock_contention_exceeds_budget(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="lock"):
         venv.ensure_venv(run=_must_not_provision)
     assert len(sleep_calls) == 1200
+    os.close(fd)
 
 
 def test_waiter_provisions_its_own_build_after_holder_releases(monkeypatch, tmp_path):
     """The lock holder was provisioning a DIFFERENT build; when it releases, the waiter
     must take the lock and provision its own rather than raise (rollout overlap)."""
     _project(monkeypatch, tmp_path)
-    lock = tmp_path / "home" / "provision.lock"
-    lock.mkdir(parents=True)
+    fd = _hold_lock(tmp_path)
     calls: list = []
-    monkeypatch.setattr(time, "sleep", lambda s: lock.rmdir())
+    monkeypatch.setattr(time, "sleep", lambda s: os.close(fd))
     py = venv.ensure_venv(run=_fake_run_factory(calls))
     assert any(c[1] == "venv" for c in calls), "waiter must provision its own build"
+    assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"
+
+
+def test_a_killed_holder_does_not_lock_out_later_provisioners(monkeypatch, tmp_path):
+    """Claude Code SIGKILLs/SIGTERMs an MCP server that has not answered in 30 s — often a
+    launcher mid-`uv sync`. Its lock must die with it: the old `mkdir` lock outlived the
+    holder and every later launcher waited out its budget behind nobody. The legacy
+    directory such a holder left behind is ignored too."""
+    import signal
+    import sys as _sys
+    _project(monkeypatch, tmp_path)
+    (tmp_path / "home" / "provision.lock").mkdir(parents=True)   # a 0.5.x corpse
+    lock = tmp_path / "home" / "provision.flock"
+    holder = subprocess.Popen(
+        [_sys.executable, "-c",
+         "import fcntl, os, sys, time\n"
+         "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+         "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+         "print('held', flush=True)\n"
+         "time.sleep(60)\n", str(lock)],
+        stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    holder.send_signal(signal.SIGKILL)
+    holder.wait()
+    monkeypatch.setattr(time, "sleep", lambda s: pytest.fail("waited on a dead holder"))
+    calls: list = []
+    py = venv.ensure_venv(run=_fake_run_factory(calls))
+    assert any(c[1] == "venv" for c in calls)
     assert py == venv.build_venv_dir(venv.build_id()) / "bin" / "python"
 
 
@@ -335,6 +373,7 @@ def test_gc_respects_grace_symlinks_and_the_lock(monkeypatch, tmp_path):
     assert str(legacy) in removed and not legacy.exists()         # legacy is a candidate
     # lock-held: nothing moves
     again = _aged_build(home, "ffffffffffff")
-    (home / "provision.lock").mkdir()
+    fd = _hold_lock(tmp_path)
     assert venv.gc_builds() == []
     assert again.exists()
+    os.close(fd)

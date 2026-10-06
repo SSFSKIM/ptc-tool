@@ -5,6 +5,7 @@ Stamp payload MUST stay semantically identical to ptc.venv.stamp_payload(): this
 its stdlib-only twin, run before the package is importable, and a payload that disagrees
 gives the two provisioners two different build ids for one source tree.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -83,21 +84,33 @@ def provision() -> None:
     (vd / ".ptc-version").write_text(json.dumps(payload()))
 
 
-def main() -> None:
+def try_lock(path: Path):
+    """Twin of ptc.venv._try_lock: an flock, which the kernel drops when its holder dies
+    however it dies — the `mkdir` lock this replaces outlived every holder Claude Code
+    killed mid-provision and locked out each session after it. Never unlinked."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def provision_locked() -> None:
     # Take-the-lock retry, not wait-then-recheck: the holder is usually provisioning a
     # DIFFERENT build (old and new adapters overlap across a rollout), so a cleared lock
     # says nothing about ours. Same loop shape as ptc.venv.ensure_venv — keep the twins
     # in step.
-    lock = HOME / "provision.lock"
+    lock = HOME / "provision.flock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     polls = 1200                       # 10 min at 0.5 s
     while not current():
-        try:
-            lock.mkdir()
-        except FileExistsError:
+        fd = try_lock(lock)
+        if fd is None:
             if polls <= 0:
-                print("ptc-launch: build absent and provisioning lock held past its "
-                      f"budget; remove {lock} if nothing is provisioning",
+                print("ptc-launch: build absent and provisioning lock held by a live "
+                      f"process past its budget; see which process holds {lock}",
                       file=sys.stderr)
                 sys.exit(1)
             polls -= 1
@@ -107,7 +120,28 @@ def main() -> None:
             if not current():
                 provision()
         finally:
-            lock.rmdir()
+            os.close(fd)
+
+
+def main() -> None:
+    if sys.argv[1:] == ["--provision"]:
+        provision_locked()
+        return
+    if not current():
+        # Provisioned in its own session, logging to a file: a first `uv sync` can outlast
+        # Claude Code's 30 s connect timeout, and the kill that ends this process must not
+        # end the build with it (nor break it with EPIPE on a closed stderr). The build
+        # finishes regardless, and the next connect finds it standing.
+        log = HOME / "provision.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "ab") as out:
+            rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--provision"],
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                start_new_session=True).returncode
+        if rc != 0 or not current():
+            print(f"ptc-launch: provisioning failed (exit {rc}); see {log}",
+                  file=sys.stderr)
+            sys.exit(1)
     os.environ["PTC_LAUNCHER"] = os.path.abspath(__file__)
     py = venv_dir() / "bin" / "python"
     os.execv(str(py), [str(py), "-m", "ptc.mcp"])
