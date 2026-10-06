@@ -5,6 +5,7 @@ checkout or the plugin dir) and bin/ptc-launch (stdlib twin; MUST stay semantica
 identical). Runtimes never recompute a payload: a provisioned venv carries its stamp
 inside, and a process identifies its own build via sys.prefix (`runtime_venv`).
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -141,6 +142,34 @@ def stamp_current() -> bool:
     return (vd / "bin" / "python").exists() and _stamp_matches(vd, payload)
 
 
+def _provision_lock() -> Path:
+    """The file provisioning and GC serialize on — an flock, not a `mkdir` directory.
+
+    The directory lock it replaces had to be removed by its holder, and a holder killed
+    mid-provision never removed it: Claude Code kills an MCP server that has not answered
+    in 30 s, a first `uv sync` routinely takes longer, and every later launcher then waited
+    out its whole budget behind a lock nobody held — past the same 30 s, so no session
+    could connect again until a human deleted it. The kernel drops an flock when its
+    holder dies, however it dies. Named apart from the old `provision.lock` so a corpse
+    of that lock left on disk is simply never consulted.
+    """
+    return ptc_home() / "provision.flock"
+
+
+def _try_lock(path: Path) -> int | None:
+    """The locked fd, or None while another process holds it. Released by closing the fd;
+    the file itself is never deleted (unlinking it would let a waiter that already opened
+    the old inode and a newcomer on a fresh one both hold "the" lock). Matches
+    ptc-launch's twin."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def ensure_venv(run=subprocess.run) -> Path:
     try:
         payload = stamp_payload()
@@ -151,24 +180,23 @@ def ensure_venv(run=subprocess.run) -> Path:
             "or a checkout, never from a --no-editable runtime") from e
     bid = build_id(payload)
     vd = build_venv_dir(bid)
-    lock = ptc_home() / "provision.lock"
+    lock = _provision_lock()
     lock.parent.mkdir(parents=True, exist_ok=True)
     import time
     polls = 1200                       # 10 min at 0.5 s
     while True:
         if (vd / "bin" / "python").exists() and _stamp_matches(vd, payload):
             return vd / "bin" / "python"
-        try:
-            lock.mkdir()  # mkdir-based lock, matches ptc-launch
-        except FileExistsError:
+        fd = _try_lock(lock)
+        if fd is None:
             # Take-the-lock retry, not wait-then-recheck: under per-build directories the
             # holder is usually provisioning a DIFFERENT build (old and new adapters
             # overlap across every rollout), so a cleared lock says nothing about ours —
             # keep trying to TAKE it ourselves until the budget runs out.
             if polls <= 0:
                 raise RuntimeError(
-                    "venv provisioning lock held and build still absent; "
-                    f"remove {lock} if no other ptc process is running")
+                    "venv provisioning lock held by a live process for 10 min and build "
+                    f"still absent; see which process holds {lock}")
             polls -= 1
             time.sleep(0.5)
             continue
@@ -197,7 +225,7 @@ def ensure_venv(run=subprocess.run) -> Path:
                 # provision that dies midway leaves a build nothing mistakes for finished.
                 (vd / ".ptc-version").write_text(json.dumps(payload))
         finally:
-            lock.rmdir()
+            os.close(fd)
         return vd / "bin" / "python"
 
 
@@ -211,7 +239,7 @@ def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
     holds a LIVE provisional owner (owner.json without `ready`), or one whose liveness
     cannot be read at all: that spawn's build is not recorded yet. A provisional owner
     settled dead is a crashed leftover, not a spawn window, and neither defers the sweep
-    nor pins a build. Serialized against provisioning on the same provision.lock; a held
+    nor pins a build. Serialized against provisioning on the same provision lock; a held
     lock means "not now", never "force it".
     """
     import time
@@ -257,11 +285,13 @@ def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
     if legacy.exists() or legacy.is_symlink():
         candidates.append(legacy)
     keep = runtime_venv()
-    lock = ptc_home() / "provision.lock"
+    lock = _provision_lock()
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
-        lock.mkdir()
-    except (FileExistsError, OSError):
+        fd = _try_lock(lock)
+    except OSError:
+        return []
+    if fd is None:
         return []                  # provisioning (or another GC) is running: not now
     removed: list[str] = []
     try:
@@ -281,8 +311,5 @@ def gc_builds(*, grace_s: float = 72 * 3600.0) -> list[str]:
             except OSError:
                 continue
     finally:
-        try:
-            lock.rmdir()
-        except OSError:
-            pass
+        os.close(fd)
     return removed

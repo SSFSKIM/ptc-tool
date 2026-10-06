@@ -730,7 +730,7 @@ when the marketplace prunes old versions.
   Runs at adapter startup — which immediately follows every launcher provision, and
   recurs at least once per session, the same cadence a SessionStart hook would give
   without asking a stdlib-only hook to judge owner liveness. GC serializes with
-  provisioning on the same `provision.lock`, and DEFERS entirely while any kernel key
+  provisioning on the same `provision.flock`, and DEFERS entirely while any kernel key
   holds a provisional owner (owner.json without `ready`): a spawn's bootstrap window has
   recorded no build yet, and deleting "unreferenced" builds inside that gap would recreate
   the exact deleted-venv failure this initiative kills. A ready kernel whose meta records
@@ -1782,6 +1782,22 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   reused pid (now reaped only after `ready`; failure path kills then waits). Re-review:
   correct. Suite: unit + integration 656 passed.
   Date/Author: 2026-10-04 / Claude.
+- Decision: the provisioning lock is an `flock` on `provision.flock`, not a `mkdir`
+  directory, and the launcher provisions in a detached session that logs to
+  `provision.log`.
+  Rationale: the 0.5.2 rollout locked one machine out of every session. The first launch
+  of the new build spent more than 30 s in `uv sync`; Claude Code killed it at its 30 s
+  connect timeout; `finally: lock.rmdir()` never ran, and every later launcher waited its
+  10 min budget behind a lock nobody held, itself killed at 30 s. Nothing retried, and the
+  half-built venv stayed unstamped until a human removed the lock. An flock dies with its
+  holder however it dies (no PID or birth identity to judge, so none of `ownership`'s
+  reuse hazards), and a new file name means a leftover `provision.lock` is never read.
+  Detaching the build means the kill ends only the launcher, so the build still finishes
+  and the next connect finds it standing. Before this change, every later connect started
+  from nothing. The first connect after an install that is slower than 30 s still fails.
+  Answering `initialize` before provisioning would fix that, but it would mean an adapter
+  serving tools from a build that does not exist yet, so it is out of scope here.
+  Date/Author: 2026-10-06 / Claude.
 
 ## Surprises & Discoveries
 
