@@ -1798,6 +1798,26 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   Answering `initialize` before provisioning would fix that, but it would mean an adapter
   serving tools from a build that does not exist yet, so it is out of scope here.
   Date/Author: 2026-10-06 / Claude.
+- Decision: v0.5.4 — fan-out rules in the skill, and a `tools=` agent option that sets the
+  built-in tool set a Claude child is given (claude-only; refused on codex like
+  `allowed_tools`/`max_turns`).
+  Rationale: live use showed two costs the doctrine left to the default. (1) Overhead: a
+  fan-out ran at the `PTC_MAX_CONCURRENCY` ceiling (8 per kernel, summed across every
+  kernel on the host) and left finished `spawn` handles open — the 2026-09-09 report's 80
+  processes, 10.7 GB, 1.2 cores. The skill now makes the bound a per-fan-out decision stated
+  in the cell (`limit=` or batched `spawn`/`gather`; 3–4 for tool-running children on a
+  laptop, 8 only for `llm()`-class one-shots) and tells callers to `close()` handles they
+  will not `send()` to. (2) Context: measured through the SDK with the exact options PTC
+  passes, a child's prompt for a one-word reply is 23 863 tokens — all built-in tool
+  definitions, since `setting_sources=[]` and the empty system prompt already remove the
+  rest (`strict_mcp_config` changed nothing: host MCP servers are not loaded). `tools=[]`
+  gives 147, `tools=["Read","Grep"]` 2 776. `allowed_tools` cannot do this: it pre-approves
+  calls and leaves every definition in the prompt. The skill also carries the `claude -p`
+  flag set for callers who shell out directly (23 786 → 368 tokens; 53 with `--bare`, which
+  then requires API-key auth) and the remeasured `llm()` floor (~150 prompt tokens in this
+  build, down from the ~5 200 recorded in S1; the cost that remains is the process launch).
+  Suite: unit 594 passed.
+  Date/Author: 2026-10-11 / Claude.
 
 ## Surprises & Discoveries
 
@@ -2389,6 +2409,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-10-11 (fan-out rules + `tools=`, v0.5.4): the skill gains a "Fan-out rules" section — decide and state the concurrency per fan-out (the per-kernel cap is a ceiling that sums across kernels; close finished `spawn` handles), and strip each child's context with the new `tools=` option (a default child carries 23 863 prompt tokens of tool definitions; `tools=[]` 147, a two-tool reader 2 776) or, for a direct `claude -p`, the flag set that takes 23 786 → 368 tokens. `llm()` doc remeasured (~150-token prompt; the process launch is the cost). Decision Log entry carries the measurements.
 
 - 2026-08-31 (subagent auto-keying, v0.2.0): item 2 shipped — PreToolUse hook + `_meta` toolUseId correlation keys each harness subagent to its own `--sub-<agent_id>` kernel, default on, fail-open, `session=` now the deliberate-sharing switch. Decision Log entry carries the design, the rejected alternatives, the codex round (3 confirmed findings, headlined by the TypedDict inertness bug the brief itself injected), and the CLI-wait seam left on the tracker. 29 new tests; suite 516 passed.
 
