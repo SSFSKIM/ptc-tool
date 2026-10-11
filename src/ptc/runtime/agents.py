@@ -94,6 +94,10 @@ class AgentOpts:
     model: str | None = None
     system: str | None = None
     allowed_tools: list | None = None
+    #: The built-in tool SET the child is given (claude-only): `[]` for none, or exact
+    #: names. This is what sizes the child's prompt — the full set is ~24k tokens of
+    #: definitions before the task — where `allowed_tools` only pre-approves calls.
+    tools: list | None = None
     permission_mode: str = "bypassPermissions"
     cwd: str | None = None
     max_turns: int | None = None

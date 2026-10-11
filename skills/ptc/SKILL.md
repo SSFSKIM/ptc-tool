@@ -85,10 +85,12 @@ still need native Read.
 
 Options that work on BOTH providers: `model=`, `system=`, `cwd=`, `effort=`,
 `output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock). Claude-only:
-`allowed_tools=`, `max_turns=`, and any `permission_mode=` other than the default —
-passing one with `provider="codex"` raises `TypeError` rather than being silently dropped,
-because `codex app-server` has no per-turn tool allowlist and no turn cap and PTC pins its
-codex threads to `approvalPolicy="never"` + `sandbox="read-only"`. `system=` rides as
+`tools=` (the built-in tool SET the child sees — `[]` for none, or exact names; see
+"Fan-out rules"), `allowed_tools=` (pre-approval only — the child still sees every
+definition), `max_turns=`, and any `permission_mode=` other than the default — passing one
+with `provider="codex"` raises `TypeError` rather than being silently dropped, because
+`codex app-server` has no tool set selection, no per-turn tool allowlist and no turn cap
+and PTC pins its codex threads to `approvalPolicy="never"` + `sandbox="read-only"`. `system=` rides as
 `developerInstructions` on codex. `agent.fork` is claude-only (`NotImplementedError`
 otherwise). Claude children default to `permission_mode="bypassPermissions"` — delegate
 only work you would run yourself. Codex children are spawned `--disable hooks --disable
@@ -105,7 +107,49 @@ one (its CLI stays alive for follow-up `send()`s until you do). `fork` is a one-
 (claude only) and needs a known session id for this conversation; `agent.resume(sid)`
 returns a handle that is already `done` — a `send()` target, not a running turn.
 Concurrency is capped by `PTC_MAX_CONCURRENCY` (default 8) and recursion by `PTC_MAX_DEPTH`
-(default 1 — a child cannot spawn grandchildren).
+(default 1 — a child cannot spawn grandchildren). The cap is a ceiling, not the bound you
+run at — see "Fan-out rules".
+
+## Fan-out rules
+
+Every child is a whole `claude` process with a context window of its own, and a fan-out
+multiplies both. Two decisions come before any cell that starts more than a couple of
+children, and both are written down in that cell.
+
+**Decide the concurrency.** `PTC_MAX_CONCURRENCY` bounds one kernel, and every kernel on
+the machine — yours and each subagent's — has its own, so the host carries the sum. A
+finished child still holds ~133 MB and ~1.5 % of a core until `close()` (measured: 80 such
+children, 10.7 GB and 1.2 cores, nine hours after their work was done); a working one costs
+more. Choose the bound per fan-out from what the host can carry and what the child does,
+and state it: `workflow.parallel(..., limit=N)` over `agent.run`/`llm` awaitables, or
+`spawn` in batches of N and `gather` a batch before starting the next. On a laptop, 3–4 for
+children that run tools; up to 8 only for `llm()`-class one-shots; past 8 only on a host
+measured to carry it, by raising `PTC_MAX_CONCURRENCY` deliberately. `agent.run` and `llm`
+end their process when the turn ends; a `spawn` handle keeps its CLI as a `send()` target,
+so close the ones you will not talk to again — `for h in hs: await h.close()` after the
+`gather`.
+
+**Strip the child's context.** A child's prompt is paid per child and per turn. PTC already
+sends children no host settings, CLAUDE.md or hooks and an empty system prompt; what remains
+is the tool set, and the default set is all of Claude Code's (prompt tokens for a one-word
+reply, measured):
+
+    agent.run(...)                       23 863   every built-in tool definition
+    agent.run(..., tools=["Read", "Grep"])  2 776
+    agent.run(..., tools=[])                147   what llm() sends
+
+Give each child exactly the tools its task needs — `tools=["Read", "Grep"]` for a reader,
+`tools=["Bash"]` for a runner, `llm()` for a turn that needs none — and a `system=` only
+when the task needs standing instructions (the default is already empty). `allowed_tools=`
+is permission, not presence: it does not shrink the prompt.
+
+The same holds when you run `claude -p` yourself through `bash(...)`, where nothing is
+stripped for you: the host's settings, CLAUDE.md, plugins, MCP servers and every tool load
+(23 786 tokens for the same one-word reply). Pass `--setting-sources ""`,
+`--strict-mcp-config`, `--disable-slash-commands`, `--no-session-persistence`, `--tools ""`
+(or the exact names) and a `--system-prompt` of your own — 368 tokens. `--bare` on top also
+skips hooks, LSP and keychain reads (53 tokens) but then authenticates only through
+`ANTHROPIC_API_KEY` or an `apiKeyHelper` passed with `--settings`.
 
 ## Sub-LM map-reduce
 
@@ -115,10 +159,10 @@ Concurrency is capped by `PTC_MAX_CONCURRENCY` (default 8) and recursion by `PTC
 
 `llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=300)` — a one-shot,
 no-tools, single-turn call to a sub-model, useful for map-reduce classification/extraction
-over many chunks. It is NOT a cheap primitive: even isolated, a call still pays a
-~5 200-prompt-token floor for the CLI's own base system prompt, so it costs more than a
-raw API call would — use it for real semantic work, not as a string op. Shares the same
-concurrency cap as `agent`. A turn that FAILS — a rate limit, a max-turns stop, an
+over many chunks. It is NOT a cheap primitive: its prompt is small (~150 tokens before
+your text — no tools, empty system prompt) but every call launches a whole `claude`
+process, seconds and hundreds of MB that a raw API call would not spend — use it for real
+semantic work, not as a string op. Shares the same concurrency cap as `agent`. A turn that FAILS — a rate limit, a max-turns stop, an
 execution error — raises rather than returning the CLI's error notice as the reply; the
 same is true of `agent.*` handles, which settle `error` and re-raise from `result()`.
 
@@ -181,7 +225,8 @@ the first — and a stage exception ends that item's chain, becoming its result.
 Write multi-phase work as ordinary cells: fan out, filter in Python, verify, synthesize.
 
     workflow.phase("fan out")
-    drafts = await workflow.parallel(*[agent.run(t) for t in tasks], limit=4)
+    # limit=4: tool-running children on a laptop (Fan-out rules); tools= trims each prompt
+    drafts = await workflow.parallel(*[agent.run(t, tools=["Read", "Grep"]) for t in tasks], limit=4)
     ok = [d for d in drafts if not isinstance(d, Exception)]
     workflow.phase("synthesize")
     print(await llm("Merge these findings:\n" + "\n---\n".join(d.text for d in ok)))

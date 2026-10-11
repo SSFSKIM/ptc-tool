@@ -225,13 +225,13 @@ def _thread_params(o: AgentOpts, resume: str | None = None) -> dict:
 
 
 #: `AgentOpts` is one option set for both providers, so every field it accepts has to be
-#: either honoured here or refused here. These three have no codex analogue: the app-server
-#: exposes no per-turn tool allowlist and no turn cap, and the thread is pinned to
+#: either honoured here or refused here. These have no codex analogue: the app-server
+#: exposes no tool set selection, no per-turn tool allowlist and no turn cap, and the thread is pinned to
 #: `approvalPolicy: "never"` + `sandbox: "read-only"` regardless of `permission_mode` (a
 #: deliberate S4 binding — see the module docstring on the responder). Refusing is the same
 #: policy T22 applied to a misplaced `effort`: an option that is accepted and then dropped
 #: is a silent no-op no caller can see.
-_CLAUDE_ONLY = ("allowed_tools", "max_turns")
+_CLAUDE_ONLY = ("tools", "allowed_tools", "max_turns")
 _PINNED_PERMISSION_MODE = AgentOpts.__dataclass_fields__["permission_mode"].default
 
 
@@ -242,7 +242,8 @@ def _reject_unsupported(o: AgentOpts) -> None:
     if bad:
         raise TypeError(
             f"provider='codex' does not support these agent options: {', '.join(bad)}. "
-            "`codex app-server` has no per-turn tool allowlist and no turn cap, and PTC "
+            "`codex app-server` has no tool set selection, no per-turn tool allowlist and "
+            "no turn cap, and PTC "
             "pins its codex threads to approvalPolicy='never' + sandbox='read-only'; "
             "use provider='claude' when you need them.")
 

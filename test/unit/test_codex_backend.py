@@ -209,7 +209,7 @@ def test_system_survives_a_resume_too(fake):
     assert sent(fake, "thread/resume")["params"]["developerInstructions"] == "be terse"
 
 
-@pytest.mark.parametrize("kw", [{"allowed_tools": ["Bash"]}, {"max_turns": 3},
+@pytest.mark.parametrize("kw", [{"tools": []}, {"allowed_tools": ["Bash"]}, {"max_turns": 3},
                                 {"permission_mode": "acceptEdits"}])
 def test_options_this_backend_cannot_honour_are_refused_not_dropped(fake, kw):
     """An option accepted and then silently discarded is a no-op no caller can see — the

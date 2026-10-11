@@ -49,6 +49,8 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
         kw["effort"] = o.effort
     if o.allowed_tools is not None:
         kw["allowed_tools"] = o.allowed_tools
+    if o.tools is not None:
+        kw["tools"] = o.tools
     if o.output_schema:
         kw["output_format"] = {"type": "json_schema", "schema": o.output_schema}
     if bare_llm:

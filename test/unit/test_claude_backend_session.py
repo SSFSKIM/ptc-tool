@@ -245,3 +245,21 @@ def test_the_session_id_is_announced_to_its_listener_as_it_arrives(monkeypatch):
     asyncio.run(flow())
     assert heard == [("sess-1", 1)], \
         f"announced once, on the first message that carried it — not at settle: {heard}"
+
+
+# -- the tool set a child is given --------------------------------------------
+def test_tools_option_sizes_the_childs_built_in_tool_set():
+    """`tools=` is the one knob that shrinks a child's prompt: the SDK's default is the whole
+    Claude Code set (~24k tokens of definitions measured), `[]` is none, a list is exactly
+    those. `allowed_tools` only pre-approves calls, so it must not stand in for it."""
+    assert claude_backend._sdk_options(AgentOpts()).tools is None
+    assert claude_backend._sdk_options(AgentOpts(tools=[])).tools == []
+    assert claude_backend._sdk_options(AgentOpts(tools=["Read", "Grep"])).tools == ["Read", "Grep"]
+    assert claude_backend._sdk_options(AgentOpts(allowed_tools=["Read"])).tools is None
+
+
+def test_bare_llm_strips_every_tool_whatever_the_caller_passed():
+    """`llm()` is the no-tools, one-turn shape by contract; a `tools=` on its opts does not
+    reopen the set."""
+    o = claude_backend._sdk_options(AgentOpts(tools=["Bash"]), bare_llm=True)
+    assert o.tools == [] and o.max_turns == 1
