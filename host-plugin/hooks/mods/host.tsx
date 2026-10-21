@@ -206,12 +206,20 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
   state.stopped = true
 }
 
-async function textOf($: EngineInterface, inline: string | null, file: string | null): Promise<string> {
-  if (file !== null) {
-    const read = await $.fs.read(file)
-    return typeof read === 'string' ? read : ''
+/** A job file the mod could not read; its message, which names the file, is the result's
+ *  detail as it stands. */
+class ReadFailed extends Error {}
+
+/** A job's text: inline, or read from the file the kernel moved it to. */
+async function textOf($: EngineInterface, field: 'prompt' | 'system', inline: string | null, file: string | null): Promise<string> {
+  if (file === null) {
+    return inline ?? ''
   }
-  return inline ?? ''
+  try {
+    return await $.fs.read(file)
+  } catch (err) {
+    throw new ReadFailed(`could not read the job's ${field} file ${file}: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 /** `$.model.complete`'s own ceiling on a reply, whatever the model can give. */
@@ -224,8 +232,8 @@ async function runComplete($: EngineInterface, job: CompleteJob, run: Running): 
   if (run.cancelRequested) {
     controller.abort()
   }
-  const prompt = await textOf($, job.prompt, job.promptFile)
-  const system = await textOf($, job.system, job.systemFile)
+  const prompt = await textOf($, 'prompt', job.prompt, job.promptFile)
+  const system = await textOf($, 'system', job.system, job.systemFile)
   const call = (maxTokens: number) =>
     $.model.complete(
       {
@@ -326,7 +334,7 @@ async function runAgent($: EngineInterface, job: AgentJob, run: Running): Promis
     return
   }
   const subagentType = await leanType($, job.type)
-  const prompt = await textOf($, job.prompt, job.promptFile)
+  const prompt = await textOf($, 'prompt', job.prompt, job.promptFile)
   // A cancel that landed while the type registered or the prompt was read stops the job
   // here: no child is created only to be stopped, with calls and tool runs in between.
   if (run.cancelRequested) {
@@ -379,7 +387,7 @@ async function dispatch($: EngineInterface, job: Job): Promise<void> {
     }
   } catch (err) {
     // A mod failure surfaces as a failed call, never as a hang.
-    await post($, job.id, { ok: false, reason: 'error', detail: String(err) })
+    await post($, job.id, { ok: false, reason: 'error', detail: err instanceof ReadFailed ? err.message : String(err) })
   }
 }
 

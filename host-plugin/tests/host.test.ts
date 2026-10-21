@@ -84,7 +84,9 @@ function world($: Engine, on: On, opts: {
   complete?: (e: Json, n: number, next: { signal: AbortSignal }) => unknown
   register?: (e: Json, n: number) => unknown
   spawn?: (e: Json, n: number) => unknown
-  files?: Record<string, string | Promise<string>>
+  /** The disk: a file's text, or `{ deny }` for one the engine cannot read; a path not
+   *  listed is missing. */
+  files?: Record<string, string | Promise<string> | { deny: string }>
   write?: (path: string, text: string) => unknown
 } = {}) {
   mock.env(on, opts.env ?? { PTC_HOST_SOCKET: SOCKET })
@@ -157,9 +159,11 @@ function world($: Engine, on: On, opts: {
   })
   on('fs.read', async (_, e) => {
     reads.push(e.path)
-    const text = opts.files?.[e.path]
-    // As the engine words it on 2.1.306.
-    return text === undefined ? { deny: `$.fs.read(${e.path}) failed: ENOENT` } : { value: await text }
+    const file = opts.files?.[e.path]
+    if (file === undefined) {
+      return { deny: `$.fs.read(${e.path}) failed: ENOENT` } // as the engine words it on 2.1.306
+    }
+    return typeof file === 'object' && 'deny' in file ? file : { value: await file }
   })
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
@@ -543,6 +547,39 @@ describe('agent jobs', () => {
 })
 
 describe('jobs the mod cannot run', () => {
+  test("an agent job whose prompt file cannot be read fails as a read error naming the file, and spawns nothing", async ($, on) => {
+    const w = world($, on)
+    await w.start()
+    await w.send({ jobs: [agentJob('j1', { prompt: null, promptFile: '/k/in/j1.prompt.txt' })] })
+    expect(w.spawns).toEqual([])
+    const r = w.resultOf('j1')
+    expect(r).toMatchObject({ ok: false, reason: 'error' })
+    expect(r.detail).toMatch(/^could not read the job's prompt file \/k\/in\/j1\.prompt\.txt: .*ENOENT/)
+  })
+
+  test("a complete job whose prompt or system file cannot be read fails naming that file, and makes no request", async ($, on) => {
+    const w = world($, on, { files: { '/k/in/j2.system.txt': { deny: 'EACCES' } } })
+    await w.start()
+    await w.send({
+      jobs: [
+        completeJob('j1', { prompt: null, promptFile: '/k/in/j1.prompt.txt' }),
+        completeJob('j2', { systemFile: '/k/in/j2.system.txt' }),
+      ],
+    })
+    expect(w.completes).toEqual([])
+    expect(w.resultOf('j1')).toMatchObject({ ok: false, reason: 'error', detail: expect.stringMatching(/^could not read the job's prompt file \/k\/in\/j1\.prompt\.txt: /) })
+    // Named by the mod, whatever the engine's error says.
+    expect(w.resultOf('j2')).toMatchObject({ ok: false, reason: 'error', detail: expect.stringMatching(/^could not read the job's system file \/k\/in\/j2\.system\.txt: .*EACCES/) })
+  })
+
+  test('an empty file is a text, not a failure: a spilled system that was empty sends none', async ($, on) => {
+    const w = world($, on, { files: { '/k/in/j1.prompt.txt': 'big prompt', '/k/in/j1.system.txt': '' } })
+    await w.start()
+    await w.send({ jobs: [completeJob('j1', { prompt: null, promptFile: '/k/in/j1.prompt.txt', systemFile: '/k/in/j1.system.txt' })] })
+    expect(w.completes).toEqual([{ model: 'haiku', prompt: 'big prompt', maxTokens: 4096 }])
+    expect(w.resultOf('j1')).toMatchObject({ ok: true })
+  })
+
   test('an unknown kind is posted as an error naming it', async ($, on) => {
     const w = world($, on)
     await w.start()
