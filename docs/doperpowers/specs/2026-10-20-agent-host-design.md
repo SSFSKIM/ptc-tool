@@ -31,7 +31,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) Spec review, round 1: adversarial design review and buildability review, both folded in (Decision Log).
 - [x] (2026-10-20) Spec review, round 2 on the round-1 fixes: folded in (Decision Log).
 - [x] (2026-10-20) M1 — spike: host feasibility. Verdict: Promote (Decision Log), 823 of 850 haiku calls.
-- [ ] M2 — prompt profiles on the CLI route.
+- [x] (2026-10-20) M2 — prompt profiles on the CLI route (3777674, fix 3e554d5; review clean).
 - [ ] M3 — the host route.
 - [ ] M4 — doctrine, acceptance, ship.
 - [ ] Whole-branch review (review-code, high).
