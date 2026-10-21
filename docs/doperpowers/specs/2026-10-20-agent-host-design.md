@@ -80,7 +80,7 @@ counts are the first request's prompt (`input + cache_creation + cache_read`).
 | CLI, default system prompt + default tools | 20,312 | — |
 | CLI, `--setting-sources user` (global CLAUDE.md, output style, user plugins) | 7,952 | the to-human output style's mod rewrote the reply itself |
 | in-process subagent, lean type, no tools, `omitClaudeMd` | **744** | none (inside its parent) |
-| in-process subagent, lean type, Read/Grep/Glob | **2,583** | none |
+| in-process subagent, lean type, Read/Grep/Glob | **3,404** (2.1.305, M1; 2,583 on the build first measured: the three tools' schemas grew between builds) | none |
 | in-process `general-purpose` subagent (median of 252 on this machine) | 26,158 | none |
 | in-process `Explore` subagent (median of 5) | 16,236 | none |
 
@@ -317,13 +317,16 @@ For each distinct `type` in an `agent` job, the mod registers one agent type, na
 later jobs reuse it. Every type gets `omitClaudeMd: true` and is kept out of any listing
 with an `agent.offer` hook answering `{ isOffered: false }`. Its `prompt` is the profile's
 system text with the memory text appended (see "Profiles"). Its `tools` are the profile's
-tool list. The measured floor is 744 tokens with no tools and 2,583 with Read/Grep/Glob.
+tool list. The measured floor on 2.1.305 (M1) is 853 tokens with `READER_SYSTEM` and no
+tools, and 3,404 with Read/Grep/Glob outside git (3,604 in a git cwd with the host's
+recipe).
 
 ### Concurrency
 
 Host jobs run under their own kernel-wide semaphore, `PTC_HOST_MAX_CONCURRENCY`. Its
-default is the largest width at which M1's ramp held its promote criteria; until M1
-records one it is 64. CLI children keep `PTC_MAX_CONCURRENCY`. The two are separate
+default is **256**, the widest width M1's ramp measured, at which it held its promote
+criteria: steps of 8, 32, 128 and 256 jobs all succeeded 100 %, and at 256 one host
+peaked at 581 MB with p95 latency 7.45 s (Surprises & Discoveries, Q4). CLI children keep `PTC_MAX_CONCURRENCY`. The two are separate
 because a host slot is one coroutine and one API stream inside an existing process, while
 a CLI slot is a 300–450 MB process. One shared cap would either starve the host or let
 the CLI route exhaust RAM. The host's own `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` is set
@@ -480,8 +483,8 @@ cell or a shell.
    `via="cli"` takes longer at its cap of 8: report both times.
 2. **32 reader agents run on the host.** `agent.run(f"How many lines does {p} have? Reply
    with the number only.", profile="reader")` over 32 files whose line counts the test
-   knows. All 32 are right, and the first request in each run's transcript has a prompt
-   of at most 3,000 tokens.
+   knows, in a git cwd. All 32 are right, and the first request in each run's transcript
+   has a prompt of at most 4,200 tokens.
 3. **CLI-route floors.** `llm("Reply with exactly: OK", via="cli")` costs at most 100
    prompt tokens with credentials in the environment, and at most 400 with
    `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` removed from the child's environment.
@@ -777,7 +780,7 @@ async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=3
 - The host plugin is named `ptc-host`. Its module path is `hooks/mods/host.tsx`.
 - Environment it reads: `PTC_HOST_SOCKET`.
 - Configuration: `PTC_HOST` (`auto` | `off`, default `auto`), `PTC_HOST_MAX_CONCURRENCY`
-  (default from M1, initially 64), `PTC_HOST_START_S` (30).
+  (default 256, from M1), `PTC_HOST_START_S` (30).
 
 ## Surprises & Discoveries
 
@@ -912,6 +915,19 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: Acceptance 2's floor becomes "a reader agent's first request on the host
+  route, in a git cwd, is at most 4,200 prompt tokens": M1's 3,604 floor for the shipped
+  host recipe plus about 15 %. The floor's parts (M1, Q2): the engine's floor for any lean
+  type, 812 (identity line, the subagent notes the engine appends to every type, the
+  `# Environment` block, the job prompt); `READER_SYSTEM`, 41; the Read/Grep/Glob
+  definitions, 2,551; in a git cwd, the gitStatus block, stripped by
+  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` in the host's environment, with about 200
+  tokens of git lines left in the environment block. The stale 2,583 row of the floors
+  table is corrected to 3,404; the rest of that table waits for M4's re-measure.
+  Rationale: the alternative that lost was keeping 3,000, which would need the reader
+  tools' schemas cut, and those are the engine's, not ptc's. The intent, lean agents
+  about an order of magnitude under `general-purpose` (26 k), holds at 4,200.
+  Date/Author: 2026-10-20, doperpowers-15 (the spec's author), recorded by the plan-executor.
 - Decision: **M1 verdict: Promote.** Q1, Q2 and Q3 work. Every ramp step met the criteria
   (≥ 99 % success, host RSS ≤ 2 GB); the widest was 256, at 100 % and 581 MB. M3
   proceeds with these inputs:
