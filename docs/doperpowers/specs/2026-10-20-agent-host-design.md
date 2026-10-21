@@ -970,6 +970,9 @@ are in `ledger.jsonl` beside the driver.
      wrong answer: `f26.txt`, 29 lines, answered `28`. Its Read result ends `29\tline 28`:
      the fixture labels its lines from `line 0`, so the last line's text carries a number
      one below the count, and haiku answered from the text, not the line number.
+     **Rerun, pass, 32/32** (approved by the author, one run) on the fixture labelled from
+     1 (d0214ec): every reply the bare number, every first request 3,459 tokens, all 64
+     requests on `claude-haiku-5-5`.
   3. **Pass**, under pytest's `tmp_path` (outside git) with `PTC_LAUNCHER` set, per the
      author's ruling: `llm()` with `--bare` 61 (≤ 100), without 421 (≤ 450), the CLI reader
      3,095 (≤ 3,400), no ptc server on it. The first run, in the fixture's earlier short
@@ -985,7 +988,7 @@ are in `ledger.jsonl` beside the driver.
   7. Unit 721 passed (1 warning: the fork `DeprecationWarning` logged as tech debt);
      integration 69 passed; live `test_profiles_live.py` 4 passed (both runs), `test_llm_live.py` +
      `test_agents_live.py` 2 passed, `-k host` 7 passed and 1 failed (acceptance 2 above),
-     12 deselected, none skipped.
+     12 deselected, none skipped; acceptance 2's rerun 1 passed.
   Evidence: `test/live/test_host_live.py`, `test_profiles_live.py`; M4's task report.
 - Observation (M4, floors): a host `llm()` costs **34** prompt tokens for "Reply with
   exactly: OK" (`input_tokens` 34, nothing cached), against 61 for the CLI's `--bare`
@@ -993,10 +996,28 @@ are in `ledger.jsonl` beside the driver.
   system and the prompt, and nothing else. The host reader outside git is 3,367 (M3's
   smoke: 3,369). `agent.run()`'s default `full` child with the ptc server attached, as a
   kernel runs it, is **14,708** (14,721 under `tmp_path`) — not the 23,863 v0.5.4 recorded on CLI 2.1.237 without
-  the server. M4 did not take that row apart; the tool set's own size on 2.1.305 is
-  the likely cause. Measured by `test_host_live.py::test_the_host_floors` and
+  the server. The cause is deferral: the request's `api-request-shape` row offers 12
+  tools — Agent, Bash, Edit, ListAgents, Read, ReportFindings, ScheduleWakeup, Skill,
+  ToolSearch, Workflow, Write and a `DeferredToolPlaceholder` — and the transcript's
+  `deferred_tools_delta` names 22 more behind ToolSearch, sent as names only: CronCreate,
+  CronDelete, CronList, DesignSync, EnterWorktree, ExitWorktree, ListMcpResourcesTool,
+  Monitor, NotebookEdit, PushNotification, ReadMcpResourceDirTool, ReadMcpResourceTool,
+  SendMessage, TaskStop, WebFetch, WebSearch and the six `mcp__ptc__*` tools. v0.5.4's
+  23,863 was every built-in definition sent whole. Measured by `test_host_live.py::test_the_host_floors` and
   `test_profiles_live.py::test_full_floor`.
-- Observation (M4): the acceptance run spent **247 haiku calls** of its 300: acceptance 1
+- Observation (M4): every CLI child makes a second haiku request that no count above
+  includes: the engine's session title (`querySource: "generate_session_title"` in the
+  bundled CLI; an `ai-title` row in the child's transcript). The `--bare` `llm()` child's
+  first request is 61 input tokens while its `cost-state` row bills
+  `claude-haiku-5-5[1m]` 1,235 input tokens and 20 output; in acceptance 1's CLI half, 56
+  of 64 transcripts carry a title, and the titled ones bill up to 1,239 input tokens
+  against a 63-token request. So a CLI `llm()` costs about 1,200 input tokens and two
+  requests, not 61 and one, and the host route makes no title call (its jobs are not
+  sessions). The engine's switch for it was not looked for. Every CLI-route call count in
+  this spec, M4's included, is low by about one call per CLI child.
+- Observation (M4): the acceptance run spent **247 haiku calls** of its 300, by the
+  count below (the run then took 64 more for acceptance 2's rerun: 311, or about 384
+  with the title calls above — 73 titled CLI sessions): acceptance 1
   128, acceptance 2 64 (counted from transcripts), acceptance 3 and the `full` floor 8 (two
   runs), the
   host floors 2, acceptance 4 at most 34, acceptance 5 1, acceptance 6 2, `test_llm_live`

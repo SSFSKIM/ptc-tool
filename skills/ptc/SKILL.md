@@ -165,7 +165,7 @@ Tool definitions are the cost (prompt tokens for a one-word reply, measured on C
     llm(..., via="cli")                               61   398 with no credential in the environment
     agent.run(..., profile="reader")               3 459   host, in a git repo (3 367 outside one)
     agent.run(..., profile="reader", via="cli")    3 079
-    agent.run(...)                                14 708   full: every built-in tool + the ptc server
+    agent.run(...)                                14 708   full; 22 of its tools, ptc's among them, deferred
     a general-purpose subagent (native Agent)     26 158
 
 Give each child exactly the tools its task needs — `profile="reader"` for a reader,
