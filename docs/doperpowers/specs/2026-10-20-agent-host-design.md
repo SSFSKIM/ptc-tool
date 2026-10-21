@@ -927,6 +927,18 @@ are in `ledger.jsonl` beside the driver.
   transcript (one per assistant message id) and complete calls one per job. Every agent
   request recorded `claude-haiku-5-5`.
 
+- Observation (M2): acceptance 3 measured live in a short non-git cwd with `PTC_LAUNCHER`
+  set: `llm()` with `--bare` 61 prompt tokens, without `--bare` 400, the CLI `reader`
+  3,068. In a git worktree with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` set: `llm()`
+  without `--bare` 634, the CLI reader 3,302. For these CLI children the variable saves
+  nothing (634 before it too); the ~240 extra tokens in a worktree are the worktree lines
+  of the environment block, which it leaves in place, as M1 saw on the host. The 400
+  limit is met with no margin: under pytest's `tmp_path` the same call is 417.
+  Evidence: `test/live/test_profiles_live.py`; M2's task report.
+- Observation (M2): `--tools` ignores MCP names without an error: `--tools
+  Read,mcp__ptc__exec` still listed all six ptc tools. The backend therefore drops ptc
+  names from `--tools`, and naming any one ptc tool attaches the whole server.
+
 ## Decision Log
 
 - Decision: The spec's author's rulings on M2's concerns. (1) The ptc MCP server attaches
