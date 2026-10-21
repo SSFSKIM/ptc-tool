@@ -73,14 +73,16 @@ counts are the first request's prompt (`input + cache_creation + cache_read`).
 
 | child | prompt tokens | process |
 |---|---|---|
-| CLI, `--bare`, own system prompt, no tools | **52** | 289 MB max RSS, 1.79 s |
-| CLI, settings off (`setting_sources=[]`), own system prompt, no tools — today's `llm()` | 379 | 366 MB, 1.70 s |
-| CLI, same, `--tools Read,Grep,Glob` | 3,023 | — |
+| CLI, `--bare`, own system prompt, no tools | **52** (M4: 61, `llm()` through the `bare` profile) | 289 MB max RSS, 1.79 s |
+| CLI, settings off (`setting_sources=[]`), own system prompt, no tools — today's `llm()` | 379 (M4: 398, `llm()` with `--bare` withheld) | 366 MB, 1.70 s |
+| CLI, same, `--tools Read,Grep,Glob` | 3,023 (M4: 3,079, the CLI `reader` profile) | — |
 | CLI, Claude Code's default system prompt, no tools | 3,085 | — |
 | CLI, default system prompt + default tools | 20,312 | — |
 | CLI, `--setting-sources user` (global CLAUDE.md, output style, user plugins) | 7,952 | the to-human output style's mod rewrote the reply itself |
 | in-process subagent, lean type, no tools, `omitClaudeMd` | **744** | none (inside its parent) |
-| in-process subagent, lean type, Read/Grep/Glob | **3,404** (2.1.305, M1; 2,583 on the build first measured: the three tools' schemas grew between builds) | none |
+| in-process subagent, lean type, Read/Grep/Glob | **3,404** (2.1.305, M1; 2,583 on the build first measured: the three tools' schemas grew between builds). M4, the shipped `reader` on the host: 3,367 outside git, 3,459 in a git repository | none |
+| host `llm()`: one `$.model.complete`, the `bare` profile's system (M4) | **34** | none (inside the host) |
+| CLI `agent.run()` default (`full`: empty system, every built-in tool, the ptc MCP server, as in a kernel; M4) | 14,708 | — |
 | in-process `general-purpose` subagent (median of 252 on this machine) | 26,158 | none |
 | in-process `Explore` subagent (median of 5) | 16,236 | none |
 
@@ -957,6 +959,48 @@ are in `ledger.jsonl` beside the driver.
 - Observation (M3): on a host crash the SDK's logger writes `Fatal error in message
   reader: Command failed with exit code -9` to the cell's stderr before the calls fail.
   `jsonschema` was already in `uv.lock`, through `mcp`.
+
+- Observation (M4): acceptance run as written, 2026-10-20, from this checkout at c7dc7a0
+  plus M4's doctrine (the live tests start real kernels from it), CLI 2.1.305, haiku.
+  1. **Pass.** Host route 64/64 in 2.8 s, one host pid (1874) and no other bundled CLI under
+     the kernel; `via="cli"` 64/64 in 18.1 s at cap 8.
+  2. **Fail, 31/32.** Every reply was the bare number — the revised `READER_SYSTEM` added no
+     citation to any of the 32, so the exact-reply check holds — and every first request
+     was 3,459 prompt tokens (≤ 4,200), all 64 requests on `claude-haiku-5-5`. The one
+     wrong answer: `f26.txt`, 29 lines, answered `28`. Its Read result ends `29\tline 28`:
+     the fixture labels its lines from `line 0`, so the last line's text carries a number
+     one below the count, and haiku answered from the text, not the line number.
+  3. **Pass**, under pytest's `tmp_path` (outside git) with `PTC_LAUNCHER` set, per the
+     author's ruling: `llm()` with `--bare` 61 (≤ 100), without 421 (≤ 450), the CLI reader
+     3,095 (≤ 3,400), no ptc server on it. The first run, in the fixture's earlier short
+     `/tmp/ptc-…` cwd, gave 61, 398 and 3,079; M4 moved the fixture to `tmp_path`.
+  4. **Pass.** 32 in flight at the kill; all 32 raised `AgentFailed: agent host retired:
+     killed by signal 9 (SIGKILL)`, no slot left held, and the next `llm()` answered `OK`
+     on a new pid (36897 → 38409). The SDK logger's `Fatal error in message reader` line
+     reached the cell's stderr first, as M3 saw.
+  5. **Pass.** Host 40420 gone within 10 s of `restart_kernel`.
+  6. **Pass.** `PTC_HOST=off` answered `OK` on the CLI with no host warning; the empty
+     host-plugin directory answered `OK` on the CLI with exactly one warning (`ptc: the
+     agent host did not start (no host plugin at …)`). Both audit records read `via: cli`.
+  7. Unit 721 passed (1 warning: the fork `DeprecationWarning` logged as tech debt);
+     integration 69 passed; live `test_profiles_live.py` 4 passed (both runs), `test_llm_live.py` +
+     `test_agents_live.py` 2 passed, `-k host` 7 passed and 1 failed (acceptance 2 above),
+     12 deselected, none skipped.
+  Evidence: `test/live/test_host_live.py`, `test_profiles_live.py`; M4's task report.
+- Observation (M4, floors): a host `llm()` costs **34** prompt tokens for "Reply with
+  exactly: OK" (`input_tokens` 34, nothing cached), against 61 for the CLI's `--bare`
+  child and 398 without it: `$.model.complete` sends the identity line, the profile's
+  system and the prompt, and nothing else. The host reader outside git is 3,367 (M3's
+  smoke: 3,369). `agent.run()`'s default `full` child with the ptc server attached, as a
+  kernel runs it, is **14,708** (14,721 under `tmp_path`) — not the 23,863 v0.5.4 recorded on CLI 2.1.237 without
+  the server. M4 did not take that row apart; the tool set's own size on 2.1.305 is
+  the likely cause. Measured by `test_host_live.py::test_the_host_floors` and
+  `test_profiles_live.py::test_full_floor`.
+- Observation (M4): the acceptance run spent **247 haiku calls** of its 300: acceptance 1
+  128, acceptance 2 64 (counted from transcripts), acceptance 3 and the `full` floor 8 (two
+  runs), the
+  host floors 2, acceptance 4 at most 34, acceptance 5 1, acceptance 6 2, `test_llm_live`
+  5 and `test_agents_live` 3; the channel tests make none.
 
 ## Decision Log
 
