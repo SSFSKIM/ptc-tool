@@ -36,6 +36,8 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) M4 — doctrine, acceptance, ship (v0.6.0).
 - [x] (2026-10-20) Whole-branch review (review-code, high): three P2 defects found, fixed in 33df0fc, re-review correct.
 - [x] (2026-10-20) Outcomes & Retrospective.
+- [x] (2026-10-21) v0.6.0's residuals (issue #1), for 0.6.1: tool groups, the mod's kit tests,
+  the read error, the reader line, the residency figure (Decision Log, last entry).
 
 ## Terms of art
 
@@ -1381,6 +1383,46 @@ are in `ledger.jsonl` beside the driver.
   remainder it does not expose. The spike had outcomes with no verdict. The live suites
   skip silently without `PTC_LIVE`.
   Date/Author: 2026-10-20, doperpowers-15.
+- Decision: v0.6.0's residuals, fixed for 0.6.1.
+  - A `claude` child's Bash tools die with it, however it dies (`src/ptc/toolgroups.py`).
+    The engine runs each Bash tool detached, its shell a direct child of the `claude` in a
+    group of its own, so a SIGKILLed host or CLI-route child left them under init (a live
+    probe on 2.1.305: a background tool and a `nohup` survivor both outlived the SIGKILL).
+    Once the `claude` is dead its tools cannot be found by parentage, so the kernel learns
+    them while it lives: a watcher thread lists the kernel's `claude` children every 0.25 s
+    and records each group one of their direct children leads, in `bgroups`' row format,
+    in `<kernel_dir>/agent-pgids.json`; a gone `claude`'s rows are reaped under
+    `bgroups.signalable`. Where ptc does the killing it stops the `claude` (SIGSTOP) and
+    reads its groups exactly: the host's escalation, the TTL exit, `kill_process_tree`.
+    `bgroups.reap` consumes the registry on every kernel exit, kill and restart. The CLI
+    route is covered by the same rule at no extra cost; codex is not (its tools are not a
+    `claude`'s children), and stays as `kill_process_tree` states.
+  - Rejected: marking the children with an environment variable and killing every process
+    that carries it after the death. It finds everything, but also kills per-user daemons
+    a tool happens to start (the `claude` daemon, tmux, gpg-agent), which inherit it. Only
+    groups a `claude`'s direct children lead are taken, and never one a `claude` leads.
+  - Residual, accepted: an outside kill (OOM, `kill -9`) misses a tool whose shell had
+    lived under one tick, and a process that left its tool's group (`setsid`).
+  - The mod is tested under the engine's own kit (`claude plugin test host-plugin`, from
+    `test/unit/test_host_mod.py`), pinning 33df0fc's preflight cancel and the failed
+    agent's text. Its deadlines read `$.clock.now()`, the clock its waits sleep on. A poll
+    answered after the mod gave up on an undelivered result is now dropped whole.
+  - An unreadable job file fails as `could not read the job's prompt file <path>: …`. On
+    2.1.305 and 2.1.306 `$.fs.read` rejects (ENOENT, EACCES, EISDIR), so the job already
+    failed with the engine's raw text, naming the path; the "non-empty prompt" refusal is
+    an empty file's, a successful read.
+  - The SDK reader's `Fatal error in message reader` line is dropped once `_SdkHost.close`
+    has begun (a contextvar marks the host reader's task). In live runs a closed host never
+    printed it, since the disconnect cancels the reader first; acceptance 4's line was an
+    outside SIGKILL, which still says so, once.
+  - Residency, re-measured for the skill on Claude Code 2.1.305 (the SDK's bundled CLI,
+    2026-10-21): four `agent.spawn` children, each `full` with the ptc server as a kernel
+    runs it, held 242 MB and 0.82 % of a core each one minute after their turn, 203 MB
+    and 0.47 % ten minutes after (60 s windows), plus an 11.6 MB `ptc.mcp` child each. The
+    skill's ~133 MB / ~1.5 % was read nine hours after the turns, on an unrecorded build.
+  Rationale: each was a gap the owner listed on issue #1; the tool groups and the kit tests
+  close behaviour that had no test, the rest make a message or a figure true.
+  Date/Author: 2026-10-21, doperpowers-15's residual pass.
 
 ## Outcomes & Retrospective
 

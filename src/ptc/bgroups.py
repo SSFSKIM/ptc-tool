@@ -210,7 +210,12 @@ def reap_leaderless_group(pgid: int) -> bool:
 
 
 def reap(kernel_dir) -> list:
-    """SIGKILL every recorded group, then drop the file. Returns the pgids signalled."""
+    """SIGKILL every recorded group, then drop the file. Returns the pgids signalled.
+
+    The tool groups of the kernel's `claude` children are reaped with them, from their own
+    registry (`ptc/toolgroups.py`): a kernel killed with its group orphans those exactly as
+    it orphans background `bash()` groups.
+    """
     killed = []
     for row in read(kernel_dir):
         pgid = row.get("pgid")
@@ -234,4 +239,5 @@ def reap(kernel_dir) -> list:
         path_for(kernel_dir).unlink(missing_ok=True)
     except OSError:
         pass
-    return killed
+    from .toolgroups import reap_file        # it builds on this module
+    return killed + reap_file(kernel_dir)

@@ -8,6 +8,8 @@ import json
 import os
 import time
 
+from ptc import toolgroups
+
 from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
 from .profiles import PRESETS, Profile, memory_text, resolve
 from .state import STATE
@@ -236,6 +238,7 @@ def _fold(messages: list, o: AgentOpts, t0: float) -> tuple[AgentResult, str | N
 async def run_once(task: str, o: AgentOpts, *, resume: str | None = None,
                    fork: bool = False, bare_llm: bool = False) -> AgentResult:
     from claude_agent_sdk import ResultError, query
+    toolgroups.watch()
     t0 = time.time()
     msgs = []
     try:
@@ -332,6 +335,9 @@ class Session:
 async def open_session(task: str | None, o: AgentOpts, *, resume: str | None = None) -> Session:
     from claude_agent_sdk import ClaudeSDKClient
     client = ClaudeSDKClient(options=_sdk_options(o, resume=resume))
+    # A child's Bash tools run in groups of their own; learning them while it lives is
+    # what reaps them when it is killed (`ptc/toolgroups.py`).
+    toolgroups.watch()
     await client.connect()
     # connect() has spawned a `claude` CLI. From here on the caller gets a Session or an
     # exception, and on the exception path it gets no handle at all — so anything that

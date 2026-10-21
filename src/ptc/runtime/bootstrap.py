@@ -454,6 +454,13 @@ def _reap_and_exit() -> None:
     except Exception:
         pass
     try:
+        # A `claude` child still standing runs its Bash tools in groups of their own:
+        # stopped, read and reaped here, as the group kill below could not.
+        from ptc import toolgroups
+        toolgroups.tracker().stop_all_and_reap()
+    except Exception:
+        pass
+    try:
         from ptc import bgroups
         bgroups.reap(STATE.kernel_dir)
     except Exception:

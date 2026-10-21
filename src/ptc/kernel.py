@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import bgroups
+from . import bgroups, toolgroups
 from .discovery import read_meta, write_meta
 from .lock import key_lock
 from .memory import footprint
@@ -418,10 +418,30 @@ def kill_process_tree(pid: int) -> None:
     through its own cancellation path. A hard kill from another process — `ptc kill`,
     `ptc restart` — has no such moment and no reach here. NOTHING below pretends
     otherwise; the honest statement is that those grandchildren survive it.
+
+    The kernel's `claude` children (the agent host, CLI-route agents) are a second such
+    case, and a closable one: each runs its Bash tools in groups of their own, which this
+    kill would orphan. So the group is stopped first and those tool groups read and
+    reaped while their `claude`s still stand (`ptc.toolgroups.stop_group`). The reap
+    comes before the group kill, not after: with the `claude`s stopped the order is
+    otherwise immaterial, and a caller inside the group (`ptc kill` run from a cell) does
+    not live past the kill. A group a stop was attempted on and not killed — the kill raised, or an
+    interrupt came first, even one landing inside `stop_group` after its SIGSTOP — is
+    continued, never left stopped: the cleanup is armed before the stop is sent, and
+    continuing a group that was never stopped is harmless.
     """
     try:
         if os.getpgid(pid) == pid:
-            os.killpg(pid, signal.SIGKILL)
+            attempted = killed = False
+            try:
+                attempted = True              # armed before the SIGSTOP can land
+                toolgroups.stop_group(pid)
+                toolgroups.reap_rows(toolgroups.tool_groups_under(pid))
+                os.killpg(pid, signal.SIGKILL)
+                killed = True
+            finally:
+                if attempted and not killed:
+                    toolgroups.resume_group(pid)
             return
     except OSError:
         pass
