@@ -29,6 +29,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) Spec written.
 - [ ] SDK pin to `claude-agent-sdk==0.2.169` (bundled CLI 2.1.305) shipped on `main` as v0.5.5 — a separate change, in flight; M1 needs it.
 - [x] (2026-10-20) Spec review, round 1: adversarial design review and buildability review, both folded in (Decision Log).
+- [x] (2026-10-20) Spec review, round 2 on the round-1 fixes: folded in (Decision Log).
 - [ ] M1 — spike: host feasibility.
 - [ ] M2 — prompt profiles on the CLI route.
 - [ ] M3 — the host route.
@@ -240,9 +241,14 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
 | request | body | response |
 |---|---|---|
 | `POST /hello` | `{"protocol": 1, "engine": "<cli version>", "plugin": "<host-plugin version>"}` | `200 {"ok": true}`; `409 {"ok": false, "reason": "protocol"}` on a mismatch, which fails the start |
-| `GET /jobs?wait=<ms>&ack=<id>,…` | — | `200 {"jobs": [Job…], "cancel": ["<id>"…]}`. The kernel holds the request up to `wait` (the mod sends 25,000, under fetch's 30 s bound) and answers at once when a job or cancel is queued. `ack` lists the ids of every job the previous response carried. |
-| `POST /results/<id>` | `Result` | `200 {"ok": true}`; `404` for an id the kernel no longer waits on (its caller already settled); the mod drops it |
-| `POST /ended/<id>` | `{}` | `200`. Sent after a cancelled job's subagent or call has actually stopped, when the job had already been settled for its caller, so that the kernel can release its slot ("Concurrency"). |
+| `GET /jobs?wait=<ms>&ack=<seq>` | — | `200 {"seq": <n>, "jobs": [Job…], "cancel": ["<id>"…]}`. The kernel holds the request up to `wait` (the mod sends 25,000, under fetch's 30 s bound) and answers at once when a job or cancel is queued. `seq` numbers each non-empty response; `ack` is the `seq` of the last response the mod received. |
+| `POST /results/<id>` | `Result` | `200 {"ok": true}`, or `200 {"ok": true, "late": true}` when the job's caller was already settled (timed out or cancelled): the result is discarded and the job's slot is released all the same; `404` only for an id the kernel never issued or already released |
+
+Every job ends in exactly one result POST. A cancelled `complete` posts `reason:
+"aborted"`. A stopped subagent posts its `turn.complete` reason. One that cannot be
+stopped posts whatever it ends with. So there is no separate end notice: a job's slot is
+released when its result arrives, whatever its caller's state, or when its generation is
+retired.
 
 ```jsonc
 // Job, kind "complete"
@@ -259,8 +265,9 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
 {"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout|too-large", "detail": "…", "status": 429}
 ```
 
-- **Delivery.** A job counts as delivered when the next poll acks it. If a poll arrives
-  without acking a job the previous response carried, that response was lost. The kernel
+- **Delivery.** A response, with every job and cancel in it, counts as delivered when
+  the next poll acks its `seq`. If a poll arrives whose `ack` is older than the last
+  response sent, that response was lost. The kernel
   then retires the generation, cause `delivery`. It does not redeliver: a lost response
   is rare on a local socket, and redelivery would need deduplication in the mod to rule
   out running an agent twice. A result POST that fails (an exception, or any status other
@@ -294,8 +301,8 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
     text.
   - A `cancel` aborts a `complete`'s controller. For an agent it does whatever M1 found
     stops a subagent (Q5). If nothing does, the subagent runs out, bounded by its
-    `maxTurns` ("Concurrency"). Either way, when the job has actually ended the mod posts
-    `/ended/<id>`; its result, if one comes, gets a 404.
+    `maxTurns` ("Concurrency"). Either way the job's one result POST, `late` by then,
+    releases its slot.
 - **Why long-poll on a kernel-served socket.** The mod API's outbound channel is
   `$.http.fetch`, and `$.process.spawn` writes a child's stdin only once. A socket the
   kernel serves keeps the host at exactly one process. Jobs arrive at the kernel's pace,
@@ -323,9 +330,11 @@ the CLI route exhaust RAM. The host's own `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`
 above the semaphore, so the kernel's semaphore is the only cap that binds.
 
 **Settlement is separate from capacity.** When a call's deadline passes or its caller
-cancels it, the caller is settled at once (`AgentFailed`), and the kernel queues a
-`cancel`. The job's slot stays held until the job has actually ended in the host: until
-its result or its `/ended` arrives, or until its generation is retired. Releasing the
+cancels it, the caller is settled at once (`TimeoutError` or `CancelledError`, as on the
+CLI route), and the kernel queues a `cancel`. The job's slot stays held until the job
+has actually ended in the host: until its result arrives (`late`), or until its
+generation is retired. Releasing is idempotent: the first of those two releases the
+slot, and the other changes nothing. Releasing the
 slot at the caller's timeout would admit replacements while the abandoned agents still
 run, and the engine's own subagent cap would then bind and stall later work.
 
@@ -352,13 +361,18 @@ host, and a fallback to the CLI. It is the existing wall-clock contract of `time
 
 - On the host route, `AgentHost.submit(job, deadline)` owns admission. It waits for the
   host's start and then for a host-semaphore permit, each bounded by the deadline. It
-  sets the job's `timeoutMs` to the time left at submission, and fails the call with
-  `AgentFailed("timed out …")` when the deadline passes at any stage. The shared CLI
-  semaphore is not taken.
+  sets the job's `timeoutMs` to the time left at submission. When the deadline passes at
+  any stage, it raises `TimeoutError`, which is what `guarded`'s `asyncio.wait_for` raises
+  on the CLI route, so callers catch one type on both routes. The shared CLI semaphore is
+  not taken.
+- `timeout` is validated once, at entry, by `guarded`'s rule: `None` means no deadline,
+  `0` is a deadline already passed, and a negative value is a `ValueError`. Nothing
+  derived later is passed back through that check.
 - When `"auto"` falls back to the CLI because the host is unavailable (start failed or
   crash-looped), the CLI attempt runs under `guarded(shared_semaphore(), make, remaining)`
-  with `remaining = deadline - monotonic()`. `guarded`'s existing semantics then apply to
-  that remainder, so a negative or zero remainder fails at once.
+  with `remaining = max(0.0, deadline - monotonic())`, or `None` when the call has no
+  deadline. A budget that is already spent therefore fails with `TimeoutError`, never
+  with `guarded`'s negative-argument `ValueError`.
 - `guarded` itself is unchanged. It stays the CLI route's admission, and the call site
   computes its argument from the deadline.
 
@@ -629,8 +643,10 @@ Decisions that belong here:
 - The kernel's channel server runs on the kernel's own asyncio loop (`STATE.loop`).
   Futures are resolved on it. A result posted for an unknown or settled id gets 404 and
   changes nothing.
-- Deadlines follow "Deadlines". On expiry the kernel fails the call, queues a `cancel`
-  for the job, and returns its host-semaphore slot.
+- Deadlines follow "Deadlines". On expiry the kernel settles the caller with
+  `TimeoutError` and queues a `cancel`. It does **not** release the job's host-semaphore
+  slot: the slot goes back only when the job's result arrives or its generation retires
+  ("Settlement is separate from capacity").
 - Job ids are `j-<uuid4 hex>`. Type names follow "Lean agent types". Use canonical JSON
   for the hash: sorted keys, no whitespace.
 - The mod's own failures (an exception in its dispatch) post `ok: false, reason: "error"`
@@ -657,9 +673,16 @@ It proves acceptance 1, 2, 4, 5 and 6. Its tests pin:
 - the crash-loop switch to the CLI;
 - retirement on lease lapse (a fake mod that stops polling) and on a lost delivery (a
   poll that does not ack), with every in-flight job failing and nothing replayed;
-- capacity: repeated caller timeouts do not admit more host jobs than the cap while the
-  abandoned jobs have not ended, and a cap filled by abandoned jobs retires the
-  generation;
+- capacity: repeated caller timeouts, with the abandoned agents still running in the
+  fake mod, admit no more host jobs than the cap. A late result releases its slot
+  exactly once, also when it races the caller's timeout. A cap filled by abandoned jobs
+  retires the generation;
+- delivery: a lost response carrying only cancels (the next poll's stale `ack`) retires
+  the generation. A result POST the mod cannot deliver after its retries ends in the
+  lease retirement;
+- deadlines: a fallback reached with its budget spent raises `TimeoutError`;
+  `timeout=0` raises `TimeoutError` on both routes; a negative `timeout` raises
+  `ValueError` at entry;
 - envelope sizing: a newline-heavy text that is small raw but large encoded spills to a
   file; an over-4-MiB field is refused;
 - two simultaneous reader runs in two directories holding identically named files, each
@@ -779,6 +802,18 @@ async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=3
   Rationale: execspec step 4.
   Date/Author: 2026-10-20, doperpowers-15.
 
+- Decision: Second review round folded in.
+  - One result POST ends every job, a `late` one included. It releases the slot
+    idempotently, so the separate `/ended` notice is removed.
+  - Acks cover whole poll responses by `seq`, so a lost cancel is detected too.
+  - M3 no longer releases a slot at the caller's timeout.
+  - Host-route timeouts raise `TimeoutError`, as `guarded` does.
+  - A spent fallback budget is clamped to 0 rather than passed negative.
+  Rationale: The first fold left M3 contradicting "Concurrency". `/ended` and cancel-only
+  responses sat outside the delivery guarantee. A late result answered 404 without
+  releasing its slot. Passing a negative remainder to `guarded` raised `ValueError` for
+  an exhausted, valid timeout (verified by running `guarded` in isolation).
+  Date/Author: 2026-10-20, doperpowers-15.
 - Decision: Design review folded in.
   - A slot is released only when its job has ended in the host, not when its caller
     settles.
