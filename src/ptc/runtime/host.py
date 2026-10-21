@@ -298,24 +298,31 @@ class AgentHost:
     async def _launched(self, gen: _Generation, start_by: float):
         """The launched host process, or `HostUnavailable` once `start_by` passes. A launch
         still running then is cancelled (its own cleanup closes what it opened) and waited
-        on for a bounded time; it stays in the host's tasks, so `close()` waits on it too."""
+        on for a bounded time; it stays in the host's tasks, so `close()` waits on it too.
+
+        The process is the caller's only once this returns it: on every other way out — the
+        deadline, a cancel from `close()`, even one landing after the launch had returned —
+        a process the launch did return is closed here, since nothing else holds it."""
         launching = self._spawn(None, self._launch(self._env(gen), self._cwd, self._plugin_dir))
+        handed = False
         try:
             done, _ = await asyncio.wait({launching}, timeout=max(0.0, _left(start_by)))
+            if not done:
+                raise HostUnavailable(f"its launch did not return within {self._start_s:g} s")
+            proc = launching.result()          # the launch's own failure, as it raised it
+            handed = True
+            return proc
         finally:
-            if not launching.done():
-                launching.cancel()
-                await asyncio.wait({launching}, timeout=_TEARDOWN_S + 2)
+            if not handed:
+                if not launching.done():
+                    launching.cancel()
+                    await asyncio.wait({launching}, timeout=_TEARDOWN_S + 2)
                 if launching.done() and not launching.cancelled() \
                         and launching.exception() is None:
-                    # it returned as it was cancelled: nothing else will close it
                     try:
                         await asyncio.wait_for(launching.result().close(), _TEARDOWN_S + 2)
-                    except Exception:    # noqa: BLE001 — teardown never masks the fault
+                    except BaseException:    # noqa: BLE001 — teardown never masks the fault
                         pass
-        if not done:
-            raise HostUnavailable(f"its launch did not return within {self._start_s:g} s")
-        return launching.result()
 
     def _env(self, gen: _Generation) -> dict:
         """The host's environment over the kernel's: M1's launch recipe."""

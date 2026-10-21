@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
-from host_fakes import FakeLauncher, echo, hold, release
+from host_fakes import FakeLauncher, agent_ended, echo, hold, release
 
 from ptc.runtime import host as host_mod
 from ptc.runtime.agents import AgentFailed
@@ -165,10 +165,32 @@ def test_a_launch_that_never_returns_is_bounded_by_the_start_deadline(tmp_path):
     asyncio.run(main())
 
 
+def test_a_close_landing_as_the_launch_returns_still_closes_the_process(tmp_path):
+    """`close()` cancels the start in the step after the launch returned, before the start
+    could take the process into its generation: the launched process is closed anyway, not
+    left running with nothing holding it."""
+    async def main():
+        launcher = FakeLauncher()
+        holder = {}
+
+        async def launch(env, cwd, plugin_dir):
+            proc = await launcher(env, cwd, plugin_dir)
+            # runs before the start task wakes on the finished launch
+            asyncio.get_running_loop().call_soon(
+                lambda: holder.setdefault("close", asyncio.ensure_future(h.close())))
+            return proc
+        h = make_host(tmp_path, launch)
+        with pytest.raises((HostUnavailable, asyncio.CancelledError)):
+            await h.ensure_started()
+        await holder["close"]
+        [proc] = launcher.procs
+        assert proc.closed
+    asyncio.run(main())
+
+
 def test_a_failed_result_carries_its_metadata(tmp_path):
     async def failing(mod, job):
-        return {"ok": False, "reason": "aborted", "detail": "stopped", "agentId": "a9",
-                "text": "half"}
+        return agent_ended("error", "half", agent_id="a9")
 
     async def main():
         h = make_host(tmp_path, FakeLauncher(handler=failing))

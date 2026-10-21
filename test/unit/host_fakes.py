@@ -110,6 +110,15 @@ class FakeMod:
             t.cancel()
 
 
+def agent_ended(reason: str, answer: str, agent_id: str = "a1", usage=None) -> dict:
+    """The Result the real mod posts when a subagent ends (`settleAgent`, host.tsx): kept
+    in step with it by hand, so a fake failure carries its text exactly as the mod's does."""
+    if reason == "answer":
+        return {"ok": True, "text": answer, "usage": usage, "agentId": agent_id}
+    return {"ok": False, "reason": reason, "detail": answer, "text": answer, "usage": usage,
+            "agentId": agent_id}
+
+
 async def echo(mod: FakeMod, job: dict) -> dict:
     """A `complete` answers its prompt back; an agent answers once cancelled or at once."""
     if job["kind"] == "complete":

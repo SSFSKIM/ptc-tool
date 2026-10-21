@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
-from host_fakes import FakeLauncher
+from host_fakes import FakeLauncher, agent_ended
 
 from ptc.runtime import _llm as llm_mod
 from ptc.runtime import host as host_mod
@@ -488,7 +488,7 @@ def test_interrupting_a_host_spawn_cancels_its_job(kernel, monkeypatch, cli):
 
 def test_a_host_run_failure_surfaces_and_marks_its_row(kernel, monkeypatch, cli):
     async def fail(mod, job):
-        return {"ok": False, "reason": "aborted", "detail": "stopped", "agentId": "z"}
+        return agent_ended("aborted", "I read two of the files", agent_id="z")
 
     async def main():
         h, _ = install_host(kernel, monkeypatch, launcher=FakeLauncher(handler=fail))
@@ -497,6 +497,7 @@ def test_a_host_run_failure_surfaces_and_marks_its_row(kernel, monkeypatch, cli)
             with pytest.raises(AgentFailed, match="aborted") as ei:
                 await ag.run("t", profile="reader")
             assert ei.value.result.agent_id == "z" and ei.value.result.via == "host"
+            assert ei.value.result.text == "I read two of the files"     # the CLI's partial
             assert ei.value.result.session_id == "host-session"
             [row] = [x for x in ag.list() if x.get("provider") == "claude-host"]
             assert row["status"] == "error" and row["agent_id"] == "z"
@@ -553,5 +554,34 @@ def test_a_schema_call_is_audited_once_though_it_retries(kernel, monkeypatch, cl
         finally:
             await h.close()
     asyncio.run(main())
+    rec = [json.loads(x) for x in (kernel / "audit.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["via"]) for r in rec] == [("llm", "host")]
+
+
+def test_a_schema_retry_whose_host_goes_away_fails_on_the_host_with_one_record(
+        kernel, monkeypatch, cli):
+    """The host took the first attempt, then went away before the retry: the call ran on
+    the host, so it fails there (carrying the reply it got) rather than running again on
+    the CLI under a second record."""
+    async def main():
+        h, _ = install_host(kernel, monkeypatch,
+                            launcher=FakeLauncher(handler=replies('{"n": "x"}', '{"n": 1}')))
+        try:
+            real, calls = h.submit, []
+
+            async def then_gone(job, deadline, **kw):
+                calls.append(job)
+                if len(calls) == 2:
+                    h._looped = "test"
+                    raise HostUnavailable("crash-looped")
+                return await real(job, deadline, **kw)
+            monkeypatch.setattr(h, "submit", then_gone)
+            with pytest.raises(AgentFailed, match="before its retry") as ei:
+                await llm_mod.llm("one", json_schema=SCHEMA)
+            assert ei.value.result.text == '{"n": "x"}' and ei.value.result.via == "host"
+        finally:
+            await h.close()
+    asyncio.run(main())
+    assert cli.calls == []
     rec = [json.loads(x) for x in (kernel / "audit.jsonl").read_text().splitlines()]
     assert [(r["kind"], r["via"]) for r in rec] == [("llm", "host")]

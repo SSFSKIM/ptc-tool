@@ -304,7 +304,9 @@ async function settleAgent($: EngineInterface, jobId: string, agentId: string, e
   if (e.reason === 'answer') {
     await post($, jobId, { ok: true, text: e.answer, usage: e.usage ?? null, agentId })
   } else {
-    await post($, jobId, { ok: false, reason: e.reason, detail: e.answer, usage: e.usage ?? null, agentId })
+    // The text it wrote before it ended rides as the result's text, as the CLI route's
+    // partial does; `detail` keeps it for the error message.
+    await post($, jobId, { ok: false, reason: e.reason, detail: e.answer, text: e.answer, usage: e.usage ?? null, agentId })
   }
 }
 
@@ -324,6 +326,12 @@ async function runAgent($: EngineInterface, job: AgentJob, run: Running): Promis
   }
   const subagentType = await leanType($, job.type)
   const prompt = await textOf($, job.prompt, job.promptFile)
+  // A cancel that landed while the type registered or the prompt was read stops the job
+  // here: no child is created only to be stopped, with calls and tool runs in between.
+  if (run.cancelRequested) {
+    await post($, job.id, { ok: false, reason: 'aborted', detail: 'cancelled before it started' })
+    return
+  }
   state.spawning++
   let spawned: Awaited<ReturnType<typeof $.agent.spawn>>
   try {
@@ -385,7 +393,8 @@ function cancel($: EngineInterface, id: string): void {
   } else if (run.agentId !== undefined) {
     void stopAgent($, run.agentId)
   }
-  // An agent still spawning is stopped once its spawn answers (runAgent).
+  // An agent not yet spawned is never spawned, and one whose spawn is in flight is
+  // stopped once the spawn answers (runAgent).
 }
 
 async function pollLoop($: EngineInterface): Promise<void> {

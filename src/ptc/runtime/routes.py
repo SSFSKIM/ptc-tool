@@ -232,11 +232,22 @@ async def complete_structured(prompt: str, *, system: str, schema: dict, deadlin
     validator = schema_validator(schema)
     host = get_host()
     system = "\n\n".join(t for t in (system, SCHEMA_INSTRUCTION + json.dumps(schema)) if t)
-    asked = prompt
+    asked, last = prompt, None
     for attempt in (1, 2):
         t0 = time.time()
-        res = await host.submit(complete_job(asked, system=system, **job_kw), deadline,
-                                on_queued=on_queued)
+        try:
+            res = await host.submit(complete_job(asked, system=system, **job_kw), deadline,
+                                    on_queued=on_queued)
+        except HostUnavailable as e:
+            if last is None:
+                raise              # nothing ran yet: the caller may take the CLI
+            # The host ran the first attempt, so this call is the host's: it fails there
+            # with the reply it got, rather than running again on the CLI.
+            raise AgentFailed(
+                f"llm(json_schema=...) on the agent host: the host went away before its "
+                f"retry ({e}); the first reply did not validate: {last[1]}",
+                host_result(last[0], session_id=host.session_id, t0=t0, kind="complete")
+            ) from None
         try:
             return parse_reply(res.get("text") or "", validator)
         except ValueError as e:
@@ -246,6 +257,7 @@ async def complete_structured(prompt: str, *, system: str, schema: dict, deadlin
                     f"after one retry: {e}",
                     host_result(res, session_id=host.session_id, t0=t0, kind="complete")
                 ) from None
+            last = (res, e)
             asked = (f"{prompt}\n\nYour previous reply was:\n{res.get('text') or ''}\n\n"
                      f"It does not validate against the schema: {e}. Reply again with only "
                      "the JSON value.")
