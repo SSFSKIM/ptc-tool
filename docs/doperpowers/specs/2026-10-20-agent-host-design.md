@@ -495,12 +495,11 @@ cell or a shell.
    with the number only.", profile="reader")` over 32 files whose line counts the test
    knows, in a git cwd. All 32 are right, and the first request in each run's transcript
    has a prompt of at most 4,200 tokens.
-3. **CLI-route floors**, in a short non-git cwd (the environment block grows with the
-   path), with `PTC_LAUNCHER` set as in a real kernel. `llm("Reply with exactly: OK",
+3. **CLI-route floors**, in a non-git cwd, with `PTC_LAUNCHER` set as in a real kernel. `llm("Reply with exactly: OK",
    via="cli")` costs at most 100 prompt tokens with credentials in the environment, and
-   at most 400 without `--bare` (measured with the credential present and `--bare`
+   at most 450 without `--bare` (measured with the credential present and `--bare`
    withheld, the same prompt, since this machine cannot sign in with the credentials
-   removed). `agent.run(..., profile="reader", via="cli")` costs at most 3,100.
+   removed). `agent.run(..., profile="reader", via="cli")` costs at most 3,400.
 4. **A host crash fails its jobs and recovers.** `kill -9` the host during a 32-wide
    fan-out. Every in-flight call raises `AgentFailed` whose message names the host's
    exit. A following `llm()` succeeds on a new host pid.
@@ -941,6 +940,13 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: Acceptance 3's limits get margin: `llm()` without `--bare` at most 450, the
+  CLI reader at most 3,400, `llm()` with `--bare` still at most 100, in any non-git cwd
+  (the length condition dropped; M4 runs it under pytest's `tmp_path`).
+  Rationale: the limits are the measured values (400, 3,068) plus about 10 %, because the
+  environment block grows with the cwd's path (417 under `tmp_path`); the criterion checks
+  how the prompt is made up, not how long the path is.
+  Date/Author: 2026-10-20, doperpowers-15 (the spec's author), recorded by the plan-executor.
 - Decision: The spec's author's rulings on M2's concerns. (1) The ptc MCP server attaches
   to an `agent.*` CLI child only when its tools are `"default"` or name `mcp__ptc` /
   `mcp__ptc__<tool>` ("Profiles"). A fix in intent, not a new contract: v0.5.4's doctrine
