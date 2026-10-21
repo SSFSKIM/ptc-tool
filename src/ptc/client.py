@@ -82,12 +82,6 @@ class NotFound:
     cell_id: int
 
 
-#: How long a submission waits for its connection to be provably synchronized with the
-#: kernel (`_connect_to_current_owner`). Matches the readiness budget `ensure_kernel` gives
-#: the same round trip at spawn: a kernel that cannot answer kernel_info inside it is not
-#: one this submission should be sending to.
-_READY_S = 20.0
-
 #: Longest `matched` a `wait_cell(until=…)` return carries. `matched` identifies the EVENT;
 #: it is not a payload channel — the output window carries the data. Capped here, at the
 #: source, so every renderer downstream is bounded by construction.
@@ -149,8 +143,8 @@ class KernelClient:
         whole budget for a message that was already sent to nobody. The submission then
         failed with a marker naming cell_id None — undischargeable while the kernel lives
         (`_pending_discharged`), so every later submission was Busy until a restart. The
-        handshake is now waited out before the send (`_connect_to_current_owner`); this is
-        the second witness for the case that survives it.
+        disk witness closes that race without waiting for an IOPub subscription to
+        become ready on every connection.
 
         The kernel-side pre_run_cell publishes the same number to current.json, on disk,
         over no socket at all. `baseline` is what that file named BEFORE this request went
@@ -380,25 +374,15 @@ class KernelClient:
         window costs one retry; two in a row is a key being replaced faster than anything
         can bind to it, and that is reported rather than papered over.
 
-        The connection is also SYNCHRONIZED before it is accepted. `start_channels()`
-        returns as soon as the sockets are created, and a ZeroMQ SUB subscription reaches
-        the kernel's PUB some time after that — so a cell submitted immediately could
-        publish its `execute_input` before anyone was subscribed to hear it, and the
-        submission that lost that race left a marker nothing could discharge (see
-        `_await_cell_id`). `wait_for_ready` is jupyter_client's own name for closing that
-        gap: a kernel_info round trip on shell, then iopub drained until it answers, which
-        is precisely the proof that the subscription is live. It runs BEFORE anything is
-        sent and before the marker is written, so its failure is an ordinary
-        connection failure — nothing on the wire, nothing on disk to clean up.
+        No IOPub readiness barrier is needed here: `_await_cell_id` can learn a
+        missed `execute_input` from current.json under the submit lock. Requiring
+        Jupyter's shell-plus-IOPub handshake as well made healthy kernels fail after
+        20 s under load, even though the durable witness was available. Bootstrap is
+        different: it installs that witness and must synchronize first (`_exec_raw`).
         """
         for attempt in (0, 1):
             owner = self._owner_identity()
             kc = self._connect()
-            try:
-                kc.wait_for_ready(timeout=_READY_S)
-            except BaseException:
-                kc.stop_channels()
-                raise
             if self._owner_identity() == owner:
                 return kc, owner
             kc.stop_channels()
@@ -900,19 +884,24 @@ class KernelClient:
         needs no hooks; failing it is an ordinary spawn failure (`run_bootstrap`'s caller
         tears the kernel down), and nothing has been sent when it does.
         """
+        # Bootstrap already has a startup budget (60 s in run_bootstrap). Its fresh
+        # connection must synchronize too, but the ordinary submission's 20 s cap
+        # killed healthy kernels when startup/scheduling consumed more than that.
+        # Spend ONE budget across the handshake, cell-id witness, and shell reply.
+        deadline = time.monotonic() + timeout_s
         kc = self._connect()
         try:
-            kc.wait_for_ready(timeout=_READY_S)
+            kc.wait_for_ready(timeout=max(0.0, deadline - time.monotonic()))
             # The key lock is `ensure_kernel`'s for the whole of this call and cells/ was
             # rotated moments ago, so the baseline is the same fact it is on the submission
             # path: whatever current.json named before this request, under exclusion.
             baseline = current_cell(self.key)
             msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
-            cell_id = self._await_cell_id(kc, msg_id, baseline)
-            deadline = time.monotonic() + timeout_s
-            while time.monotonic() < deadline:
+            cell_id = self._await_cell_id(
+                kc, msg_id, baseline, timeout=max(0.0, min(15.0, deadline - time.monotonic())))
+            while (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    reply = kc.get_shell_msg(timeout=1.0)
+                    reply = kc.get_shell_msg(timeout=min(1.0, remaining))
                 except Exception:
                     continue
                 if reply.get("parent_header", {}).get("msg_id") == msg_id:

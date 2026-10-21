@@ -416,10 +416,9 @@ class _SilentIopubKC:
     def __init__(self, key: str, cell_id: int):
         self._kd = kernel_dir(key)
         self._cell_id = cell_id
-        self.ready_waits = 0
 
     def wait_for_ready(self, timeout=None):
-        self.ready_waits += 1
+        raise RuntimeError("Kernel didn't respond in 20 seconds")
 
     def execute(self, code, **kw):
         cells = self._kd / "cells"
@@ -443,6 +442,8 @@ def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_p
     nothing can ever discharge while the kernel lives, so every later submission was Busy
     until a restart. The id is on disk too, and the submit lock is held for this whole
     window, so an id NEWER than the one standing there before the send can only be ours.
+    Requiring Jupyter's IOPub handshake as well defeats that independence: under load
+    it can time out even though the disk witness makes submission safe.
     """
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
     kd = _live_kernel("p20")
@@ -454,7 +455,6 @@ def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_p
     out = KernelClient("p20").exec_cell("1 + 1", 5.0, Config.from_env(env={}))
 
     assert isinstance(out, Completed) and out.cell_id == 7, f"the id was never learned: {out}"
-    assert kc.ready_waits == 1, "the submission never waited for the subscription handshake"
     assert not (kd / "cells" / "pending.json").exists(), "an undischargeable marker was left"
     assert KernelClient("p20").is_busy() is None, "the key stayed busy for good"
 

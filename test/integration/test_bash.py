@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import textwrap
 import time
 
@@ -122,13 +123,19 @@ def test_background_group_is_forgotten_when_it_ends(ptc_home):
     OS has handed to somebody else."""
     import json
     ensure_kernel("b6", cwd=str(ptc_home))
-    out = _exec("b6", """
-        h = await bash("true", background=True)
-        r = await h.wait()
-        print("code", r.code)
-    """)
+    # `true` can be reaped before _register even runs: an already-empty group needs
+    # no row, so no registry file is promised. Hold this group until registration is
+    # observed, then release it; neither scheduler speed nor an arbitrary sleep decides.
+    release = ptc_home / "release-b6"
+    command = f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.05; done"
+    out = _exec("b6", f"h = await bash({command!r}, background=True); print(h.pid)")
+    pid = int(out.output.strip())
+    registry = ptc_home / "kernels" / "b6" / "bash-pgids.json"
+    assert any(r["pid"] == pid for r in json.loads(registry.read_text()))
+    release.touch()
+    out = _exec("b6", "r = await h.wait(); print('code', r.code)")
     assert "code 0" in out.output
-    rows = json.loads((ptc_home / "kernels" / "b6" / "bash-pgids.json").read_text())
+    rows = json.loads(registry.read_text())
     assert rows == [], f"an exited group stayed in the registry: {rows}"
     kill_kernel("b6")
 
