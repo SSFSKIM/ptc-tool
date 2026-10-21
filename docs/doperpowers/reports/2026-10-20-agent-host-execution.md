@@ -1,39 +1,59 @@
-# Agent host — execution report (interim)
+# Agent host — execution report
 
-Plan-executor for docs/doperpowers/specs/2026-10-20-agent-host-design.md, branch `agent-host`.
-This is an interim report: the harness required a hand-back while M3's executor was still
-running. Nothing is pushed and no PR is open.
+Plan-executor for `docs/doperpowers/specs/2026-10-20-agent-host-design.md`, branch `agent-host`,
+integrated into `main` by a `--no-ff` merge (no PR, per the spec's author: ptc-tool lands on main
+directly). Ships ptc v0.6.0.
 
-## State
+## Milestones
 
-- Base merge: origin/main 5a6bca7 (v0.5.5, claude-agent-sdk 0.2.169) merged at 1f50755.
-- M1 (spike): complete, reviewed clean. Commits 2edebad..50d3e17. Verdict Promote (Decision
-  Log), 823/850 haiku calls. Review minors folded into the spec at a51eb9d.
-- M2 (profiles, CLI route): complete, reviewed clean. 3777674, fix 3e554d5. About 44 haiku
-  calls. Unit 650, integration 69, live profiles 3/3 executed.
-- Spec revisions from the author's rulings, all committed: d88c747 (acceptance 2 at 4,200,
-  host cap 256), e7d196b (M2 decisions), 35ec513 (ptc MCP only when named, git context off),
-  aba75bb (M2 measurements), 4b8a600 (acceptance 3 at 450 / 3,400), d4eaefa (M2 tick).
-- M3 (host route): complete, reviewed clean. 22e4c1b, 17ddb4e, fix be5003b; 335/400 haiku
-  calls. Deferred Minor (tech debt): a schema retry that falls back between attempts writes
-  two audit records.
-- M4 (doctrine, acceptance, ship): complete, reviewed clean. c7dc7a0..b830461 (ship v0.6.0),
-  fix 6f16eb5, 908e7b6. Acceptance 1–6 pass (acceptance 2 32/32 on rerun); acceptance 7's last
-  full run had one integration flake (test_mutation_footer, start timeout, 3/3 on rerun).
-  Every CLI child's hidden session-title request is now off (CLAUDE_CODE_DISABLE_TERMINAL_TITLE,
-  7c415dc). Requests, from the gateway log: M4 397/400, M3 ~408 (reported 335), M2 ~52–62
-  (reported ~44), M1 823 (host only).
-- Whole-branch review (reviewer-high, 5a6bca7..908e7b6): incorrect, 3 P2 — a launch/close race
-  leaves a launched host unowned (host.py ~306); the mod spawns an agent after a cancel that
-  arrived during preflight (host.tsx ~325); a failed agent's partial text is lost (host.tsx
-  ~307). Fix wave IN PROGRESS on afec58e598f5dea84, with the deferred schema-retry
-  double-audit record added.
-- Not started: re-review, the v0.6.0 tech-debt comment on ptc-tool issue #1, Outcomes &
-  Retrospective, PR.
+| milestone | commits | review |
+|---|---|---|
+| merge of main (v0.5.5, claude-agent-sdk 0.2.169, CLI 2.1.305) | 1f50755 | — |
+| M1 — spike: host feasibility | 2edebad..50d3e17 | task review Approved; minors folded into the spec (a51eb9d) |
+| M2 — prompt profiles on the CLI route | 3777674, fix 3e554d5 | Needs fixes → Approved |
+| M3 — the host route | 22e4c1b, 17ddb4e, fix be5003b | Needs fixes → Approved |
+| M4 — doctrine, acceptance, ship v0.6.0 | 7e0bf3d..b830461, fix 6f16eb5, 908e7b6 | Needs fixes → Approved |
+| Whole-branch review (reviewer-high, 5a6bca7..908e7b6) | fix 33df0fc | incorrect (3 P2) → correct |
 
-## Resume path
+The spec carries every decision and measurement (Decision Log, Surprises & Discoveries) and its
+Outcomes & Retrospective (160083b).
 
-Ledger: .doperpowers/sde/2026-10-20-agent-host-design/progress.md (bases, heads, handles).
-Wait for the fix wave's "Branch-review fix wave" section in task-3-report.md, then resume
-reviewer-high (af8ac97308df732c2) on 908e7b6..<fix head>. Then the tech-debt comment
-(hard-kill killpg, 64k–128k limit, fork warning, flakes), Outcomes & Retrospective, PR.
+## Validation
+
+- M1 verdict Promote: 8/32/128/256-wide ramps all 100 %, 581 MB peak at 256, p95 7.45 s; 0/100
+  schema calls needed the retry.
+- Acceptance, run as written in M4: 1 (64/64 on one host in ~4 s vs ~21 s on the CLI at cap 8),
+  2 (32/32 readers on the rerun with the fixed fixture, first request 3,459 ≤ 4,200, all on
+  haiku), 3 (61 / 421 / 3,095 under `tmp_path`, limits 100 / 450 / 3,400), 4 (every in-flight
+  call fails naming SIGKILL, next call on a new pid), 5 (old host pid gone after restart), 6
+  (both fallbacks answer on the CLI, the unloadable plugin with one warning). 7: unit and
+  integration pass except load-sensitive flakes that pass on rerun (below).
+- After the branch-review fix wave: `uv run pytest test/unit test/integration -q` → 797 passed,
+  1 warning (pre-existing fork DeprecationWarning); focused host/routes/backend/profile 145/145;
+  mod typecheck clean; live channel tests 2/2 with zero model calls.
+- On the merge commit: the unit suite (recorded in the hand-back).
+
+## Model requests (counted at the gateway log by session id)
+
+M1 823 (host only, under its 850 budget). M2 ~52–62 (reported ~44). M3 ~408 (reported 335,
+against a 400 cap). M4 397 of its 400 cap. The CLI-route undercount came from every CLI child's
+hidden session-title request, found in M4 and removed (7c415dc).
+
+## Residuals
+
+Logged on ptc-tool issue #1 ("From v0.6.0"): host tool processes outliving an externally
+SIGKILLed host (killpg fix sketched); the 64k–128k uncapped-reply divergence; the
+preflight-cancel fix covered by typecheck and the reviewer's mocked-`$` probe only (no
+kernel-side timing hook; a TS harness for the mod would close it); an unreadable prompt file
+surfacing as the spawn's "non-empty prompt" refusal; test-output noise; one figure measured on
+an earlier CLI build.
+
+## Friction
+
+- The MacBook's CLI cannot sign in with credentials removed ("OAuth session expired"), so
+  acceptance 3's no-credential case is measured as credential present with `--bare` withheld
+  (friction tracker #4).
+- Load-sensitive integration flakes (`test_peek_on_a_dead_kernel_raises_unavailable`,
+  `test_mutation_footer`) under concurrent live runs (friction tracker #4).
+- The harness forced five interim hand-backs while subagents were mid-run; each resumed from
+  the ledger without loss.
