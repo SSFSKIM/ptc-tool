@@ -419,8 +419,15 @@ that cannot express a value falls back as described under "Routes".
   never takes it.) Measured: it takes `llm()` from 379 to 52 tokens on this
   machine. Without credentials in the environment it would fail authentication, so the
   route keeps the 379-token form. `--bare` also skips hooks, LSP and plugin sync, which a
-  settings-`"none"` child does not load anyway; it keeps `--mcp-config`, so `agent.*`
-  children keep the ptc MCP server.
+  settings-`"none"` child does not load anyway.
+- **The ptc MCP server.** An `agent.*` CLI child gets the ptc MCP server only when its
+  tools are `"default"` or its explicit list names it, as the whole server (`mcp__ptc`)
+  or one of its tools (`mcp__ptc__exec`). `--tools` does not filter MCP tools, so
+  attaching it to an explicit list would add its tools to every reader. A child that
+  needs its own kernel names `mcp__ptc`. `llm()` never gets it.
+- **Git context.** Every CLI child whose profile is not `full` runs with
+  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, as the host process does, so both routes give
+  a profile the same prompt. `full` stays exactly today's child.
 - **`settings="user"` is allowed but in no preset.** It brings the user's hooks, plugins,
   MCP servers and output style. The measurement above shows an output style's mod
   rewriting a child's reply. The SKILL doctrine says so where it lists the axis.
@@ -488,10 +495,12 @@ cell or a shell.
    with the number only.", profile="reader")` over 32 files whose line counts the test
    knows, in a git cwd. All 32 are right, and the first request in each run's transcript
    has a prompt of at most 4,200 tokens.
-3. **CLI-route floors.** `llm("Reply with exactly: OK", via="cli")` costs at most 100
-   prompt tokens with credentials in the environment, and at most 400 with
-   `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` removed from the child's environment.
-   `agent.run(..., profile="reader", via="cli")` costs at most 3,100.
+3. **CLI-route floors**, in a short non-git cwd (the environment block grows with the
+   path), with `PTC_LAUNCHER` set as in a real kernel. `llm("Reply with exactly: OK",
+   via="cli")` costs at most 100 prompt tokens with credentials in the environment, and
+   at most 400 without `--bare` (measured with the credential present and `--bare`
+   withheld, the same prompt, since this machine cannot sign in with the credentials
+   removed). `agent.run(..., profile="reader", via="cli")` costs at most 3,100.
 4. **A host crash fails its jobs and recovers.** `kill -9` the host during a 32-wide
    fan-out. Every in-flight call raises `AgentFailed` whose message names the host's
    exit. A following `llm()` succeeds on a new host pid.
@@ -920,6 +929,23 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: The spec's author's rulings on M2's concerns. (1) The ptc MCP server attaches
+  to an `agent.*` CLI child only when its tools are `"default"` or name `mcp__ptc` /
+  `mcp__ptc__<tool>` ("Profiles"). A fix in intent, not a new contract: v0.5.4's doctrine
+  already says "Give each child exactly the tools its task needs — `tools=["Read",
+  "Grep"]` for a reader" (skills/ptc/SKILL.md), and its 2,776 was measured outside a
+  kernel, so the leak contradicted the documented behavior. M4 says so in the changelog
+  and in the skill's `tools=` paragraph: a child that needs its own kernel names
+  `mcp__ptc`. A test runs with `PTC_LAUNCHER` set, so acceptance 3 is measured as a real
+  kernel runs. (2) Acceptance 3 is stated for a short non-git cwd, and every non-`full`
+  CLI profile runs with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, as the host does; the
+  git-worktree figure with the variable set is recorded beside it. (3) Measuring the
+  no-credential case as credential present with `--bare` withheld is accepted.
+  Rationale: the alternative that lost, the server on every non-llm child, made the CLI
+  reader cost 5,792 tokens rather than about 3,066 and let a reader run code. M2 measured
+  the cwd's cost: the no-`--bare` `llm()` was 392 in `/tmp/<short>`, 417 under pytest's
+  `tmp_path` and 634 in a git worktree, where the CLI reader was 3,327.
+  Date/Author: 2026-10-20, doperpowers-15 (the spec's author), recorded by the plan-executor.
 - Decision: M2's executor decisions, folded. (1) `full`'s system is `""`, not
   `"claude_code"`: today's `agent.run` child runs on the SDK's empty `--system-prompt ""`
   (619 tokens), and the preset would cost 3,733; "exactly today's child" is the intent.
