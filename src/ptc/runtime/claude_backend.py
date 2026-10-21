@@ -99,6 +99,8 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
         # A profile's prompt is the same on both routes: the host runs with this too. `full`
         # stays exactly today's child, git context included.
         env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
+    if o.max_output_tokens is not None:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(o.max_output_tokens)
     kw: dict = dict(
         model=o.model,
         cwd=env["PTC_CWD"],
@@ -225,12 +227,19 @@ def _fold(messages: list, o: AgentOpts, t0: float) -> tuple[AgentResult, str | N
 
 async def run_once(task: str, o: AgentOpts, *, resume: str | None = None,
                    fork: bool = False, bare_llm: bool = False) -> AgentResult:
-    from claude_agent_sdk import query
+    from claude_agent_sdk import ResultError, query
     t0 = time.time()
     msgs = []
-    async for m in query(prompt=task, options=_sdk_options(o, resume=resume, fork=fork,
-                                                           bare_llm=bare_llm)):
-        msgs.append(m)
+    try:
+        async for m in query(prompt=task, options=_sdk_options(o, resume=resume, fork=fork,
+                                                               bare_llm=bare_llm)):
+            msgs.append(m)
+    except ResultError:
+        # A one-shot CLI that reported a failed result then exits non-zero on purpose, and
+        # the SDK raises for the exit after yielding that result (a reply cut at its output
+        # cap ends this way). The result already says what failed: fold it below.
+        if not any(type(m).__name__ == "ResultMessage" for m in msgs):
+            raise
     r, failure = _fold(msgs, o, t0)
     if failure:
         raise AgentFailed(failure, r)

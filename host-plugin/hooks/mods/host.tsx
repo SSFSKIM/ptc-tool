@@ -54,7 +54,8 @@ type CompleteJob = {
   systemFile: string | null
   prompt: string | null
   promptFile: string | null
-  maxTokens: number
+  /** null: the most the model gives in one completion (`HOST_MAX_TOKENS`, or less) */
+  maxTokens: number | null
   effort: string | null
   timeoutMs: number | null
 }
@@ -212,6 +213,10 @@ async function textOf($: EngineInterface, inline: string | null, file: string | 
   return inline ?? ''
 }
 
+/** `$.model.complete`'s own ceiling on a reply, whatever the model can give. */
+const HOST_MAX_TOKENS = 64000
+const PAST_WHAT_IT_CAN = /is past what .* can produce in one reply \((\d+)\)/
+
 async function runComplete($: EngineInterface, job: CompleteJob, run: Running): Promise<void> {
   const controller = new AbortController()
   run.controller = controller
@@ -220,18 +225,42 @@ async function runComplete($: EngineInterface, job: CompleteJob, run: Running): 
   }
   const prompt = await textOf($, job.prompt, job.promptFile)
   const system = await textOf($, job.system, job.systemFile)
-  const r = await $.model.complete(
-    {
-      model: job.model,
-      prompt,
-      ...(system !== '' ? { system } : {}),
-      maxTokens: job.maxTokens,
-      ...(job.effort !== null ? { effort: job.effort as Effort } : {}),
-      ...(job.timeoutMs !== null ? { timeoutMs: Math.max(1, job.timeoutMs) } : {}),
-    },
-    { signal: controller.signal },
-  )
-  if (r.isAnswered) {
+  const call = (maxTokens: number) =>
+    $.model.complete(
+      {
+        model: job.model,
+        prompt,
+        ...(system !== '' ? { system } : {}),
+        maxTokens,
+        ...(job.effort !== null ? { effort: job.effort as Effort } : {}),
+        ...(job.timeoutMs !== null ? { timeoutMs: Math.max(1, job.timeoutMs) } : {}),
+      },
+      { signal: controller.signal },
+    )
+  // A cap of null is the most the model gives: the engine's ceiling, or, for a model that
+  // gives less, the figure the engine names when it refuses that ceiling.
+  let limit = job.maxTokens ?? HOST_MAX_TOKENS
+  let r
+  try {
+    r = await call(limit)
+  } catch (e) {
+    const less = job.maxTokens === null ? PAST_WHAT_IT_CAN.exec(String(e)) : null
+    if (less === null) throw e
+    limit = Number(less[1])
+    r = await call(limit)
+  }
+  // The engine reports no stop reason, and asks the API for more than `maxTokens` (a
+  // thinking model's headroom). A reply that spent the whole cap is the one the CLI route
+  // cuts there and fails, in these words; it fails here too, its text riding along.
+  if (r.isAnswered && r.usage.output_tokens >= limit) {
+    await post($, job.id, {
+      ok: false,
+      reason: 'max-tokens',
+      detail: `API Error: Claude's response exceeded the ${limit} output token maximum.`,
+      text: r.text,
+      usage: r.usage,
+    })
+  } else if (r.isAnswered) {
     await post($, job.id, { ok: true, text: r.text, usage: r.usage })
   } else if (r.reason === 'api-error') {
     await post($, job.id, { ok: false, reason: 'api-error', detail: r.error, status: r.status, usage: r.usage })

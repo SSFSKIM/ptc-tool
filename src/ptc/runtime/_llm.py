@@ -27,7 +27,7 @@ from .profiles import Profile, resolve
 
 async def llm(prompt: str, *, model: str = "haiku", system: str | None = None,
               json_schema: dict | None = None, timeout: float | None = 300.0,
-              profile: str | Profile = "bare", via: str = "auto", max_tokens: int = 4096,
+              profile: str | Profile = "bare", via: str = "auto", max_tokens: int | None = None,
               effort: str | None = None):
     """Run one turn against `model` with no tools and return the reply.
 
@@ -35,8 +35,11 @@ async def llm(prompt: str, *, model: str = "haiku", system: str | None = None,
     overrides the profile's. Its tools must be `[]` and its settings `"none"`.
 
     `via` is `"auto"`, `"host"` or `"cli"` (module docstring). `max_tokens` caps the reply
-    on the host route; the CLI route keeps the CLI's own output limit. `effort` is passed
-    on both.
+    on both routes; `None` (the default) is the model's own output cap — the CLI's per-model
+    cap on the CLI route, the most the host's completion takes (64,000) on the host, so the
+    route never changes an answer of any length up to that. A reply cut at its cap raises
+    `AgentFailed` naming the cap and carrying the partial, on either route. A cap past
+    64,000 runs on the CLI. `effort` is passed on both.
 
     `json_schema`, when given, returns the parsed value instead of text. On the CLI route
     it is the SDK's native `output_format` (raw text if the SDK could not parse it); on the
@@ -48,7 +51,8 @@ async def llm(prompt: str, *, model: str = "haiku", system: str | None = None,
     its permit forever; passing it raises `TimeoutError` on either route.
 
     `llm()` shares the audit trail with `agent.*`: one "llm" record per call, attributed
-    to the current cell, with the route it took.
+    to the current cell, with the route it ran on (written once that is settled: the CLI
+    after a host that went away before taking the job).
     """
     p = resolve(profile, default="bare", system=system)
     if p.tools != []:
@@ -60,21 +64,25 @@ async def llm(prompt: str, *, model: str = "haiku", system: str | None = None,
                          "plugins and MCP servers, tools included, into the child")
     routes.check_max_tokens(max_tokens)
     deadline = routes.deadline_of(timeout)
-    route = routes.choose(via, routes.llm_misfit(p))
+    route = routes.choose(via, routes.llm_misfit(p, max_tokens))
     if json_schema is not None and route == "host":
         routes.schema_validator(json_schema)      # a bad schema is the caller's, not the host's
     route = await routes.settle(route, via, deadline)
-    audit.append("llm", model=model, prompt=prompt[:200], via=route)
+
+    def record(ran_on: str) -> None:
+        audit.append("llm", model=model, prompt=prompt[:200], via=ran_on)
     if route == "host":
         try:
-            return await _on_host(prompt, p, model, json_schema, max_tokens, effort, deadline)
+            return await _on_host(prompt, p, model, json_schema, max_tokens, effort, deadline,
+                                  on_queued=routes.once(lambda: record("host")))
         except HostUnavailable:
             # Raised only before the job was queued (the host went away while this call
             # waited for a slot), so nothing ran and the CLI may take it.
             if via == "host":
                 raise
+    record("cli")
     o = AgentOpts(model=model, profile=p, output_schema=json_schema, effort=effort,
-                  permission_mode="bypassPermissions")
+                  permission_mode="bypassPermissions", max_output_tokens=max_tokens)
     r = await guarded(shared_semaphore(),
                       lambda: _run_once(prompt, o, bare_llm=True), routes.remaining(deadline))
     if json_schema:
@@ -82,12 +90,13 @@ async def llm(prompt: str, *, model: str = "haiku", system: str | None = None,
     return r.text
 
 
-async def _on_host(prompt, p, model, json_schema, max_tokens, effort, deadline):
+async def _on_host(prompt, p, model, json_schema, max_tokens, effort, deadline, on_queued):
     system = routes.system_text(p, routes.kernel_cwd())
     kw = {"model": model, "max_tokens": max_tokens, "effort": effort}
     if json_schema is not None:
         return await routes.complete_structured(prompt, system=system, schema=json_schema,
-                                                deadline=deadline, **kw)
+                                                deadline=deadline, on_queued=on_queued, **kw)
     t0 = time.time()
-    res = await get_host().submit(routes.complete_job(prompt, system=system, **kw), deadline)
+    res = await get_host().submit(routes.complete_job(prompt, system=system, **kw), deadline,
+                                  on_queued=on_queued)
     return routes.host_result(res, session_id=None, t0=t0, kind="complete").text

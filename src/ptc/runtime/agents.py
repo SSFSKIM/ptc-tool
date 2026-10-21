@@ -113,6 +113,9 @@ class AgentOpts:
     #: stores it resolved, `system=`/`tools=` laid over it; `None` reads as the `full`
     #: preset with this option set's own `system`/`tools`, which is today's child.
     profile: Profile | str | None = None
+    #: `llm(max_tokens=)` on the CLI route: the child's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+    #: `llm()`'s alone — `agent.*` refuses it (`_Agent._opts`).
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -527,7 +530,7 @@ class _Agent:
         provider = kw.pop("provider", "claude")
         if provider not in self._backends:
             raise ValueError(f"unknown provider {provider!r}; use one of {sorted(self._backends)}")
-        bad = set(kw) - set(AgentOpts.__dataclass_fields__)
+        bad = set(kw) - (set(AgentOpts.__dataclass_fields__) - {"max_output_tokens"})
         if bad:
             raise TypeError(f"unsupported agent options: {sorted(bad)}")
         profile = kw.pop("profile", None)
@@ -650,46 +653,71 @@ class _Agent:
         o = self._opts(kw)
         deadline = routes.deadline_of(o.timeout)
         route = await routes.settle(routes.choose(via, routes.agent_misfit(o)), via, deadline)
-        audit.append("agent", name=f"run-{o.provider}", task=task[:120], provider=o.provider,
-                     via=route)
+
+        def record(ran_on: str) -> None:
+            audit.append("agent", name=f"run-{o.provider}", task=task[:120],
+                         provider=o.provider, via=ran_on)
         if route == "host":
             from .host import HostUnavailable
             try:
-                return await self._run_on_host(task, o, deadline)
+                return await self._run_on_host(task, o, deadline,
+                                               on_queued=lambda: record("host"))
             except HostUnavailable:
                 if via == "host":       # raised before the job was queued: nothing ran
                     raise
+        record("cli")
         return await self._guarded(
             lambda: self._backends[o.provider].run_once(task, o), routes.remaining(deadline))
 
     async def _run_on_host(self, task: str, o: AgentOpts, deadline,
-                           name: str | None = None) -> AgentResult:
+                           name: str | None = None, on_queued=None) -> AgentResult:
         """One lean subagent on the host, with its registry row: `agent.list()` shows host
-        runs under provider `claude-host`, with the subagent id and its transcript path."""
+        runs under provider `claude-host`, with the subagent id and its transcript path —
+        a failed run's too, whose transcript holds what it did before it failed."""
         from . import routes
         from .host import get_host
-        from .transcript import _munge, _projects_root
         host = get_host()
         name = name or self._generated_name("host")
         job = routes.agent_job(task, o)
-        self._registry_write(name, HOST_PROVIDER, host.session_id, "running", task_head=task)
+        queued = []
+
+        def row(status: str, sid=None, **extra) -> None:
+            if queued:     # a job the host never took has no host row (the call may fall back)
+                self._registry_write(name, HOST_PROVIDER, sid or host.session_id, status,
+                                     **extra)
+
+        def taken() -> None:
+            queued.append(True)
+            row("running", task_head=task)
+            if on_queued is not None:
+                on_queued()
         t0 = time.time()
         try:
-            res = await host.submit(job, deadline)
+            res = await host.submit(job, deadline, on_queued=taken)
         except asyncio.CancelledError:
-            self._registry_write(name, HOST_PROVIDER, host.session_id, "interrupted")
+            row("interrupted")
+            raise
+        except AgentFailed as e:
+            r = e.result
+            row("error", r.session_id if r else None, **(self._host_row(r, host) if r else {}))
             raise
         except BaseException:
-            self._registry_write(name, HOST_PROVIDER, host.session_id, "error")
+            row("error")
             raise
         r = routes.host_result(res, session_id=host.session_id, t0=t0, kind="agent")
-        extra = {}
-        if r.agent_id and r.session_id and host.host_cwd:
-            extra = {"agent_id": r.agent_id, "transcript": str(
-                _projects_root() / _munge(host.host_cwd) / r.session_id / "subagents"
-                / f"agent-{r.agent_id}.jsonl")}
-        self._registry_write(name, HOST_PROVIDER, r.session_id, "done", **extra)
+        self._registry_write(name, HOST_PROVIDER, r.session_id, "done",
+                             **self._host_row(r, host))
         return r
+
+    @staticmethod
+    def _host_row(r: AgentResult, host) -> dict:
+        """A host run's subagent id and transcript path, for its registry row."""
+        from .transcript import _munge, _projects_root
+        if not (r.agent_id and r.session_id and host.host_cwd):
+            return {}
+        return {"agent_id": r.agent_id, "transcript": str(
+            _projects_root() / _munge(host.host_cwd) / r.session_id / "subagents"
+            / f"agent-{r.agent_id}.jsonl")}
 
     def spawn(self, task: str, *, name: str | None = None, via: str = "auto",
               **kw) -> AgentHandle:
@@ -750,6 +778,9 @@ class _Agent:
         h = AgentHandle(self, name, HOST_PROVIDER, o.timeout)
         self._handles[name] = h
         audit.append("agent", name=name, task=task[:120], provider=o.provider, via="host")
+        # A handle is listed from its spawn, as a CLI child's is, not from when the host
+        # takes its job.
+        self._registry_update(h, "running", task_head=task)
 
         async def drive():
             try:

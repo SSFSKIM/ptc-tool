@@ -18,9 +18,12 @@ SystemSpec = str | Literal["claude_code"] | tuple[Literal["claude_code"], str]
 #: `llm()`'s system prompt since before profiles existed.
 LLM_SYSTEM = "Answer directly and concisely. No preamble."
 
-#: Short on purpose: every word is paid by every reader child, on every request.
-READER_SYSTEM = ("Investigate using only the tools given, and change nothing. Cite each "
-                 "file you rely on by its absolute path. End with your findings.")
+#: Short on purpose: every word is paid by every reader child, on every request. The
+#: citation is conditional because, stated flat, it outweighed a task's own reply format:
+#: 7 of 32 haiku readers told "Reply with the number only" added a citation paragraph (M3).
+READER_SYSTEM = ("Investigate using only the tools given, and change nothing. When the task "
+                 "names no reply format of its own, cite each file you rely on by its "
+                 "absolute path and end with your findings.")
 
 _MEMORY = ("global", "project", "both")
 _SETTINGS = ("none", "user", "all")

@@ -28,7 +28,10 @@ _SPAWNING = ("Agent", "Task", "Workflow")
 #: Host agent jobs are bounded even when nobody waits for them any more: an abandoned agent
 #: holds its slot until it ends, and only its turn limit ends it.
 DEFAULT_MAX_TURNS = 50
-MAX_TOKENS_CAP = 64_000          # `$.model.complete`'s own cap
+#: `$.model.complete`'s own cap. `llm()`'s `max_tokens=None` asks the host for the most the
+#: model gives under it, as the CLI route takes the CLI's own per-model cap; a larger
+#: explicit cap is the CLI's alone.
+MAX_TOKENS_CAP = 64_000
 
 SCHEMA_INSTRUCTION = ("Reply with one JSON value that validates against this JSON Schema, "
                       "and nothing else:\n")
@@ -68,11 +71,14 @@ def _plain(system) -> bool:
     return isinstance(system, str) and system != "claude_code"
 
 
-def llm_misfit(p: Profile) -> str | None:
+def llm_misfit(p: Profile, max_tokens: int | None = None) -> str | None:
     """Why the host cannot run this `llm()` call, or None. Its tools are `[]` and its
     settings `"none"` already: `llm()` refuses anything else."""
     if not _plain(p.system):
         return "a 'claude_code' system prompt (Claude Code's own, which the host lacks)"
+    if max_tokens is not None and max_tokens > MAX_TOKENS_CAP:
+        return (f"max_tokens={max_tokens:,}, past the host's {MAX_TOKENS_CAP:,}-token "
+                "completion cap")
     return None
 
 
@@ -143,7 +149,7 @@ def system_text(p: Profile, cwd: str) -> str:
     return "\n\n".join(t for t in (p.system, memory_text(p.memory, cwd)) if t)
 
 
-def complete_job(prompt: str, *, system: str, model: str, max_tokens: int,
+def complete_job(prompt: str, *, system: str, model: str, max_tokens: int | None,
                  effort: str | None) -> dict:
     return {"kind": "complete", "model": model, "system": system, "prompt": prompt,
             "maxTokens": max_tokens, "effort": effort}
@@ -170,8 +176,21 @@ def host_result(res: dict, *, session_id: str | None, t0: float, kind: str) -> A
 
 
 def check_max_tokens(n) -> None:
-    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= MAX_TOKENS_CAP:
-        raise ValueError(f"max_tokens must be an integer from 1 to {MAX_TOKENS_CAP}, got {n!r}")
+    if n is None:
+        return
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"max_tokens must be a positive integer or None, got {n!r}")
+
+
+def once(fn):
+    """`fn` as a callable that runs it on its first call only."""
+    done = []
+
+    def call():
+        if not done:
+            done.append(True)
+            fn()
+    return call
 
 
 # ---- structured output on the host ----------------------------------------------------------
@@ -206,7 +225,7 @@ def parse_reply(text: str, validator):
 
 
 async def complete_structured(prompt: str, *, system: str, schema: dict, deadline,
-                              **job_kw):
+                              on_queued=None, **job_kw):
     """`$.model.complete` has no structured output: ask for the JSON in the system prompt,
     validate the reply, retry once with the error, then fail carrying the last reply. M1's
     Q6 measured 0 of 100 replies needing the retry."""
@@ -216,7 +235,8 @@ async def complete_structured(prompt: str, *, system: str, schema: dict, deadlin
     asked = prompt
     for attempt in (1, 2):
         t0 = time.time()
-        res = await host.submit(complete_job(asked, system=system, **job_kw), deadline)
+        res = await host.submit(complete_job(asked, system=system, **job_kw), deadline,
+                                on_queued=on_queued)
         try:
             return parse_reply(res.get("text") or "", validator)
         except ValueError as e:

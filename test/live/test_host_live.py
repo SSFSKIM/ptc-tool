@@ -181,10 +181,9 @@ def test_32_reader_agents_run_on_the_host(host_kernel, tmp_path):
                                     for p, r in zip(paths, rs)]))
     """, timeout_s=600)
     rows = json.loads(re.search(r"RESULT (.*)", full_output("a2host", out)).group(1))
-    # The reply's leading number: READER_SYSTEM asks a reader to cite the files it used,
-    # and about a third of haiku's replies add that citation after the number.
-    wrong = [(p, ans, counts[p]) for p, ans, _, _ in rows
-             if (m := re.match(r"\s*(\d+)\b", ans)) is None or int(m.group(1)) != counts[p]]
+    # The whole stripped reply: the task names its reply format, so READER_SYSTEM's
+    # citation must not ride along (7 of 32 replies added it before the prompt said so).
+    wrong = [(p, ans, counts[p]) for p, ans, _, _ in rows if ans != str(counts[p])]
     assert all(via == "host" for _, _, via, _ in rows)
     time.sleep(3)              # the engine writes a subagent's last rows after its answer
     registry = {r["agent_id"]: r for r in json.loads(

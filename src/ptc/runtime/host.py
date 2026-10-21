@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ptc.paths import private_open, secure_dir
 
-from .agents import AgentFailed, AgentOpts, child_ptc_env
+from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
 from .state import STATE
 
 PROTOCOL = 1
@@ -269,11 +269,14 @@ class AgentHost:
         try:
             for d in (self._dir, self._in, self._out):
                 secure_dir(d)
+            # One bound over the launch and the hello: a `connect()` that never returns is
+            # as much a failed start as a host that never says hello.
+            start_by = time.monotonic() + self._start_s
             gen = await self._serve(self._n)
-            gen.proc = await self._launch(self._env(gen), self._cwd, self._plugin_dir)
+            gen.proc = await self._launched(gen, start_by)
             self._spawn(gen, self._watch(gen))
             try:
-                await asyncio.wait_for(asyncio.shield(gen.hello), self._start_s)
+                await asyncio.wait_for(asyncio.shield(gen.hello), max(0.0, _left(start_by)))
             except TimeoutError:
                 raise HostUnavailable(f"no hello within {self._start_s:g} s") from None
         except asyncio.CancelledError:
@@ -291,6 +294,28 @@ class AgentHost:
         gen.last_poll = time.monotonic()
         self._spawn(gen, self._lease(gen))
         self._gen = self._last = gen
+
+    async def _launched(self, gen: _Generation, start_by: float):
+        """The launched host process, or `HostUnavailable` once `start_by` passes. A launch
+        still running then is cancelled (its own cleanup closes what it opened) and waited
+        on for a bounded time; it stays in the host's tasks, so `close()` waits on it too."""
+        launching = self._spawn(None, self._launch(self._env(gen), self._cwd, self._plugin_dir))
+        try:
+            done, _ = await asyncio.wait({launching}, timeout=max(0.0, _left(start_by)))
+        finally:
+            if not launching.done():
+                launching.cancel()
+                await asyncio.wait({launching}, timeout=_TEARDOWN_S + 2)
+                if launching.done() and not launching.cancelled() \
+                        and launching.exception() is None:
+                    # it returned as it was cancelled: nothing else will close it
+                    try:
+                        await asyncio.wait_for(launching.result().close(), _TEARDOWN_S + 2)
+                    except Exception:    # noqa: BLE001 — teardown never masks the fault
+                        pass
+        if not done:
+            raise HostUnavailable(f"its launch did not return within {self._start_s:g} s")
+        return launching.result()
 
     def _env(self, gen: _Generation) -> dict:
         """The host's environment over the kernel's: M1's launch recipe."""
@@ -402,7 +427,7 @@ class AgentHost:
 
     # ---- jobs ---------------------------------------------------------------------------
 
-    async def submit(self, job: dict, deadline: float | None) -> dict:
+    async def submit(self, job: dict, deadline: float | None, *, on_queued=None) -> dict:
         """Run one job on the host and return its Result (`ok: true`).
 
         `deadline` is in `time.monotonic()`, `None` for none; it covers the start, the
@@ -410,6 +435,9 @@ class AgentHost:
         once; the job is cancelled in the host and keeps its slot until it ends there). A
         result that says it failed raises `AgentFailed`, as does the generation retiring
         under the job. A field the mod could not read is refused with `ValueError`.
+
+        `HostUnavailable` is raised only before the job is queued. `on_queued()`, when given,
+        is called once it is: from there on the job ran on the host, whatever happens next.
         """
         job = dict(job)
         jid = f"j-{uuid.uuid4().hex}"
@@ -438,17 +466,20 @@ class AgentHost:
         gen.jobs[jid] = j
         gen.queue.append(jid)
         gen.notify()
+        if on_queued is not None:
+            on_queued()
         try:
             res = await _until(deadline, lambda: asyncio.shield(j.future))
         except TimeoutError:
             if j.future.done() and not j.future.cancelled() and j.future.exception() is None:
-                return _outcome(j.future.result())    # it landed as the deadline passed
+                # it landed as the deadline passed
+                return _outcome(j.future.result(), gen.session_id)
             self._abandon(j)
             raise
         except asyncio.CancelledError:
             self._abandon(j)
             raise
-        return _outcome(res)
+        return _outcome(res, gen.session_id)
 
     def _encode(self, job: dict) -> tuple[str, list[Path]]:
         """The job's JSON as it rides a poll response, spilling its prompt and system to
@@ -664,7 +695,10 @@ class AgentHost:
         return 200, ({"ok": True, "late": True} if late else {"ok": True})
 
 
-def _outcome(res: dict) -> dict:
+def _outcome(res: dict, session_id: str | None) -> dict:
+    """The Result of a job that succeeded; a failed one raised. `AgentFailed` carries what
+    the failure left — the partial text, the subagent id its transcript is filed under —
+    as the CLI route's carries its partial and session id."""
     if res.get("ok"):
         return res
     reason = res.get("reason") or "error"
@@ -673,7 +707,9 @@ def _outcome(res: dict) -> dict:
         raise TimeoutError(f"the host job reached its deadline: {detail}".rstrip(": "))
     status = res.get("status")
     head = f"{reason}, status {status}" if status is not None else reason
-    raise AgentFailed(f"agent host job failed ({head})" + (f": {detail}" if detail else ""))
+    raise AgentFailed(f"agent host job failed ({head})" + (f": {detail}" if detail else ""),
+                      AgentResult(res.get("text") or "", session_id, None, None, None, 0,
+                                  via="host", agent_id=res.get("agentId")))
 
 
 def _check_fields(job: dict) -> None:

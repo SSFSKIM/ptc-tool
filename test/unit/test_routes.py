@@ -72,7 +72,8 @@ def test_llm_takes_the_host_under_auto(kernel, monkeypatch, cli):
             assert await llm_mod.llm("hi") == "echo:hi"
             [job] = launcher.mod.jobs
             assert job["kind"] == "complete" and job["model"] == "haiku"
-            assert job["system"] == LLM_SYSTEM and job["maxTokens"] == 4096
+            # None: the most a host completion takes, as the CLI route takes its own cap
+            assert job["system"] == LLM_SYSTEM and job["maxTokens"] is None
             assert job["effort"] is None and cli.calls == []
         finally:
             await h.close()
@@ -131,9 +132,47 @@ def test_an_unknown_via_is_refused(kernel, monkeypatch, cli):
 
 
 def test_max_tokens_is_checked(kernel, cli):
-    for bad in (0, 64_001, 1.5):
+    for bad in (0, -3, 1.5, True):
         with pytest.raises(ValueError, match="max_tokens"):
             asyncio.run(llm_mod.llm("x", max_tokens=bad))
+
+
+def test_an_explicit_max_tokens_caps_the_reply_on_both_routes(kernel, monkeypatch, cli):
+    """The CLI route takes it as the child's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, the host as
+    the completion's `maxTokens`; a cap the host cannot take sends the call to the CLI."""
+    async def main():
+        h, launcher = install_host(kernel, monkeypatch)
+        try:
+            await llm_mod.llm("a", max_tokens=500)
+            assert launcher.mod.jobs[-1]["maxTokens"] == 500
+            await llm_mod.llm("b", max_tokens=500, via="cli")
+            await llm_mod.llm("c", max_tokens=100_000)               # past 64,000: CLI
+            with pytest.raises(ValueError, match="via='host'.*64,000"):
+                await llm_mod.llm("d", max_tokens=100_000, via="host")
+            await llm_mod.llm("e", via="cli")
+        finally:
+            await h.close()
+    asyncio.run(main())
+    assert [(c[0], c[1].max_output_tokens) for c in cli.calls] == \
+        [("b", 500), ("c", 100_000), ("e", None)]
+
+
+def test_a_reply_cut_at_its_cap_fails_naming_the_cap(kernel, monkeypatch, cli):
+    """The CLI route ends a cut reply with an API error naming the cap; the mod reports a
+    cut as `max-tokens` in the same words, and the partial reply rides the failure."""
+    async def cut(mod, job):
+        return {"ok": False, "reason": "max-tokens", "text": "The sea is",
+                "detail": "API Error: Claude's response exceeded the 40 output token maximum."}
+
+    async def main():
+        h, _ = install_host(kernel, monkeypatch, launcher=FakeLauncher(handler=cut))
+        try:
+            with pytest.raises(AgentFailed, match="exceeded the 40 output token maximum") as ei:
+                await llm_mod.llm("x", max_tokens=40)
+            assert ei.value.result.text == "The sea is" and ei.value.result.via == "host"
+        finally:
+            await h.close()
+    asyncio.run(main())
 
 
 def test_a_host_that_does_not_start_sends_auto_to_the_cli_with_the_remainder(
@@ -455,10 +494,13 @@ def test_a_host_run_failure_surfaces_and_marks_its_row(kernel, monkeypatch, cli)
         h, _ = install_host(kernel, monkeypatch, launcher=FakeLauncher(handler=fail))
         try:
             ag = agent(kernel, cli)
-            with pytest.raises(AgentFailed, match="aborted"):
+            with pytest.raises(AgentFailed, match="aborted") as ei:
                 await ag.run("t", profile="reader")
+            assert ei.value.result.agent_id == "z" and ei.value.result.via == "host"
+            assert ei.value.result.session_id == "host-session"
             [row] = [x for x in ag.list() if x.get("provider") == "claude-host"]
-            assert row["status"] == "error"
+            assert row["status"] == "error" and row["agent_id"] == "z"
+            assert row["transcript"].endswith("/-fake-cwd/host-session/subagents/agent-z.jsonl")
         finally:
             await h.close()
     asyncio.run(main())
@@ -477,3 +519,39 @@ def test_a_run_timeout_on_the_host_is_a_timeout(kernel, monkeypatch, cli):
         finally:
             await h.close()
     asyncio.run(main())
+
+
+def test_a_call_is_audited_once_with_the_route_it_ran_on(kernel, monkeypatch, cli):
+    """A host whose generation dies while the call waits for a slot, and cannot start
+    again, sends the call to the CLI: the record says cli, once."""
+    async def main():
+        h, launcher = install_host(kernel, monkeypatch)
+        try:
+            await h.ensure_started()
+            real = h.submit
+
+            async def gone(job, deadline, **kw):
+                h._looped = "test"                    # the host is off from here on
+                raise HostUnavailable("crash-looped")
+            monkeypatch.setattr(h, "submit", gone)
+            assert await llm_mod.llm("fell") == "cli:fell"
+            assert (await agent(kernel, cli).run("fell too", profile="reader")).via == "cli"
+            monkeypatch.setattr(h, "submit", real)
+        finally:
+            await h.close()
+    asyncio.run(main())
+    rec = [json.loads(x) for x in (kernel / "audit.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["via"]) for r in rec] == [("llm", "cli"), ("agent", "cli")]
+
+
+def test_a_schema_call_is_audited_once_though_it_retries(kernel, monkeypatch, cli):
+    async def main():
+        h, _ = install_host(kernel, monkeypatch,
+                            launcher=FakeLauncher(handler=replies('{"n": "x"}', '{"n": 1}')))
+        try:
+            assert await llm_mod.llm("one", json_schema=SCHEMA) == {"n": 1}
+        finally:
+            await h.close()
+    asyncio.run(main())
+    rec = [json.loads(x) for x in (kernel / "audit.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["via"]) for r in rec] == [("llm", "host")]

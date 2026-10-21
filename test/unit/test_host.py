@@ -139,6 +139,50 @@ def test_no_hello_within_the_start_bound_fails_the_start(tmp_path):
     asyncio.run(main())
 
 
+def test_a_launch_that_never_returns_is_bounded_by_the_start_deadline(tmp_path):
+    """The start bound covers the launch too: a `connect()` that hangs fails the start
+    within `start_s` (and its cleanup is bounded), even for a call with no deadline, and
+    it counts toward the crash loop."""
+    async def main():
+        cleaned = []
+
+        async def stuck(env, cwd, plugin_dir):
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                cleaned.append(True)
+        h = make_host(tmp_path, stuck, start_s=0.2)
+        try:
+            for _ in range(3):
+                t = time.monotonic()
+                with pytest.raises(HostUnavailable, match="did not start.*0.2 s"):
+                    await h.submit(complete(), None)
+                assert time.monotonic() - t < 1.5
+            assert cleaned == [True, True, True]
+            assert not h.enabled()                   # three failed starts: the loop's
+        finally:
+            await h.close()
+    asyncio.run(main())
+
+
+def test_a_failed_result_carries_its_metadata(tmp_path):
+    async def failing(mod, job):
+        return {"ok": False, "reason": "aborted", "detail": "stopped", "agentId": "a9",
+                "text": "half"}
+
+    async def main():
+        h = make_host(tmp_path, FakeLauncher(handler=failing))
+        try:
+            with pytest.raises(AgentFailed) as ei:
+                await h.submit(agent_job(), soon(5))
+            r = ei.value.result
+            assert (r.agent_id, r.text, r.session_id, r.via) == ("a9", "half",
+                                                                 "host-session", "host")
+        finally:
+            await h.close()
+    asyncio.run(main())
+
+
 def test_concurrent_callers_share_one_start(tmp_path):
     async def main():
         launcher = FakeLauncher()
