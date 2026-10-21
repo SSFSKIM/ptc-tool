@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from ptc.paths import KEY_MAX, private_write_text, secure_dir
 
 from . import audit
+from .profiles import PRESETS, Profile, resolve
 from .state import STATE
 
 #: Teardown gets its own budget, separate from any call deadline. S1 measured a cancelled
@@ -36,6 +37,10 @@ _TEARDOWN_S = 30.0
 _INTERRUPT_DRAIN_S = 30.0
 
 _TERMINAL = ("done", "error", "interrupted")
+
+#: The provider a host agent's handle and registry row carry: Claude, run inside the
+#: kernel's agent host rather than as a process of its own.
+HOST_PROVIDER = "claude-host"
 
 #: Spec: ONE semaphore across agent/llm/web_search, not one pool per caller (two 8-permit
 #: pools would let 16 SDK-spawning calls run at once against an 8 cap). Module-level and
@@ -104,6 +109,13 @@ class AgentOpts:
     effort: str | None = None
     output_schema: dict | None = None
     timeout: float | None = None
+    #: What the child's prompt is made of (`profiles.py`), claude-only. `_Agent._opts`
+    #: stores it resolved, `system=`/`tools=` laid over it; `None` reads as the `full`
+    #: preset with this option set's own `system`/`tools`, which is today's child.
+    profile: Profile | str | None = None
+    #: `llm(max_tokens=)` on the CLI route: the child's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+    #: `llm()`'s alone — `agent.*` refuses it (`_Agent._opts`).
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -114,6 +126,12 @@ class AgentResult:
     cost_usd: float | None
     num_turns: int | None
     duration_ms: int
+    #: Which route ran it: "cli" (a `claude` process of its own) or "host" (inside the
+    #: kernel's agent host, `host.py`).
+    via: str = "cli"
+    #: A host agent's subagent id: its transcript is
+    #: `<host session>/subagents/agent-<agent_id>.jsonl` (`agent.list()` names the path).
+    agent_id: str | None = None
 
 
 class AgentFailed(RuntimeError):
@@ -266,6 +284,10 @@ class AgentHandle:
             # wait, and a close()/interrupt() landing in that window would otherwise turn
             # the intended refusal into an AttributeError on None (M2).
             session = self._session
+            if session is None and self.provider == HOST_PROVIDER:
+                raise RuntimeError(
+                    f"agent {self.name!r} ran on the agent host, whose agents take no "
+                    "follow-up turns; spawn it with via='cli' to send() to it")
             if session is None:
                 raise RuntimeError(f"agent {self.name!r} has no live session to send to")
             self._status = "running"
@@ -320,6 +342,10 @@ class AgentHandle:
         default). `transcript._resolve_path`'s glob is the fallback that covers a child
         given a different `cwd=` at spawn.
         """
+        if self.provider == HOST_PROVIDER:
+            raise NotImplementedError(
+                f"agent {self.name!r} ran on the agent host as a subagent of the host's own "
+                "session; its transcript is the `transcript` path agent.list() gives it")
         if self.provider != "claude":
             # A codex handle's session_id is a THREAD id whose turns live in a codex
             # rollout ($CODEX_HOME/sessions/**.jsonl), a different store in a different
@@ -504,9 +530,18 @@ class _Agent:
         provider = kw.pop("provider", "claude")
         if provider not in self._backends:
             raise ValueError(f"unknown provider {provider!r}; use one of {sorted(self._backends)}")
-        bad = set(kw) - set(AgentOpts.__dataclass_fields__)
+        bad = set(kw) - (set(AgentOpts.__dataclass_fields__) - {"max_output_tokens"})
         if bad:
             raise TypeError(f"unsupported agent options: {sorted(bad)}")
+        profile = kw.pop("profile", None)
+        if provider == "claude":
+            kw["profile"] = resolve(profile, default="full",
+                                    system=kw.get("system"), tools=kw.get("tools"))
+        elif profile is not None and resolve(profile, default="full") != PRESETS["full"]:
+            # Profiles shape a Claude child's prompt; a codex thread has no tool set or
+            # setting sources to shape, so accepting one would drop it silently.
+            raise ValueError(f"profiles are claude-only; provider {provider!r} takes "
+                             f"profile='full' or none, got {profile!r}")
         return AgentOpts(provider=provider, **kw)
 
     def _claim_name(self, name: str) -> None:
@@ -608,18 +643,95 @@ class _Agent:
         self._registry_write(h.name, h.provider, h.session_id, status, task_head, **extra)
 
     # -- public API ---------------------------------------------------------
-    async def run(self, task: str, **kw) -> AgentResult:
+    async def run(self, task: str, *, via: str = "auto", **kw) -> AgentResult:
+        """One turn to completion. `via` picks the route (`routes.py`): under `"auto"` a call
+        the agent host can serve — a plain system prompt, an explicit tool list, the
+        kernel's cwd, no output schema — runs there as a lean subagent; everything else,
+        `profile="full"` (the default) included, is a CLI child as before."""
+        from . import routes
         self._check_depth()
         o = self._opts(kw)
-        audit.append("agent", name=f"run-{o.provider}", task=task[:120], provider=o.provider)
-        return await self._guarded(
-            lambda: self._backends[o.provider].run_once(task, o), o.timeout)
+        deadline = routes.deadline_of(o.timeout)
+        route = await routes.settle(routes.choose(via, routes.agent_misfit(o)), via, deadline)
 
-    def spawn(self, task: str, *, name: str | None = None, **kw) -> AgentHandle:
+        def record(ran_on: str) -> None:
+            audit.append("agent", name=f"run-{o.provider}", task=task[:120],
+                         provider=o.provider, via=ran_on)
+        if route == "host":
+            from .host import HostUnavailable
+            try:
+                return await self._run_on_host(task, o, deadline,
+                                               on_queued=lambda: record("host"))
+            except HostUnavailable:
+                if via == "host":       # raised before the job was queued: nothing ran
+                    raise
+        record("cli")
+        return await self._guarded(
+            lambda: self._backends[o.provider].run_once(task, o), routes.remaining(deadline))
+
+    async def _run_on_host(self, task: str, o: AgentOpts, deadline,
+                           name: str | None = None, on_queued=None) -> AgentResult:
+        """One lean subagent on the host, with its registry row: `agent.list()` shows host
+        runs under provider `claude-host`, with the subagent id and its transcript path —
+        a failed run's too, whose transcript holds what it did before it failed."""
+        from . import routes
+        from .host import get_host
+        host = get_host()
+        name = name or self._generated_name("host")
+        job = routes.agent_job(task, o)
+        queued = []
+
+        def row(status: str, sid=None, **extra) -> None:
+            if queued:     # a job the host never took has no host row (the call may fall back)
+                self._registry_write(name, HOST_PROVIDER, sid or host.session_id, status,
+                                     **extra)
+
+        def taken() -> None:
+            queued.append(True)
+            row("running", task_head=task)
+            if on_queued is not None:
+                on_queued()
+        t0 = time.time()
+        try:
+            res = await host.submit(job, deadline, on_queued=taken)
+        except asyncio.CancelledError:
+            row("interrupted")
+            raise
+        except AgentFailed as e:
+            r = e.result
+            row("error", r.session_id if r else None, **(self._host_row(r, host) if r else {}))
+            raise
+        except BaseException:
+            row("error")
+            raise
+        r = routes.host_result(res, session_id=host.session_id, t0=t0, kind="agent")
+        self._registry_write(name, HOST_PROVIDER, r.session_id, "done",
+                             **self._host_row(r, host))
+        return r
+
+    @staticmethod
+    def _host_row(r: AgentResult, host) -> dict:
+        """A host run's subagent id and transcript path, for its registry row."""
+        from .transcript import _munge, _projects_root
+        if not (r.agent_id and r.session_id and host.host_cwd):
+            return {}
+        return {"agent_id": r.agent_id, "transcript": str(
+            _projects_root() / _munge(host.host_cwd) / r.session_id / "subagents"
+            / f"agent-{r.agent_id}.jsonl")}
+
+    def spawn(self, task: str, *, name: str | None = None, via: str = "auto",
+              **kw) -> AgentHandle:
+        """A handle on a live child. Under `"auto"` it is always a CLI child: a handle is
+        for `send()` follow-ups, which host agents cannot take. `via="host"` runs it on the
+        host anyway, as a handle that settles once and refuses `send()`."""
+        from . import routes
         self._check_depth()
         o = self._opts(kw)
+        route = routes.choose(via, routes.agent_misfit(o), spawn=True)
         name = name or self._generated_name("agent")
         self._claim_name(name)
+        if route == "host":
+            return self._spawn_on_host(task, name, o)
         h = AgentHandle(self, name, o.provider, o.timeout)
         self._handles[name] = h
         audit.append("agent", name=name, task=task[:120], provider=o.provider)
@@ -655,6 +767,39 @@ class _Agent:
                 h._status = "error"
                 self._registry_update(h, "error")
                 await h.close()            # tear down the CLI process tree (F6)
+                h._settle_exception(e)
+        h._driver = asyncio.ensure_future(drive())
+        return h
+
+    def _spawn_on_host(self, task: str, name: str, o: AgentOpts) -> AgentHandle:
+        from . import routes
+        from .host import get_host
+        deadline = routes.deadline_of(o.timeout)
+        h = AgentHandle(self, name, HOST_PROVIDER, o.timeout)
+        self._handles[name] = h
+        audit.append("agent", name=name, task=task[:120], provider=o.provider, via="host")
+        # A handle is listed from its spawn, as a CLI child's is, not from when the host
+        # takes its job.
+        self._registry_update(h, "running", task_head=task)
+
+        async def drive():
+            try:
+                await routes.settle("host", "host", deadline)
+                r = await self._run_on_host(task, o, deadline, name=name)
+                h._session_id_seen = r.session_id
+                h._status = "done"
+                h._settle_result(r)
+            except asyncio.CancelledError:
+                # A cancelled host job is cancelled in the host too (`AgentHost.submit`).
+                if h._status not in _TERMINAL and not h._interrupting:
+                    h._status = "interrupted"
+                    self._registry_update(h, "interrupted")
+                    h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))
+                raise
+            except Exception as e:  # noqa: BLE001 — surfaced through result()
+                h._status = "error"
+                h._session_id_seen = get_host().session_id
+                self._registry_update(h, "error")
                 h._settle_exception(e)
         h._driver = asyncio.ensure_future(drive())
         return h

@@ -1,0 +1,9 @@
+{
+  "name": "ptc-host",
+  "version": "1.0.0",
+  "description": "ptc's agent host: loaded only into the one headless claude a ptc kernel starts, it long-polls the kernel's channel and runs its model calls and lean subagents in that one process",
+  "author": {
+    "name": "SSFSKIM"
+  },
+  "license": "MIT"
+}

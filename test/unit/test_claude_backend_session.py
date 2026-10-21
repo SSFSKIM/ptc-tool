@@ -263,3 +263,46 @@ def test_bare_llm_strips_every_tool_whatever_the_caller_passed():
     reopen the set."""
     o = claude_backend._sdk_options(AgentOpts(tools=["Bash"]), bare_llm=True)
     assert o.tools == [] and o.max_turns == 1
+
+
+def test_run_once_surfaces_the_sdks_error_exit_as_a_failed_turn(monkeypatch):
+    """A one-shot `claude` that reports an is_error result then EXITS non-zero, and the SDK
+    raises its `ResultError` after yielding that result. Measured on 2.1.305: a reply cut at
+    its output cap (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`) ends exactly this way. The turn must
+    still surface as AgentFailed carrying the cap's text and the partial — the same shape
+    the host route raises for a cut reply — not as the SDK's process error."""
+    cut = ("API Error: Claude's response exceeded the 40 output token maximum. To configure "
+           "this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.")
+
+    async def fake_query(*, prompt, options):
+        yield AssistantMessage(content=[TextBlock(text="The sea is")], model="haiku")
+        yield _result(is_error=True, text=cut, terminal_reason="api_error")
+        raise claude_agent_sdk.ResultError(f"Claude Code returned an error result: {cut}",
+                                           data={"subtype": "success", "result": cut},
+                                           exit_code=1)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+    with pytest.raises(AgentFailed, match="exceeded the 40 output token maximum") as e:
+        asyncio.run(claude_backend.run_once("q", AgentOpts()))
+    assert e.value.result.text == "The sea is"
+    assert e.value.result.session_id == "sess-1"
+
+
+def test_run_once_lets_a_process_error_with_no_result_through(monkeypatch):
+    """A child that died before reporting any result has nothing to fold: the SDK's own
+    error is the only account of it."""
+    async def fake_query(*, prompt, options):
+        raise claude_agent_sdk.ProcessError("boom", exit_code=1)
+        yield  # pragma: no cover
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+    with pytest.raises(claude_agent_sdk.ProcessError):
+        asyncio.run(claude_backend.run_once("q", AgentOpts()))
+
+
+def test_an_output_cap_reaches_the_child_as_its_env():
+    """`llm(max_tokens=N)` on the CLI route caps the child's reply through the CLI's own
+    knob; unset, the child runs at its per-model default."""
+    env = claude_backend._sdk_options(AgentOpts(max_output_tokens=500), bare_llm=True).env
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "500"
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in claude_backend._sdk_options(AgentOpts()).env

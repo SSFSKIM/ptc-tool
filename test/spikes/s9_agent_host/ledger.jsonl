@@ -1,0 +1,17 @@
+{"at": "2026-10-20T19:28:06", "mode": "q1", "calls": 0, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q1-20261020-192738"}
+{"at": "2026-10-20T19:29:29", "mode": "q2", "calls": 2, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q2-20261020-192811", "note": "recount: 3 spawns refused before any subagent ran (no Agent tool), 0 requests each"}
+{"at": "2026-10-20T19:31:04", "mode": "q2", "calls": 6, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q2-20261020-193012"}
+{"at": "2026-10-20T19:31:32", "mode": "q2", "calls": 3, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q2-20261020-193104"}
+{"at": "2026-10-20T19:32:36", "mode": "q2", "calls": 5, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q2-20261020-193143", "note": "recounted from transcripts after they settled: 3 -> 5"}
+{"at": "2026-10-20T19:33:47", "mode": "q3", "calls": 16, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q3-20261020-193320"}
+{"at": "2026-10-20T19:34:21", "mode": "ramp-8", "calls": 8, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/ramp-8-20261020-193354"}
+{"at": "2026-10-20T19:35:34", "mode": "q5", "calls": 21, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q5-20261020-193445"}
+{"at": "2026-10-20T19:36:15", "mode": "q5", "calls": 1, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q5-20261020-193547"}
+{"at": "2026-10-20T19:40:22", "mode": "q7", "calls": 0, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q7-20261020-193621"}
+{"at": "2026-10-20T19:41:25", "mode": "q10", "calls": 6, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q10-20261020-194058"}
+{"at": "2026-10-20T19:41:52", "mode": "q10", "calls": 6, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q10-20261020-194126"}
+{"at": "2026-10-20T19:42:19", "mode": "q10", "calls": 6, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q10-20261020-194152"}
+{"at": "2026-10-20T19:43:31", "mode": "q8", "calls": 3, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q8-20261020-194236"}
+{"at": "2026-10-20T19:43:58", "mode": "q9", "calls": 4, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q9-20261020-194331"}
+{"at": "2026-10-20T19:46:00", "mode": "ramp-8-32-128-256", "calls": 636, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/ramp-8-32-128-256-20261020-194412"}
+{"at": "2026-10-20T19:46:37", "mode": "q6", "calls": 100, "dir": "/Users/new/Developer/GitHub/ptc-tool/.claude/worktrees/agent-host/test/spikes/s9_agent_host/out/q6-20261020-194610"}

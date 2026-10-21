@@ -150,7 +150,10 @@ host session id, every result header says so (`[keying: adapter-local]`).
 | PTC_HEAVY_MB / PTC_HEAVY_IDLE_MIN | 1024 / 30 | idle kernels at or over this footprint expire after this long (`0` MB disables) |
 | PTC_PRESSURE_MB / PTC_PRESSURE_IDLE_MIN | 512 / 5 | the same rule while macOS reports memory pressure (`0` MB disables) |
 | PTC_MEM_NOTE_MB | 512 | footprint at which result headers show the kernel's memory (`0` disables) |
-| PTC_MAX_CONCURRENCY | 8 | SDK-call semaphore |
+| PTC_MAX_CONCURRENCY | 8 | CLI-route semaphore: one `claude` process per child (`agent.*`, `llm(via="cli")`, `web_search`) |
+| PTC_HOST | auto | `off` disables the agent host, so every call takes the CLI route |
+| PTC_HOST_MAX_CONCURRENCY | 256 | host-route semaphore: `llm()` calls and lean `agent.run()` agents in flight inside the kernel's one agent host |
+| PTC_HOST_START_S | 30 | how long the host may take to start; a start that fails sends `via="auto"` calls to the CLI route |
 | PTC_MAX_DEPTH | 1 | agent recursion brake |
 | PTC_CODEX_INHERIT | unset | `1` lets Codex children see your `~/.codex` hooks, plugins and plugin-provided skills (the default `--disable hooks --disable plugins` removes all three); credential stripping from the codex child's environment is unconditional and this knob does not affect it |
 

@@ -49,6 +49,19 @@ def _reset_shared_semaphore():
 
 
 @pytest.fixture(autouse=True)
+def _no_agent_host(monkeypatch):
+    """No test reaches a real agent host by accident: `via="auto"` would start one (a real
+    `claude` process, real model calls) wherever `PTC_LAUNCHER` happens to be set. Tests of
+    the host build their own `AgentHost` with a fake launch, or delete this variable (the
+    live host suite); the kernels integration tests start inherit it too."""
+    from ptc.runtime import host
+    monkeypatch.setenv("PTC_HOST", "off")
+    host._reset_host()
+    yield
+    host._reset_host()
+
+
+@pytest.fixture(autouse=True)
 def _reap_kernels(tmp_path):
     """Kill every kernel a test spawned under its own PTC_HOME, however it ended.
 

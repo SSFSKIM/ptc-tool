@@ -9,6 +9,7 @@ import os
 import time
 
 from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
+from .profiles import PRESETS, Profile, memory_text, resolve
 from .state import STATE
 
 
@@ -24,13 +25,90 @@ def _child_env(o: AgentOpts) -> dict:
     T18 Decision Log). The codex backend faces the opposite problem (another vendor's
     binary has no business seeing those credentials) and builds its child env instead.
     """
-    return child_ptc_env(o)
+    return {**child_ptc_env(o), **NO_SESSION_TITLE}
+
+
+#: CLI 2.1.305 names an SDK-launched session with a second model request (~1,200 input
+#: tokens, `querySource: "generate_session_title"`) once its first prompt arrives: every
+#: child paid two requests for one turn. This variable latches the title off (the bundle's
+#: `Sfs()`, which also exempts a bare `claude -p` but not an SDK child). It does nothing
+#: else in a headless child but leave the process title alone.
+NO_SESSION_TITLE = {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"}
+
+
+#: How a profile's `settings` axis reaches the CLI.
+_SETTING_SOURCES = {"none": [], "user": ["user"], "all": ["user", "project", "local"]}
+
+#: Either one means the child can authenticate under `--bare`, which reads neither the
+#: keychain nor an OAuth login (CLI help; the agent-host spec's measurements).
+_BARE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+#: A child whose tool list names this server, or one of its tools, gets the ptc MCP server.
+_PTC_SERVER = "mcp__ptc"
+
+
+def _names_ptc(tool: str) -> bool:
+    return tool == _PTC_SERVER or tool.startswith(_PTC_SERVER + "__")
+
+
+def _wants_ptc(p: Profile) -> bool:
+    """Whether an `agent.*` child gets the ptc MCP server: with Claude Code's default tool
+    set (today's child), or when its explicit list names the server. `--tools` does not
+    filter MCP tools (measured on 2.1.305: `--tools Read,mcp__ptc__exec` still listed all
+    six `mcp__ptc__*`), so a server attached to an explicit list would add its ~2.5k tokens,
+    and `exec`, to every reader. Naming one of its tools attaches the whole server."""
+    return p.tools == "default" or any(_names_ptc(t) for t in p.tools)
+
+
+def _profile(o: AgentOpts) -> Profile:
+    """The option set's profile, resolved. `_Agent._opts` already resolved it for agent
+    calls; any other caller's `AgentOpts` (`llm()`, `web.py`, a test) gets the same rule."""
+    return resolve(o.profile, default="full", system=o.system, tools=o.tools)
+
+
+def _system_prompt(system, memory: str):
+    """The profile's system axis as the SDK's `system_prompt`, memory text appended."""
+    if isinstance(system, str) and system != "claude_code":
+        return "\n\n".join(t for t in (system, memory) if t)
+    append = system[1] if isinstance(system, tuple) else ""
+    append = "\n\n".join(t for t in (append, memory) if t)
+    preset = {"type": "preset", "preset": "claude_code"}
+    return {**preset, "append": append} if append else preset
+
+
+def _bare(p: Profile, tools, env: dict) -> bool:
+    """Whether the child runs `--bare`: settings off, a plain system prompt, NO tools, and
+    a credential in its environment.
+
+    `--bare` takes a settings-off `llm()` child from about 400 prompt tokens to about 60,
+    but it is not prompt trimming alone (measured on CLI 2.1.305): it cuts the default tool set to Bash, Edit and
+    Read, cuts any explicit list to its part of those three (`reader`'s Read/Grep/Glob
+    became Read), and replaces Claude Code's system prompt with a ~40-token stub. The one
+    child it cannot change is a plain-prompt child with no tools to cut. And it signs in
+    only from the environment, so without a credential there it would fail to start.
+
+    `env` is checked as the SDK will pass it — the kernel's environment with `env` laid
+    over it — and only for presence: it is never copied out, logged or audited (the trust
+    note in `_child_env`).
+    """
+    if p.settings != "none" or tools != [] or not isinstance(p.system, str) \
+            or p.system == "claude_code":
+        return False
+    return any((env[k] if k in env else os.environ.get(k)) for k in _BARE_CREDENTIALS)
 
 
 def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
                  bare_llm: bool = False):
     from claude_agent_sdk import ClaudeAgentOptions
     env = _child_env(o)
+    p = _profile(o)
+    if p != PRESETS["full"]:
+        # A profile's prompt is the same on both routes: the host runs with this too. `full`
+        # stays exactly today's child, git context included.
+        env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
+    if o.max_output_tokens is not None:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(o.max_output_tokens)
     kw: dict = dict(
         model=o.model,
         cwd=env["PTC_CWD"],
@@ -38,19 +116,20 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
         env=env,
         # S1: the default (None) loads the host user's settings, CLAUDE.md and HOOKS into
         # every child — measured 4.7x the cost of an isolated call, plus foreign hook
-        # execution inside our child. PTC configures children explicitly instead.
-        setting_sources=[],
+        # execution inside our child. PTC configures children explicitly instead, and a
+        # profile's `settings` axis is the only way back in.
+        setting_sources=list(_SETTING_SOURCES[p.settings]),
+        system_prompt=_system_prompt(p.system, memory_text(p.memory, env["PTC_CWD"])),
     )
-    if o.system:
-        kw["system_prompt"] = o.system
     if o.max_turns:
         kw["max_turns"] = o.max_turns
     if o.effort:
         kw["effort"] = o.effort
     if o.allowed_tools is not None:
         kw["allowed_tools"] = o.allowed_tools
-    if o.tools is not None:
-        kw["tools"] = o.tools
+    if p.tools != "default":
+        # ptc's names select its server (below); `--tools` takes the built-in set.
+        kw["tools"] = [t for t in p.tools if not _names_ptc(t)]
     if o.output_schema:
         kw["output_format"] = {"type": "json_schema", "schema": o.output_schema}
     if bare_llm:
@@ -59,8 +138,10 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
     else:
         # Children do not inherit --plugin-dir, so the ptc capability is passed explicitly.
         launcher = os.environ.get("PTC_LAUNCHER")
-        if launcher:
+        if launcher and _wants_ptc(p):
             kw["mcp_servers"] = {"ptc": {"type": "stdio", "command": launcher}}
+    if _bare(p, [] if bare_llm else p.tools, env):
+        kw["extra_args"] = {"bare": None}
     if resume:
         kw["resume"] = resume
         kw["fork_session"] = fork
@@ -154,12 +235,19 @@ def _fold(messages: list, o: AgentOpts, t0: float) -> tuple[AgentResult, str | N
 
 async def run_once(task: str, o: AgentOpts, *, resume: str | None = None,
                    fork: bool = False, bare_llm: bool = False) -> AgentResult:
-    from claude_agent_sdk import query
+    from claude_agent_sdk import ResultError, query
     t0 = time.time()
     msgs = []
-    async for m in query(prompt=task, options=_sdk_options(o, resume=resume, fork=fork,
-                                                           bare_llm=bare_llm)):
-        msgs.append(m)
+    try:
+        async for m in query(prompt=task, options=_sdk_options(o, resume=resume, fork=fork,
+                                                               bare_llm=bare_llm)):
+            msgs.append(m)
+    except ResultError:
+        # A one-shot CLI that reported a failed result then exits non-zero on purpose, and
+        # the SDK raises for the exit after yielding that result (a reply cut at its output
+        # cap ends this way). The result already says what failed: fold it below.
+        if not any(type(m).__name__ == "ResultMessage" for m in msgs):
+            raise
     r, failure = _fold(msgs, o, t0)
     if failure:
         raise AgentFailed(failure, r)

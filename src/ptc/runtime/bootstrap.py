@@ -387,7 +387,20 @@ async def _release_backends() -> None:
             except Exception:               # noqa: BLE001 — teardown never raises
                 pass
 
-    await asyncio.gather(*(release(h) for h in handles), return_exceptions=True)
+    async def release_host() -> None:
+        # The agent host is one more child of this kernel: closing it fails its in-flight
+        # jobs and stops its process (`AgentHost.close`). Only a host that was ever asked
+        # for exists, and none is created here just to be closed.
+        from .host import current_host
+        host = current_host()
+        if host is not None:
+            try:
+                await host.close()
+            except Exception:               # noqa: BLE001 — teardown never raises
+                pass
+
+    await asyncio.gather(release_host(), *(release(h) for h in handles),
+                         return_exceptions=True)
 
 
 def _release_backends_now(budget: float = _BACKEND_RELEASE_S) -> None:

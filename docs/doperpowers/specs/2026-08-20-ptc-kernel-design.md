@@ -336,6 +336,13 @@ mechanics (first-line rule; each `%%bash` is a throw-away subshell; `%cd` + `os.
 
 ### Agents
 
+> Since v0.6.0 (`docs/doperpowers/specs/2026-10-20-agent-host-design.md`): `agent.*` take
+> `profile=` and `via=`. Under `"auto"`, an `agent.run()` whose profile names its tools runs
+> as a lean subagent inside the kernel's one agent host, not as a CLI process; the default
+> profile (`full`), `spawn`, `fork` and `resume` stay on the CLI route described here. Below,
+> that spec changes the concurrency and one backend rule: a CLI child gets the ptc MCP server
+> only with Claude Code's default tool set or an explicit list naming `mcp__ptc`.
+
 ```python
 await agent.run(task, *, provider="claude",           # "claude" | "codex"
                 model=None, system=None, allowed_tools=None,
@@ -439,6 +446,11 @@ agent.resume(session_id, **options) -> AgentHandle
   so this is the only place the relation is recoverable from disk.
 
 ### Sub-LM calls
+
+> Since v0.6.0 (`docs/doperpowers/specs/2026-10-20-agent-host-design.md`): `llm()` takes
+> `profile=` (default `bare`), `via=`, `max_tokens=` and `effort=`, and under `"auto"` it is
+> one `$.model.complete` inside the kernel's agent host rather than an SDK `query()` per
+> call; the `query()` below is its CLI route.
 
 ```python
 await llm(prompt, *, model="haiku", system=None, json_schema=None,
@@ -654,7 +666,10 @@ recorded as a residual, not shipped.
 | `PTC_HOME` | `~/.ptc` | root for venv/kernels/run |
 | `PTC_SESSION` | — | session key override; set on kernel + children |
 | `PTC_DEPTH` / `PTC_MAX_DEPTH` | `0` / `1` | agent-spawn depth guard |
-| `PTC_MAX_CONCURRENCY` | `8` | SDK-subprocess semaphore |
+| `PTC_MAX_CONCURRENCY` | `8` | CLI-route semaphore: one `claude` process per child |
+| `PTC_HOST` | `auto` | `off` disables the agent host; `via="auto"` then always means the CLI route (`2026-10-20-agent-host-design.md`) |
+| `PTC_HOST_MAX_CONCURRENCY` | `256` | host-route semaphore: jobs in flight inside the kernel's one agent host |
+| `PTC_HOST_START_S` | `30` | the host's start deadline (launch and `/hello`); a failed start counts toward the crash loop |
 | `PTC_YIELD_S` | `300` | default `exec`/`wait` timeout_s |
 | `PTC_MAX_OUTPUT_CHARS` | `12000` | default result cap |
 | `PTC_IDLE_HOURS` | `24` | kernel self-reap (the TTL qualifying all persistence promises) |
@@ -2437,6 +2452,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-10-20 (agent host and prompt profiles, v0.6.0): under `via="auto"`, `llm()` and an `agent.run()` with an explicit tool list run inside one long-lived headless `claude` per kernel, the agent host (`PTC_HOST`, `PTC_HOST_MAX_CONCURRENCY` 256, `PTC_HOST_START_S` 30), instead of a CLI process each. Every child's prompt comes from a profile (`profile=`; presets `bare`, `reader`, `worker`, `full`). A host `llm()` costs 34 prompt tokens and no process, and a host reader about 3.4 k. Changes for today's CLI-route callers: an `agent.*` child with an explicit tool list no longer gets the ptc MCP server, and one that needs its own kernel names `mcp__ptc`, which enforces v0.5.4's doctrine and is not a new contract. `run_once` now folds the SDK's `ResultError` into `AgentFailed`, which changes every `is_error` one-shot (max turns, a rate limit, a cut reply) from the SDK's process error to `AgentFailed` with the partial result. No CLI child makes the engine's session-title request (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), which was a second request of about 1,200 tokens per child. `llm()` takes `max_tokens=` (default: the model's own cap); on the host a longer reply with no cap fails as `AgentFailed`, and a cap above 64,000 runs on the CLI. Design, measurements, acceptance and the ship entry: `docs/doperpowers/specs/2026-10-20-agent-host-design.md`.
 
 - 2026-10-20 (SDK bump, v0.5.5): `claude-agent-sdk` pinned at 0.2.169, whose bundled Claude Code 2.1.305 replaces 2.1.237 for every Claude child, so `model="opus"` works again (the API refuses claude-opus-5-5 below CLI 2.1.280). No PTC code changed: the SDK's message types and the CLI argv PTC's options build are the same in both versions. The Decision Log entry carries the review of what changed and the suite record.
 

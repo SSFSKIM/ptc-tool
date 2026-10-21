@@ -421,3 +421,18 @@ def test_web_search_still_returns_an_empty_list_for_a_genuine_zero_result(monkey
     _install_query(monkeypatch, [_terminal()])
 
     assert asyncio.run(web.web_search("anything")) == []
+
+
+def test_web_search_child_asks_for_no_session_title(monkeypatch, tmp_path):
+    """Its child is a CLI process like any other: no second request to name its session."""
+    import claude_agent_sdk
+    STATE.kernel_dir = tmp_path
+    STATE.config = {"key": "k", "max_concurrency": 8}
+    seen = []
+
+    async def fake_query(*, prompt, options):
+        seen.append(options)
+        yield _terminal()
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    asyncio.run(web.web_search("anything"))
+    assert seen[0].env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] == "1"
