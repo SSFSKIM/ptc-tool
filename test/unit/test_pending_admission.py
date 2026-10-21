@@ -104,7 +104,16 @@ class _Killed(BaseException):
     """Stands in for the adapter dying between the send and the exception handler."""
 
 
-class _FakeKC:
+class _ShellResponsive:
+    def kernel_info(self):
+        return "shell-probe"
+
+    def get_shell_msg(self, timeout):
+        return {"msg_type": "kernel_info_reply",
+                "parent_header": {"msg_id": "shell-probe"}}
+
+
+class _FakeKC(_ShellResponsive):
     """A kernel client whose execute() records what is on disk at the instant of the send
     and then never returns — the shape of a SIGKILL landing inside the wire window."""
 
@@ -166,7 +175,7 @@ def test_a_marker_that_cannot_be_written_aborts_the_submission(monkeypatch, tmp_
 
 # --- r5 finding 1: a stale submitter never marks the REPLACEMENT epoch ----------------
 
-class _RestartingKC:
+class _RestartingKC(_ShellResponsive):
     """A kernel client that is replaced mid-flight: the request goes out, the key is
     restarted under a new incarnation, and only then does the submitter come back to
     refresh its marker — the shape of restart() landing inside an exec's wire window."""
@@ -218,7 +227,7 @@ def test_a_stale_submitter_never_marks_the_replacement_epoch(monkeypatch, tmp_pa
 
 # --- r8 finding 1: the marker names the kernel the request actually reached -----------
 
-class _EpochBoundKC:
+class _EpochBoundKC(_ShellResponsive):
     """A connection that remembers WHICH incarnation's ports it opened, and records the
     marker standing on disk at the instant the request goes out on them."""
 
@@ -403,7 +412,7 @@ def test_an_unreadable_identity_keeps_a_running_cell_busy(monkeypatch, tmp_path)
 
 # --- r13 finding 2: the SUB handshake losing the race must not wedge the key -----------
 
-class _SilentIopubKC:
+class _SilentIopubKC(_ShellResponsive):
     """A connection whose iopub never delivers.
 
     That is the ZeroMQ subscription race, not a fault: `start_channels()` returns before
@@ -416,10 +425,9 @@ class _SilentIopubKC:
     def __init__(self, key: str, cell_id: int):
         self._kd = kernel_dir(key)
         self._cell_id = cell_id
-        self.ready_waits = 0
 
     def wait_for_ready(self, timeout=None):
-        self.ready_waits += 1
+        raise RuntimeError("Kernel didn't respond in 20 seconds")
 
     def execute(self, code, **kw):
         cells = self._kd / "cells"
@@ -443,6 +451,8 @@ def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_p
     nothing can ever discharge while the kernel lives, so every later submission was Busy
     until a restart. The id is on disk too, and the submit lock is held for this whole
     window, so an id NEWER than the one standing there before the send can only be ours.
+    Requiring Jupyter's IOPub handshake as well defeats that independence: under load
+    it can time out even though the disk witness makes submission safe.
     """
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
     kd = _live_kernel("p20")
@@ -454,7 +464,6 @@ def test_a_cell_id_missed_on_iopub_is_still_learned_from_disk(monkeypatch, tmp_p
     out = KernelClient("p20").exec_cell("1 + 1", 5.0, Config.from_env(env={}))
 
     assert isinstance(out, Completed) and out.cell_id == 7, f"the id was never learned: {out}"
-    assert kc.ready_waits == 1, "the submission never waited for the subscription handshake"
     assert not (kd / "cells" / "pending.json").exists(), "an undischargeable marker was left"
     assert KernelClient("p20").is_busy() is None, "the key stayed busy for good"
 
@@ -504,3 +513,68 @@ def test_the_bootstrap_client_synchronizes_before_it_sends(monkeypatch, tmp_path
 
     assert kc.calls == ["ready", "execute"], \
         f"the bootstrap cell went out on an unsynchronized connection: {kc.calls}"
+
+
+@pytest.mark.parametrize("delay", [16, 21])
+def test_delayed_shell_dispatch_is_confirmed_before_marking_a_submission(monkeypatch,
+                                                                        tmp_path, delay):
+    """Without a pre-send shell probe, 16 s of scheduler delay exhausts the 15 s
+    cell-id wait and leaves an unidentified marker that late completion cannot clear."""
+    from types import SimpleNamespace
+    from queue import Empty
+    from ptc import client
+
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("slow-shell")
+    clock = [0.0]
+    monkeypatch.setattr(client, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], time=time.time,
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+    class SlowShell(_SilentIopubKC):
+        def kernel_info(self):
+            return "shell-probe"
+
+        def get_shell_msg(self, timeout):
+            assert not (kd / "cells" / "pending.json").exists()
+            clock[0] += min(timeout, max(0, delay - clock[0]))
+            if clock[0] < delay:
+                raise Empty
+            return {"msg_type": "kernel_info_reply",
+                    "parent_header": {"msg_id": "shell-probe"}}
+
+        def execute(self, code, **kwargs):
+            if clock[0] < delay:
+                return "m-race"  # queued, not yet dispatched: no disk witness
+            return super().execute(code, **kwargs)
+
+        def get_iopub_msg(self, timeout):
+            clock[0] += timeout
+            raise Empty
+
+    connection = SlowShell("slow-shell", 1)
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: connection)
+    if delay > 20:
+        with pytest.raises(TimeoutError, match="shell did not respond"):
+            KernelClient("slow-shell").exec_cell("print('hi')", 30, Config.from_env(env={}))
+    else:
+        out = KernelClient("slow-shell").exec_cell("print('hi')", 30, Config.from_env(env={}))
+        assert isinstance(out, Completed) and out.output == "hi\n"
+    assert not (kd / "cells" / "pending.json").exists()
+    assert KernelClient("slow-shell").is_busy() is None
+
+
+def test_an_absent_owner_never_receives_an_unidentified_pending_marker(monkeypatch,
+                                                                      tmp_path):
+    """A restart leaves old connection.json behind after removing owner/ready.
+    None == None must not accept those ports and mark a replacement's fresh cells/."""
+    monkeypatch.setenv("PTC_HOME", str(tmp_path))
+    kd = _live_kernel("no-owner")
+    (kd / "owner.json").unlink()
+    (kd / "ready").unlink()
+    marker = kd / "cells" / "pending.json"
+    connection = _FakeKC(marker)
+    monkeypatch.setattr(KernelClient, "_connect", lambda self, **kw: connection)
+    with pytest.raises(RuntimeError, match="owner"):
+        KernelClient("no-owner").exec_cell("print('hi')", 30, Config.from_env(env={}))
+    assert not marker.exists()
