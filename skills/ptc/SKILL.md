@@ -180,10 +180,11 @@ child — an output style's mod has rewritten a child's reply — so no preset u
 
 The same holds when you run `claude -p` yourself through `bash(...)`, where nothing is
 stripped for you: the host's settings, CLAUDE.md, plugins, MCP servers and every tool load
-(23 786 tokens for the same one-word reply). Pass `--setting-sources ""`,
-`--strict-mcp-config`, `--disable-slash-commands`, `--no-session-persistence`, `--tools ""`
-(or the exact names) and a `--system-prompt` of your own — 368 tokens. `--bare` on top also
-skips hooks, LSP and keychain reads (53 tokens), but it signs in only from the environment
+(29 291 tokens for the same one-word reply on the machine measured). Pass
+`--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`,
+`--no-session-persistence`, `--tools ""` (or the exact names) and a `--system-prompt` of
+your own — 379 tokens. `--bare` on top also skips hooks, LSP and keychain reads (52
+tokens), but it signs in only from the environment
 (`ANTHROPIC_API_KEY`, a gateway's `ANTHROPIC_AUTH_TOKEN`, or an `apiKeyHelper` passed with
 `--settings`) and cuts any tool list to its share of Bash, Edit and Read.
 

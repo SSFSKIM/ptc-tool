@@ -33,7 +33,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) M1 — spike: host feasibility. Verdict: Promote (Decision Log), 823 of 850 haiku calls.
 - [x] (2026-10-20) M2 — prompt profiles on the CLI route (3777674, fix 3e554d5; review clean).
 - [x] (2026-10-20) M3 — the host route (22e4c1b, 17ddb4e, fix be5003b; review clean). 335 of 400 haiku calls.
-- [ ] M4 — doctrine, acceptance, ship.
+- [x] (2026-10-20) M4 — doctrine, acceptance, ship (v0.6.0).
 - [ ] Whole-branch review (review-code, high).
 - [ ] Outcomes & Retrospective.
 
@@ -1013,17 +1013,121 @@ are in `ledger.jsonl` beside the driver.
   of 64 transcripts carry a title, and the titled ones bill up to 1,239 input tokens
   against a 63-token request. So a CLI `llm()` costs about 1,200 input tokens and two
   requests, not 61 and one, and the host route makes no title call (its jobs are not
-  sessions). The engine's switch for it was not looked for. Every CLI-route call count in
-  this spec, M4's included, is low by about one call per CLI child.
-- Observation (M4): the acceptance run spent **247 haiku calls** of its 300, by the
-  count below (the run then took 64 more for acceptance 2's rerun: 311, or about 384
-  with the title calls above — 73 titled CLI sessions): acceptance 1
+  sessions). Every CLI-route call count in this spec before this entry is low by about one
+  request per CLI child.
+- Observation (M4, the title's gate): in the 2.1.305 bundle a headless session's title
+  state starts latched when the conversation already has messages or `Sfs()` holds, and
+  `Sfs() = Ct() || CLAUDE_CODE_DISABLE_TERMINAL_TITLE || (CLAUDE_CODE_ENTRYPOINT ===
+  "sdk-cli" && !CLAUDE_AGENT_SDK_VERSION && !CLAUDE_CODE_REMOTE_SESSION_ID &&
+  tengu_quizzical_thimble)`, where `Ct()` is `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`'s
+  essential-traffic mode. An unlatched session titles itself from its first real user
+  message (`rQo` → `Lt` → `gbe`, `querySource: "generate_session_title"`). So a bare
+  `claude -p` (entrypoint `sdk-cli`, no SDK variable) skips the title, and an SDK child —
+  the Python SDK sets `CLAUDE_AGENT_SDK_VERSION` — makes it. Persistence does not decide
+  it: `--no-session-persistence` only changes whether the title is saved, and the call
+  runs either way. The bridge does not either: `CLAUDE_CODE_REMOTE_SESSION_ID` only narrows
+  the `sdk-cli` exemption and is unset here. `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` is a
+  boolean variable (`H.bool()`), and the only other effects it has are on the terminal's
+  title, which a headless child does not draw.
+- Observation (M4, the fix, proved): with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` in every
+  CLI child's environment, the `--bare` `llm()` floor test made **one** gateway request
+  (session in `pytest-2569`) where the same test made two before (`pytest-2565`), and its
+  transcript has no `ai-title` row. The first request is unchanged, at 61 tokens.
+- Observation (M4, `claude -p` on 2.1.305, the bundled binary, `--model haiku`, "Reply
+  with exactly: OK"): plain `claude -p` from this machine's shell **29,291** prompt tokens
+  (the user's settings, CLAUDE.md, plugins, MCP servers, output style, and deferred tools);
+  with `--setting-sources "" --strict-mcp-config --disable-slash-commands
+  --no-session-persistence --tools "" --system-prompt "Answer directly."` **379**; with
+  `--bare` added **52**. One gateway request each, as `Sfs()` predicts. v0.5.4's figures
+  were 23,786, 368 and 53 on 2.1.237.
+- Observation (M4, request totals from the gateway log,
+  `~/Library/Application Support/ClaudeUsage/gateway-requests*.jsonl`). Requests are
+  matched by session id to the test transcripts under `~/.claude/projects/`, and a host
+  session is added when it ran inside a test's window (it leaves no transcript of its own
+  for completions). **M4: 397 requests**:
+  - acceptance 1: 128 CLI and 64 host;
+  - acceptance 2: 64, then 64 for the rerun;
+  - acceptance 3 and the `full` floor: 8 in each of two runs;
+  - acceptance 4: 34; acceptance 5: 1; acceptance 6: 4;
+  - the host floors: 2;
+  - `test_llm_live`: 10, and `test_agents_live`: 6;
+  - the `claude -p` re-measure: 3, and the fix's proof: 1.
+
+  **M3: about 408.** That is 303 from transcripts (runs `pytest-2532`–`2537`), 99 from
+  hosts and 6 from `/tmp/ptc-*`, against the 335 calls M3 reported. **M2: 52 matched**
+  (`pytest-2506`, `2507`, `2515` and 24 from `/tmp/ptc-*`). Five more SDK sessions of two
+  requests each ran inside M2's window with no transcript the match finds. With them M2
+  comes to about 62, against M2's reported ~44. The 2.1.305 `sdk-py` traffic between 02:00
+  and 04:00 UTC that no test session claims is M1's spike, whose hosts and drivers ran
+  outside pytest. Its ledger (823) counted host requests directly and made almost no CLI
+  calls.
+- Observation (M4): the acceptance run's first count, **247 haiku calls** of its 300,
+  made before the title requests were known (the gateway totals above replace it): acceptance 1
   128, acceptance 2 64 (counted from transcripts), acceptance 3 and the `full` floor 8 (two
   runs), the
   host floors 2, acceptance 4 at most 34, acceptance 5 1, acceptance 6 2, `test_llm_live`
   5 and `test_agents_live` 3; the channel tests make none.
 
 ## Decision Log
+
+- Decision: **v0.6.0 shipped** (`.claude-plugin/plugin.json`, `marketplace.json`). It
+  carries the agent host and prompt profiles:
+  - `via=` on `llm()` and `agent.*`;
+  - `profile=` with the presets `bare`, `reader`, `worker` and `full`;
+  - one host per kernel, configured by `PTC_HOST`, `PTC_HOST_MAX_CONCURRENCY` (256) and
+    `PTC_HOST_START_S` (30);
+  - `llm(max_tokens=, effort=)`.
+
+  The doctrine (the skill's "Fan-out rules" and "Sub-LM map-reduce", README
+  "Configuration", and the kernel spec's configuration table and pointers) teaches the
+  routes, the profiles and the re-measured floors. What changes for a caller who touches
+  none of the new options, on the CLI route they already use:
+  1. An `agent.*` child with an explicit tool list no longer gets the ptc MCP server; a
+     child that needs its own kernel names `mcp__ptc`. This enforces v0.5.4's own doctrine
+     ("exactly the tools its task needs"), whose 2,776-token reader was measured outside a
+     kernel; it is not a new contract.
+  2. `run_once` folds the SDK's `ResultError` into `AgentFailed`. Every one-shot whose
+     result is `is_error` (max turns, a rate limit, a reply cut at its cap) raises
+     `AgentFailed` carrying the partial result, where it raised the SDK's process error.
+  3. Under `"auto"`, `llm()` and an `agent.run()` with an explicit tool list run on the
+     host. Every non-`full` CLI profile runs with git instructions off. `llm()` runs
+     `--bare` when a credential is in the environment.
+  4. No CLI child makes the engine's session-title request any more, which halves a CLI
+     `llm()`'s requests.
+  5. `llm()`'s cap is the model's own (`max_tokens=None`). On the host a reply over 64,000
+     tokens with no cap fails loudly as `AgentFailed` with the partial text, and
+     `max_tokens` above 64,000 runs on the CLI.
+
+  Acceptance 1–7 pass. Acceptance 2 passed on the rerun, after the fixture fix; the record
+  is in Surprises & Discoveries. Suites: unit 726, integration 68 plus 1 load flake (it
+  passed 3/3 on rerun; friction tracker #4), and the live suites as recorded. Deferred as
+  tech debt:
+  - the hard-kill residual;
+  - the 64k–128k difference;
+  - the fork `DeprecationWarning`;
+  - the schema retry's double audit record;
+  - the spike plugin's manifest warnings.
+
+  Date/Author: 2026-10-20, M4 task-executor.
+- Decision: Every CLI child runs with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`
+  (`claude_backend.NO_SESSION_TITLE`, set in `_child_env`). That covers `full`, `spawn`,
+  `fork` and `resume`. `web_search`'s child now takes its environment from `_child_env`
+  too. Pinned by `test_no_cli_child_asks_for_a_session_title` and
+  `test_web_search_child_asks_for_no_session_title`. Rationale:
+  - The author ruled that the title request be turned off at the engine's switch.
+  - This variable is the narrow switch: in a headless child it gates only the title and
+    the terminal's own title.
+  - The alternatives lost. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` latches the title
+    too, but turns off more besides. The SDK sets `CLAUDE_AGENT_SDK_VERSION`, which is what
+    keeps SDK children out of `claude -p`'s exemption, and PTC cannot unset it.
+  - The bridge and persistence were ruled out (Surprises & Discoveries).
+
+  Date/Author: 2026-10-20, M4 task-executor, on doperpowers-15's ruling.
+- Decision: Acceptance 2's fixture labels its lines from 1 (d0214ec). Labelled from 0, the
+  last line of a 29-line file read `29\tline 28`, and a haiku reader answered 28. The
+  check is meant to test the host readers, not haiku against a lure. Approved by the
+  author, with one rerun (32/32).
+  Date/Author: 2026-10-20, M4 task-executor, approved by doperpowers-15.
 
 - Decision: M3's fix wave, accepted by the author.
   - `llm(max_tokens=None)` sends the host `maxTokens: null`, which the mod asks as 64,000
