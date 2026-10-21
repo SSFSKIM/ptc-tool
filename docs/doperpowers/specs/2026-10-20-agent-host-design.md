@@ -30,7 +30,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) SDK pin to `claude-agent-sdk==0.2.169` (bundled CLI 2.1.305) shipped on `main` as v0.5.5 (5a6bca7), merged into this branch at 1f50755.
 - [x] (2026-10-20) Spec review, round 1: adversarial design review and buildability review, both folded in (Decision Log).
 - [x] (2026-10-20) Spec review, round 2 on the round-1 fixes: folded in (Decision Log).
-- [ ] M1 — spike: host feasibility.
+- [x] (2026-10-20) M1 — spike: host feasibility. Verdict: Promote (Decision Log), 823 of 850 haiku calls.
 - [ ] M2 — prompt profiles on the CLI route.
 - [ ] M3 — the host route.
 - [ ] M4 — doctrine, acceptance, ship.
@@ -786,7 +786,181 @@ async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=3
   Evidence: `claude --version` → `2.1.305`; `claude_agent_sdk/_cli_version.py` in
   0.2.142 → `2.1.237`, in 0.2.169 → `2.1.305`.
 
+M1's answers follow (2026-10-20, SDK 0.2.169, bundled CLI 2.1.305, haiku, the
+MacBook). The spike is `test/spikes/s9_agent_host/`. Each run wrote
+`out/<mode>-<stamp>/report.json` and the host's debug log there (gitignored). The calls
+are in `ledger.jsonl` beside the driver.
+
+- Observation (Q1): the mod loads and `session.start` fires in an SDK-started headless
+  CLI with no first query. `connect()` alone is enough.
+  Evidence: `drive.py --q 1` gave `first_query=None hello=True start_s=0.82`. The
+  `/hello` body carried `engine: "2.1.305"`, and the debug log reads `hooks module
+  ptc-host@inline loaded … events: session.start,turn.complete,agent.offer,turn.step,tool.call`.
+  No model call was made.
+- Observation (Q2): `$.agent.spawn` runs a lean subagent to its `turn.complete` with no
+  main-loop turn, but only if the host's main loop has the `Agent` tool. The spawn goes
+  through that tool (`$.tool.call (ptc-host): Agent (prompt, description,
+  run_in_background, model, subagent_type, cwd)` in the debug log). With main-loop
+  `tools=[]`, or `["Read","Grep","Glob"]`, every spawn failed with `$.tool.call: no tool
+  named "Agent" in this session`.
+- Observation (Q2): a type's tool list is intersected with the main loop's tools, so the
+  main loop must list every tool a type may name. With main-loop tools `Agent` alone, a
+  type naming Read/Grep/Glob was offered only `['Grep', 'Glob']`: Read was silently
+  dropped. With the main loop's default tools (`tools=None`, 24 listed) or
+  `Agent,Read,Grep,Glob`, the type was offered exactly `['Read', 'Grep', 'Glob']`.
+  Evidence: the `api-request-shape` row of each subagent transcript records the tools the
+  request offered (`q2-20261020-193012`, `q2-20261020-193143`).
+- Observation (Q2, floor): the reader-shaped type's first request costs **3,404** prompt
+  tokens outside git and **3,996** in a git cwd. With `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
+  in the host's environment it costs **3,604** in a git cwd. Measured by `drive.py --q 10`
+  (one type part changed per job, prompt "Reply with exactly: OK", one request each).
+  The breakdown outside git:
+  - **812**: the engine's floor for any lean type. That is the identity line (62 chars);
+    the subagent notes the engine appends to every type's prompt (about 1,240 chars:
+    "Messages from the agent that launched you…" and five "Notes" bullets); the
+    `# Environment` block (about 1,000 chars: cwd, platform, shell, OS, the
+    untrusted-downloads line, the model line, the date); and the job prompt.
+  - **+41**: `READER_SYSTEM` itself (853 with no tools).
+  - **+2,551**: the three tool definitions. Alone, Read adds 998, Grep 1,562 and Glob
+    563 (Grep's input schema is 2,764 chars).
+  - In a git cwd, **+592** more. The gitStatus block (about 400 tokens: branch, status,
+    recent commits) is what `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` removes. The rest is
+    the git lines of the `# Environment` block (here a worktree's two paragraphs, about
+    200 tokens), which that variable leaves in place.
+
+  Neither the notes nor the environment block has a switch an agent definition or an
+  environment variable reaches that this spike found: `omitClaudeMd` is set and strips
+  nothing more. Against the measurement the design rests on (2,583), the gap is the tool
+  definitions (2,551 here against about 1,840 then) and about 70 tokens of base.
+  Acceptance 2's "at most 3,000" does not hold for this build. The final host
+  configuration below, in a git cwd, gives 3,604 (3,996 without the variable).
+- Observation (Q2): the lean types ran on haiku (`claude-haiku-5-5` on every agent
+  request of every run) only because the driver strips `CLAUDE_CODE_SUBAGENT_MODEL`,
+  which this machine's sessions export as `opus`. The engine forces that variable on
+  every subagent, a plugin's spawn included (`CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+  `agent.spawn`'s doc). The kernel inherits it from the session, so a host left with it
+  would run every host agent on opus. `hostproc.STRIP` lists what the spike removes.
+- Observation (Q3): `$.model.complete` runs N calls concurrently. 16 calls in 1.19 s of
+  wall time, against 17.69 s of summed latency. All 16 were in flight at once (the
+  mod-side start/settle intervals overlap 16 deep), and all 16 were right.
+- Observation (Q4, the cap): `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` binds as set, and a
+  spawn past it is **refused, not queued**. With the cap at 2 and 4 agents, the debug log
+  reads `$.agent.spawn (ptc-host): 2 running at once; refused` twice. The call rejects,
+  so the mod posts `reason: "error"`. The engine's default cap is 20 (2.1.304 bundle,
+  `Izr = 20`). `CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION` caps a session's lifetime spawns
+  (300 in this machine's environment), which a long-lived host would reach; the spike
+  sets it to 100000.
+- Observation (Q4): the ramp held at every width with no failures and at most 581 MB.
+  Each step started a fresh host, ran half `complete` jobs and half reader agents that
+  each made one `Read`, with `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` = width + 8 and the
+  final host configuration below. `drive.py --ramp 8,32,128,256` printed:
+
+  ```
+  width=8 ok=8 fail=0 wall=6.39 rss_peak=365 p50=2.65 p95=4.34 cpu_s=1.22 cpu_peak=106% calls=12
+  width=32 ok=32 fail=0 wall=5.43 rss_peak=472 p50=2.38 p95=3.02 cpu_s=1.63 cpu_peak=143% calls=48
+  width=128 ok=128 fail=0 wall=10.51 rss_peak=480 p50=5.97 p95=7.62 cpu_s=4.11 cpu_peak=123% calls=192
+  width=256 ok=256 fail=0 wall=11.05 rss_peak=581 p50=5.13 p95=7.45 cpu_s=6.31 cpu_peak=164% calls=384
+  ```
+
+  RSS is the host's process tree in MB, sampled every 0.25 s; `cpu_s` is the host's CPU
+  time over the step. Every answer was right: each complete returned its number and
+  each agent its file's token. At 256 the mod had all 128 completes and all 128 agents in
+  flight at once (the start/settle intervals overlap 128 deep for each kind). No
+  failure reason occurred at any width. One host held 128 concurrent subagents in 581 MB.
+  The 8 CLI children of the 2026-10-20 fan-out held 2.5 GB.
+- Observation (Q6): over 100 host `complete` calls with a two-field JSON schema, using
+  the prompt + validate method of "Structured output", **0 needed the retry** and 0
+  failed it. Every reply was bare JSON with no code fence (`{"n": 0, "parity":
+  "even"}`), and all 100 carried the right `n`. The 100 ran concurrently on one host.
+- Observation (Q5): the mod stops a running subagent with `$.tool.call({ tool:
+  "TaskStop", task_id: agentId })`. That needs `TaskStop` among the main loop's tools,
+  which the default set has. The agent's `turn.complete` arrived with `reason: "aborted"`
+  0.01 s after the cancel was queued, after 2 of its up to 10 requests.
+  Aborting `$.model.complete`'s signal resolves `aborted`, 0.01 s after the cancel.
+  Two other strategies did not stop anything: answering the cancelled agent's
+  `turn.step` from a hook, and denying its `tool.call`s. Both agents ran to their natural
+  end (9 requests each), because a subagent a plugin spawned steps past that plugin's own
+  hooks, as `turn.step`'s doc says.
+- Observation (Q7): `$.http.fetch` refuses a request body over **4,194,304 characters**
+  (`a request body of 4194305 characters is over the 4194304-character limit`). It
+  refuses a response body over **4,194,304 bytes** (`body of 4194305 bytes is over the
+  4194304-byte limit`). The response cap is in bytes, so the poll-response budget must be
+  measured in bytes: JSON with `ensure_ascii` makes the two counts equal. A held request
+  answered at 29.9 s arrives. One at 30.1 s or later is aborted at 30,000 ms (`aborted:
+  no complete answer within 30000ms`). The 25 s hold has 5 s of margin.
+- Observation (Q8): a host killed with `kill -9` shows up in the SDK at once. The
+  message reader raised `ProcessError('Command failed with exit code -9 …')` 12 ms after
+  the kill, and a later `query()` raised `CLIConnectionError('Cannot write to terminated
+  process (exit code: -9)')`. The channel saw nothing: the held poll's connection just
+  ended, and no further poll came. The two in-flight jobs stayed pending until the driver
+  failed them, which is what M3's retirement must do. A fresh start took 2.91 s to
+  `/hello`, against 0.93 s for the first start of the run.
+- Observation (Q9): a spawn's `cwd` does **not** set the subagent's working directory.
+  `cwd` reached the Agent tool's input (debug log), but both agents, given `dir-a` and
+  `dir-b`, ran in the host's cwd: their transcript rows' `cwd`, their Globs (both saw
+  both directories), and their failed relative Read of `same.txt` all show it.
+- Observation: the engine writes a subagent's last transcript rows after the plugin's
+  `turn.complete` hook has run. Read straight away, the final request is missing (1
+  request seen, 2 written). The driver counts calls after a 2 s settle. M3's
+  `agent.list()` transcript path is right, but anything that reads that transcript right
+  after the result must allow for this.
+- Observation: M1 spent **823 haiku calls** of its 850. Q1 0, Q2 16, Q3 16, the cap probe
+  8, Q5 22, Q7 0, the floor breakdown 18, Q8 3, Q9 4, Q4 636 and Q6 100.
+  Evidence: `test/spikes/s9_agent_host/ledger.jsonl`. Agent calls are counted from each
+  transcript (one per assistant message id) and complete calls one per job. Every agent
+  request recorded `claude-haiku-5-5`.
+
 ## Decision Log
+
+- Decision: **M1 verdict: Promote.** Q1, Q2 and Q3 work. Every ramp step met the criteria
+  (≥ 99 % success, host RSS ≤ 2 GB); the widest was 256, at 100 % and 581 MB. M3
+  proceeds with these inputs:
+  - **`PTC_HOST_MAX_CONCURRENCY` default: 256**, the widest step that met the numbers.
+    The ramp's top was 256; nothing wider was measured.
+  - **Launch recipe (Q1, Q2).** Through `ClaudeSDKClient`, `connect()` with no first
+    query is enough. `/hello` came 0.8–0.9 s after `connect()` on a first start and 2.9 s
+    after a restart. The main loop's tools must be the default set (`tools` left unset):
+    a spawn goes through the `Agent` tool, a cancel through `TaskStop`, and a type's
+    tools are intersected with the main loop's. The main loop never runs a turn, so its
+    tool list costs nothing. `setting_sources=[]`, no MCP servers, the plugin through
+    `plugins`, `cwd` the kernel's. The environment:
+    - `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`;
+    - `PTC_HOST_SOCKET` = the socket's **short real path**, not the symlink, since
+      `socketPath` is a `sun_path` too;
+    - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` ≥ `PTC_HOST_MAX_CONCURRENCY` (the spike
+      used width + 8), so the kernel's semaphore is the only cap that binds: a spawn
+      past the engine's cap is refused, not queued;
+    - `CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION` set far above any host's lifetime (the
+      spike used 100000). The kernel's environment may carry 300;
+    - `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, which takes about 400 tokens of gitStatus
+      off every host agent in a git cwd;
+    - removed: `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` and
+      `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`, which would force a model on every host
+      agent; `CLAUDE_CODE_PLUGIN_DIRS`, which would load the session's mods into the
+      host; and the parent session's identity variables (`hostproc.STRIP`).
+  - **Cancel (Q5).** An agent is stopped by `$.tool.call({ tool: "TaskStop", task_id:
+    agentId })`, and its `turn.complete` then reads `reason: "aborted"` within about
+    10 ms. A `complete` is stopped by aborting its signal, and resolves `aborted`. The
+    one-result rule holds for both. A plugin's own `turn.step` and `tool.call` hooks
+    cannot stop its spawned agents.
+  - **`"auto"` and schema calls (Q6).** `"auto"` sends `llm(json_schema=…)` to the host:
+    0 of 100 needed the retry, within the rule's "no more than 1 in 100, none failing".
+  - **Body caps (Q7).** A request body may be up to 4,194,304 characters, and a response
+    body up to 4,194,304 **bytes**. A held request is aborted at 30,000 ms. The kernel's
+    4,000,000 poll-response budget should be counted in bytes of the encoded JSON
+    (`ensure_ascii` JSON makes that the character count). The 25 s hold stands.
+  - **`cwd` (Q9): not carried.** A spawn's `cwd` does not move the subagent, so under
+    `"auto"` a `cwd` other than the kernel's goes to the CLI route, and `via="host"`
+    raises for it, as the option table's fallback says.
+
+  Two findings bear on acceptance, and the spec's author owns them. Acceptance 2's
+  3,000-token reader floor does not hold. The host reader costs 3,404 outside git and
+  3,604 in a git cwd with the recipe above; the cause breakdown is in Surprises &
+  Discoveries. And host death is visible only through the SDK, not through the channel
+  (Q8).
+  Rationale: the verdict rule in M1's entry, applied to the evidence in Surprises &
+  Discoveries.
+  Date/Author: 2026-10-20, M1 task-executor.
 
 - Decision: Verification for this spec. An independent spec review by the
   `doperpowers:adversarial-reviewer` agent (the spec is technical-heavy), and in the same
