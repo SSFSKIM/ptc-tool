@@ -346,6 +346,22 @@ def test_git_context_is_off_for_every_profile_but_full(kernel, no_creds, o, bare
     assert off or GIT_OFF not in env
 
 
+
+TITLE_OFF = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
+
+
+@pytest.mark.parametrize("o, bare_llm", [
+    (AgentOpts(), False),                                          # full, today's child too
+    (AgentOpts(profile=PRESETS["bare"]), True),
+    (AgentOpts(profile=PRESETS["reader"]), False),
+    (AgentOpts(profile=PRESETS["worker"]), False),
+])
+def test_no_cli_child_asks_for_a_session_title(kernel, no_creds, o, bare_llm):
+    """CLI 2.1.305 names an SDK-launched session with a second model request (~1,200
+    tokens) after its first prompt; `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` latches that off
+    (the bundle's `Sfs()`), and nothing else a child carries does."""
+    assert claude_backend._sdk_options(o, bare_llm=bare_llm).env[TITLE_OFF] == "1"
+
 def test_the_bare_decision_audits_and_logs_nothing(kernel, monkeypatch, capsys):
     """The trust note in `_child_env`: the merged environment is read, never recorded."""
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat-secret-value")

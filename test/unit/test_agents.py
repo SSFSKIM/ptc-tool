@@ -644,7 +644,8 @@ def test_child_env_is_ptc_only_and_carries_no_secrets(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-secret")
     STATE.config = {"key": "parent-key", "depth": 0, "max_depth": 1}
     env = claude_backend._child_env(AgentOpts(cwd=str(tmp_path)))
-    assert set(env) == {"PTC_SESSION", "PTC_DEPTH", "PTC_MAX_DEPTH", "PTC_CWD"}
+    assert set(env) == {"PTC_SESSION", "PTC_DEPTH", "PTC_MAX_DEPTH", "PTC_CWD",
+                        "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"}
     assert env["PTC_SESSION"] != "parent-key" and env["PTC_SESSION"].startswith("parent-key-a")
     assert env["PTC_DEPTH"] == "1" and env["PTC_MAX_DEPTH"] == "1"
     for name, value in env.items():

@@ -25,7 +25,15 @@ def _child_env(o: AgentOpts) -> dict:
     T18 Decision Log). The codex backend faces the opposite problem (another vendor's
     binary has no business seeing those credentials) and builds its child env instead.
     """
-    return child_ptc_env(o)
+    return {**child_ptc_env(o), **NO_SESSION_TITLE}
+
+
+#: CLI 2.1.305 names an SDK-launched session with a second model request (~1,200 input
+#: tokens, `querySource: "generate_session_title"`) once its first prompt arrives: every
+#: child paid two requests for one turn. This variable latches the title off (the bundle's
+#: `Sfs()`, which also exempts a bare `claude -p` but not an SDK child). It does nothing
+#: else in a headless child but leave the process title alone.
+NO_SESSION_TITLE = {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"}
 
 
 #: How a profile's `settings` axis reaches the CLI.

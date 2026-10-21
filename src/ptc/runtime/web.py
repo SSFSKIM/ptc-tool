@@ -26,8 +26,8 @@ from urllib.parse import urlsplit
 from ptc import policy
 
 from . import audit
-from .agents import AgentFailed, AgentOpts, child_ptc_env, guarded, shared_semaphore
-from .claude_backend import terminal_failure
+from .agents import AgentFailed, AgentOpts, guarded, shared_semaphore
+from .claude_backend import _child_env, terminal_failure
 from .files import _denied
 
 #: Hard body cap, enforced WHILE streaming: a limit checked after the download has already
@@ -289,9 +289,10 @@ async def web_search(query_text: str, *, allowed_domains: list | None = None,
         tools=["WebSearch"], allowed_tools=["WebSearch"],
         permission_mode="bypassPermissions", max_turns=2,
         # Same isolation every other PTC child gets: no host settings, no foreign hooks,
-        # and PTC's own child variables (a fresh PTC_SESSION above all — see child_ptc_env).
+        # and PTC's own child variables (a fresh PTC_SESSION above all — see child_ptc_env),
+        # with no second request to title the session (`claude_backend.NO_SESSION_TITLE`).
         setting_sources=[],
-        env=child_ptc_env(AgentOpts()),
+        env=_child_env(AgentOpts()),
     )
 
     tool_names: dict = {}
