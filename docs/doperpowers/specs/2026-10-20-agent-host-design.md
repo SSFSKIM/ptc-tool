@@ -200,11 +200,27 @@ initiative exists to remove.
   settle (Q1, Q2). The executor records the answer and the launch follows it.
 - **Readiness.** At `session.start` the mod posts `/hello`. The kernel waits up to
   `PTC_HOST_START_S` (30 s) for it; if none comes, the start has failed.
-- **Health.** The host is *healthy* from `/hello` until its process exits. Exit of any
-  kind (crash, kill, OOM) fails every in-flight job at once with
-  `AgentFailed("agent host exited (code …/signal …)")`. The next host-route call starts a
-  fresh host.
-- **Crash loop.** If three host starts fail or three hosts exit within 5 minutes,
+- **A cold host.** Under `"auto"` the first host-eligible call starts the host and waits
+  for it within its own deadline. A start that fails counts toward the crash loop below,
+  and that call goes to the CLI with what remains of its deadline ("Deadlines").
+- **Generations and retirement.** Each started host is one *generation*. A generation is
+  *retired* when any of these happens:
+  - its process exits (crash, kill, OOM);
+  - its lease lapses (below);
+  - its channel loses a delivery (below);
+  - its abandoned jobs fill the host cap ("Concurrency").
+
+  Retiring kills the process if it still runs, and fails every in-flight job of that
+  generation at once with `AgentFailed("agent host retired: <cause>")`. The cause is the
+  exit code or signal, `lease`, `delivery` or `abandoned`. Nothing is replayed, because an
+  agent may already have run tools. The next host-route call starts a fresh generation.
+- **Lease.** The mod's `/jobs` poll is its heartbeat. A generation that sends no poll for
+  60 s after `/hello` (the hold is 25 s) has lapsed and is retired, even though its CLI
+  is alive. This catches a mod whose poll loop died, which process exit alone would miss.
+  It matters because `agent.run()`'s `timeout` defaults to `None`, and without the lease
+  such a call could wait forever.
+- **Crash loop.** If three host starts fail or three generations are retired within
+  5 minutes, counting every cause except `abandoned`,
   `"auto"` sends everything to the CLI for the rest of the kernel's life, with one warning
   in the cell output that names `PTC_HOST`. `via="host"` keeps raising. The reason: the
   host rides the engine's mod API, which can change under an engine update, and when it
@@ -224,8 +240,9 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
 | request | body | response |
 |---|---|---|
 | `POST /hello` | `{"protocol": 1, "engine": "<cli version>", "plugin": "<host-plugin version>"}` | `200 {"ok": true}`; `409 {"ok": false, "reason": "protocol"}` on a mismatch, which fails the start |
-| `GET /jobs?wait=<ms>` | — | `200 {"jobs": [Job…], "cancel": ["<id>"…]}`. The kernel holds the request up to `wait` (the mod sends 25,000, under fetch's 30 s bound) and answers at once when a job or cancel is queued. |
-| `POST /results/<id>` | `Result` | `200 {"ok": true}`; `404` for an id the kernel no longer waits on (cancelled or timed out); the mod drops it |
+| `GET /jobs?wait=<ms>&ack=<id>,…` | — | `200 {"jobs": [Job…], "cancel": ["<id>"…]}`. The kernel holds the request up to `wait` (the mod sends 25,000, under fetch's 30 s bound) and answers at once when a job or cancel is queued. `ack` lists the ids of every job the previous response carried. |
+| `POST /results/<id>` | `Result` | `200 {"ok": true}`; `404` for an id the kernel no longer waits on (its caller already settled); the mod drops it |
+| `POST /ended/<id>` | `{}` | `200`. Sent after a cancelled job's subagent or call has actually stopped, when the job had already been settled for its caller, so that the kernel can release its slot ("Concurrency"). |
 
 ```jsonc
 // Job, kind "complete"
@@ -241,12 +258,31 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
 {"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout", "detail": "…", "status": 429}
 ```
 
-- **Large payloads.** A prompt over 3,500,000 characters goes in a file:
-  `<kernel_dir>/host/in/<id>.txt`, named by `promptFile`, read by the mod with
-  `$.fs.read`. A prompt over 4 MiB is refused in the kernel with `ValueError` before it
-  is queued, because that is `$.fs.read`'s cap. A reply over the same size comes back the
-  same way, as `textFile` under `<kernel_dir>/host/out/`. The kernel reads the file and
-  deletes it. The threshold sits under the fetch body cap with room for the JSON around it.
+- **Delivery.** A job counts as delivered when the next poll acks it. If a poll arrives
+  without acking a job the previous response carried, that response was lost. The kernel
+  then retires the generation, cause `delivery`. It does not redeliver: a lost response
+  is rare on a local socket, and redelivery would need deduplication in the mod to rule
+  out running an agent twice. A result POST that fails (an exception, or any status other
+  than 200/404) is retried by the mod three times within 10 s. If all three fail, the mod
+  stops polling, and the lease retires the generation. Every transport failure thus ends
+  in a bounded retirement, never in a stranded call.
+- **Sizes.** Size the serialized envelope, never the raw text. JSON escaping can more than
+  double a text: 2.2 M newlines encode to 4.4 M characters.
+  - **Poll responses.** The kernel builds each one so that its JSON stays at or under
+    4,000,000 characters, under the 4,194,304-character fetch cap. Jobs that do not fit
+    wait for the next poll.
+  - **Large job fields.** A job whose own JSON would pass 3,500,000 characters has its
+    `prompt` and `system` moved to `<kernel_dir>/host/in/<id>.prompt.txt` and
+    `.system.txt`, named by `promptFile` / `systemFile`. The mod reads them with
+    `$.fs.read`.
+  - **Over the read cap.** Each of those fields is at most 4 MiB in UTF-8 bytes (the
+    read cap). A larger one is refused in the kernel with `ValueError` before it is
+    queued.
+  - **Results.** The mod measures its result envelope the same way. A result over
+    3,500,000 characters writes its `text` to `<kernel_dir>/host/out/<id>.txt`, named by
+    `textFile`; the kernel reads the file and deletes it. A text over 4 MiB in UTF-8
+    bytes cannot be written by `$.fs.write`. The mod then posts
+    `ok: false, reason: "too-large"` with the size, and the kernel raises `AgentFailed`.
 - **Dispatch in the mod.** One poll loop. Each job is started without waiting for it to
   finish, and its result is posted when it settles.
   - `complete` runs `$.model.complete` with an `AbortController` per job.
@@ -256,8 +292,9 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
     with that reason. A spawn that comes back `{ deny }` posts `reason: "denied"` with the
     text.
   - A `cancel` aborts a `complete`'s controller. For an agent it does whatever M1 found
-    stops a subagent (Q5). If nothing does, the kernel has already failed that job, the
-    subagent runs out, and its result gets a 404.
+    stops a subagent (Q5). If nothing does, the subagent runs out, bounded by its
+    `maxTurns` ("Concurrency"). Either way, when the job has actually ended the mod posts
+    `/ended/<id>`; its result, if one comes, gets a 404.
 - **Why long-poll on a kernel-served socket.** The mod API's outbound channel is
   `$.http.fetch`, and `$.process.spawn` writes a child's stdin only once. A socket the
   kernel serves keeps the host at exactly one process. Jobs arrive at the kernel's pace,
@@ -282,7 +319,25 @@ records one it is 64. CLI children keep `PTC_MAX_CONCURRENCY`. The two are separ
 because a host slot is one coroutine and one API stream inside an existing process, while
 a CLI slot is a 300–450 MB process. One shared cap would either starve the host or let
 the CLI route exhaust RAM. The host's own `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` is set
-above the semaphore, so the kernel's semaphore is the only cap that binds. A rate limit
+above the semaphore, so the kernel's semaphore is the only cap that binds.
+
+**Settlement is separate from capacity.** When a call's deadline passes or its caller
+cancels it, the caller is settled at once (`AgentFailed`), and the kernel queues a
+`cancel`. The job's slot stays held until the job has actually ended in the host: until
+its result or its `/ended` arrives, or until its generation is retired. Releasing the
+slot at the caller's timeout would admit replacements while the abandoned agents still
+run, and the engine's own subagent cap would then bind and stall later work.
+
+- An abandoned agent's work is always bounded: a host agent job's `maxTurns` defaults to
+  50 when the caller gives none.
+- If abandoned jobs come to hold every slot, the generation is retired with cause
+  `abandoned`, which kills them. Live jobs of that generation fail with that cause too.
+  That is the price of a host whose agents cannot be stopped one by one, and it only
+  happens once the cap is entirely abandoned.
+- If M1's Q5 finds no way to stop a subagent, this rule plus the `maxTurns` bound is how
+  host agents stay bounded. It is recorded with the verdict.
+
+A rate limit
 comes back as `api-error` with its status, and the kernel raises `AgentFailed` just as the
 CLI route raises it for a failed turn today (the `llm()` contract in the kernel spec).
 
@@ -599,7 +654,15 @@ It proves acceptance 1, 2, 4, 5 and 6. Its tests pin:
   large-payload file path both ways);
 - every in-flight job failing on host exit;
 - the crash-loop switch to the CLI;
-- cancel on timeout;
+- retirement on lease lapse (a fake mod that stops polling) and on a lost delivery (a
+  poll that does not ack), with every in-flight job failing and nothing replayed;
+- capacity: repeated caller timeouts do not admit more host jobs than the cap while the
+  abandoned jobs have not ended, and a cap filled by abandoned jobs retires the
+  generation;
+- envelope sizing: a newline-heavy text that is small raw but large encoded spills to a
+  file; an over-4-MiB field is refused;
+- two simultaneous reader runs in two directories holding identically named files, each
+  answering from its own directory;
 - `"auto"` resolution for each case in "Routes";
 - schema validation and retry.
 
@@ -715,6 +778,21 @@ async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=3
   Rationale: execspec step 4.
   Date/Author: 2026-10-20, doperpowers-15.
 
+- Decision: Design review folded in.
+  - A slot is released only when its job has ended in the host, not when its caller
+    settles.
+  - Host agent jobs get a `maxTurns` default of 50.
+  - A cap filled by abandoned jobs retires the generation.
+  - Host generations retire on exit, on a 60 s lease lapse, or on a lost delivery
+    (detected by acks), and never replay.
+  - Cold-start failure falls back within the call's deadline.
+  - Sizes are measured on the serialized envelope, with spill and `too-large` rules.
+  Rationale: Releasing a slot at the caller's timeout let abandoned agents outlive the
+  cap. Process exit alone missed a dead poll loop, and with `timeout=None` that meant a
+  call could wait forever. A raw-text size threshold could still overflow the fetch cap
+  after JSON escaping. Redelivery with deduplication was rejected in favor of retirement:
+  simpler, and it never runs an agent twice.
+  Date/Author: 2026-10-20, doperpowers-15.
 - Decision: Buildability review folded in. Added the option-compatibility table, one
   deadline per call (`AgentHost.submit` takes a monotonic deadline), an exhaustive M1
   verdict whose every non-promote outcome is `BLOCKED` with a proposed revision for the
