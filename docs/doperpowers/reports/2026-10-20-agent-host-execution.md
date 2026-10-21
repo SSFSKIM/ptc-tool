@@ -17,23 +17,23 @@ running. Nothing is pushed and no PR is open.
 - M3 (host route): complete, reviewed clean. 22e4c1b, 17ddb4e, fix be5003b; 335/400 haiku
   calls. Deferred Minor (tech debt): a schema retry that falls back between attempts writes
   two audit records.
-- M4 (doctrine, acceptance, ship): executor ab1f018a781043a9b returned NEEDS_CONTEXT at
-  84ba26e (commits 7e0bf3d, d0214ec, 84ba26e). Acceptance 1, 3, 4, 5, 6 pass; acceptance 2
-  31/32, the miss caused by the fixture's line-0 labels (fixed in d0214ec, not run live).
-  247/300 calls. The rerun (~64 calls, ~311 total) was put to the author; no answer yet. The
-  ship commit (0.6.0, revision note, ship entry, Progress tick) waits on it.
-- Not started: M4 task review, whole-branch review (high), the v0.6.0 tech-debt comment on
-  issue #1, Outcomes & Retrospective, PR.
+- M4 (doctrine, acceptance, ship): complete, reviewed clean. c7dc7a0..b830461 (ship v0.6.0),
+  fix 6f16eb5, 908e7b6. Acceptance 1–6 pass (acceptance 2 32/32 on rerun); acceptance 7's last
+  full run had one integration flake (test_mutation_footer, start timeout, 3/3 on rerun).
+  Every CLI child's hidden session-title request is now off (CLAUDE_CODE_DISABLE_TERMINAL_TITLE,
+  7c415dc). Requests, from the gateway log: M4 397/400, M3 ~408 (reported 335), M2 ~52–62
+  (reported ~44), M1 823 (host only).
+- Whole-branch review (reviewer-high, 5a6bca7..908e7b6): incorrect, 3 P2 — a launch/close race
+  leaves a launched host unowned (host.py ~306); the mod spawns an agent after a cancel that
+  arrived during preflight (host.tsx ~325); a failed agent's partial text is lost (host.tsx
+  ~307). Fix wave IN PROGRESS on afec58e598f5dea84, with the deferred schema-retry
+  double-audit record added.
+- Not started: re-review, the v0.6.0 tech-debt comment on ptc-tool issue #1, Outcomes &
+  Retrospective, PR.
 
 ## Resume path
 
 Ledger: .doperpowers/sde/2026-10-20-agent-host-design/progress.md (bases, heads, handles).
-On the author's answer, resume the M4 executor (rerun or record 31/32, then the ship
-commit). Then the M4 task review (c7dc7a0..ship head), then reviewer-high over
-`git merge-base main HEAD`..HEAD. then M4, then reviewer-high over `git merge-base main HEAD`..HEAD.
-
-## Friction
-
-- The CLI cannot sign in on the MacBook with credentials removed ("OAuth session expired"),
-  so acceptance 3's no-credential case is measured as credential present with --bare
-  withheld. M2's executor logged this in the ptc-tool friction tracker (issue #4).
+Wait for the fix wave's "Branch-review fix wave" section in task-3-report.md, then resume
+reviewer-high (af8ac97308df732c2) on 908e7b6..<fix head>. Then the tech-debt comment
+(hard-kill killpg, 64k–128k limit, fork warning, flakes), Outcomes & Retrospective, PR.
