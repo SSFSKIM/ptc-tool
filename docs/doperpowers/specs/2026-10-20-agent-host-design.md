@@ -152,6 +152,26 @@ brake.
 `via="host"` with a call the host cannot serve raises `ValueError` naming the reason.
 `via="cli"` always works.
 
+**Option compatibility.** Every option a call already accepts either travels to the host
+or sends the call to the CLI route. None is dropped silently, because a dropped `cwd`
+reads the wrong checkout and a dropped `output_schema` loses `AgentResult.structured`,
+which the kernel spec promises.
+
+| option | host route |
+|---|---|
+| `model`, `effort`, `max_turns`, `permission_mode` | carried: the lean type's `model`, `effort`, `maxTurns`, `permissionMode` |
+| `tools` / profile tools | carried as the type's `tools`; `"default"`, `Agent` or `mcp__*` → CLI |
+| `system` / profile system | carried as the type's `prompt` when a string; `"claude_code"` → CLI |
+| `cwd` | carried as the spawn's `cwd` (`AgentSpawnInput.cwd`, "the directory the subagent runs in"), if M1's Q2 confirms a spawn honors it; otherwise a `cwd` other than the kernel's → CLI |
+| `allowed_tools` | meaningless under `bypassPermissions` (carried as nothing); with any other permission mode → CLI |
+| `output_schema` on `agent.*` | → CLI (subagents have no structured output) |
+| `json_schema` on `llm()` | "Structured output" below |
+| `timeout` | the call's deadline ("Deadlines" below) |
+| `provider="codex"` | → CLI |
+
+Under `"auto"`, "→ CLI" sends the call there. Under `via="host"`, it raises `ValueError`
+naming the option.
+
 Why two routes and not host-only: the CLI route keeps everything the host lacks
 (conversations, native structured output, codex, per-child isolation, Claude Code's own
 system prompt). Rewriting those inside the host would rebuild the CLI. Why not CLI-only
@@ -265,6 +285,26 @@ the CLI route exhaust RAM. The host's own `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`
 above the semaphore, so the kernel's semaphore is the only cap that binds. A rate limit
 comes back as `api-error` with its status, and the kernel raises `AgentFailed` just as the
 CLI route raises it for a failed turn today (the `llm()` contract in the kernel spec).
+
+### Deadlines
+
+A call has one deadline, fixed when it is entered: `deadline = monotonic() + timeout`
+(`None` means none). Everything the call waits on spends that same budget, and no later
+step gets a fresh one. That covers the host's start, the host semaphore, the job in the
+host, and a fallback to the CLI. It is the existing wall-clock contract of `timeout`
+("a deadline covering the queue wait too", `_llm.py`).
+
+- On the host route, `AgentHost.submit(job, deadline)` owns admission. It waits for the
+  host's start and then for a host-semaphore permit, each bounded by the deadline. It
+  sets the job's `timeoutMs` to the time left at submission, and fails the call with
+  `AgentFailed("timed out …")` when the deadline passes at any stage. The shared CLI
+  semaphore is not taken.
+- When `"auto"` falls back to the CLI because the host is unavailable (start failed or
+  crash-looped), the CLI attempt runs under `guarded(shared_semaphore(), make, remaining)`
+  with `remaining = deadline - monotonic()`. `guarded`'s existing semantics then apply to
+  that remainder, so a negative or zero remainder fails at once.
+- `guarded` itself is unchanged. It stays the CLI route's admission, and the call site
+  computes its argument from the deadline.
 
 ### Profiles
 
@@ -439,15 +479,31 @@ evidence in Surprises & Discoveries:
 - **Q8.** What does the host's death look like to the driver (the SDK client's error, the
   socket), and how long does a fresh start take?
 
-**Promote** when Q1–Q3 work and the 128-job step finishes with at least 99 % success and
-the host's RSS at most 2 GB. M3 then builds the route, with `PTC_HOST_MAX_CONCURRENCY`'s
-default set to the widest step that met those numbers.
+- **Q9.** Does a spawn's `cwd` set the subagent's working directory? Check with a
+  reader agent asked for its working directory's listing.
 
-**Partial**: if `$.model.complete` works but spawned agents do not, the host route
-serves `llm()` only. Record it, and M3 drops the `agent` job kind.
+**Verdict.** Exactly one of the following applies.
 
-**Discard**: if mods do not run in a headless host at all, record it and stop with
-`BLOCKED`. The design's alternative (non-goals, raw HTTP loop) goes back to the owner.
+- **Promote.** Q1, Q2 and Q3 work, and some step of width 32 or more finishes with at
+  least 99 % success and host RSS at most 2 GB. M3 proceeds. Its inputs, recorded with the
+  verdict, are:
+  - `PTC_HOST_MAX_CONCURRENCY`'s default: the widest step that met those numbers;
+  - the launch recipe (Q1, Q2);
+  - the cancel mechanism or its absence (Q5);
+  - `"auto"`'s rule for schema calls (Q6);
+  - the body cap (Q7);
+  - whether `cwd` is carried (Q9).
+- **Not promoted.** Any other result stops M1 with `BLOCKED`. Examples: completions work
+  but agents do not; both work but no step of width ≥ 32 meets the numbers; mods load but
+  completions fail or run one at a time; mods do not run headless at all. The `BLOCKED`
+  carries:
+  - the evidence;
+  - the condition that failed;
+  - a proposed revision: a narrower scope such as a host route for `llm()` alone, with
+    acceptance 2 moved to the CLI route; or the non-goals' raw HTTP loop.
+
+  A revision that narrows the scope or changes acceptance is the owner's to approve, so
+  M3 does not start on it until the dispatching session has the answer.
 
 This milestone touches `test/spikes/s9_agent_host/` only. The prototype is deleted or kept
 there as a spike, as earlier spikes were. M3 writes the real code from scratch, guided by
@@ -517,9 +573,8 @@ Decisions that belong here:
 - The kernel's channel server runs on the kernel's own asyncio loop (`STATE.loop`).
   Futures are resolved on it. A result posted for an unknown or settled id gets 404 and
   changes nothing.
-- A job's `timeoutMs` is the call's remaining `timeout` after its semaphore wait, as
-  `guarded` computes it today. On expiry the kernel fails the call, queues a `cancel` for
-  the job, and returns its semaphore slot.
+- Deadlines follow "Deadlines". On expiry the kernel fails the call, queues a `cancel`
+  for the job, and returns its host-semaphore slot.
 - Job ids are `j-<uuid4 hex>`. Type names follow "Lean agent types". Use canonical JSON
   for the hash: sorted keys, no whitespace.
 - The mod's own failures (an exception in its dispatch) post `ok: false, reason: "error"`
@@ -534,6 +589,11 @@ It does not touch the CLI route's process handling, the codex backend, the MCP a
 tool surface, or the SKILL text; the SKILL text is M4's.
 
 It proves acceptance 1, 2, 4, 5 and 6. Its tests pin:
+- the option-compatibility table: a non-default `cwd` (carried or routed per M1's Q9) and
+  an `agent.run(output_schema=…)` under `"auto"` going to the CLI with `structured`
+  populated, `via="host"` raising for it;
+- deadlines: a call that spends most of its `timeout` waiting for a host permit gets only
+  the remainder as `timeoutMs`, and a fallback to the CLI gets only the remainder too;
 - the channel protocol against a fake mod written in Python (hello and protocol mismatch,
   held polls answered at once on a queued job, results, 404 on a settled id, the
   large-payload file path both ways);
@@ -577,9 +637,14 @@ git merge main                                   # before M1: brings claude-agen
 uv sync                                          # the repo's own venv
 uv run pytest test/unit -q                       # fast; expect all pass
 uv run pytest test/integration -q                # starts real kernels; expect all pass
-uv run pytest test/live/test_llm_live.py test/live/test_agents_live.py -q   # real model calls (haiku)
-uv run pytest test/live -q -k host               # M3's live host tests, once they exist
+PTC_LIVE=1 uv run pytest test/live/test_llm_live.py test/live/test_agents_live.py -q -rs   # real model calls (haiku)
+PTC_LIVE=1 uv run pytest test/live -q -rs -k host   # M3's live host tests, once they exist
 ```
+
+The live suites skip unless `PTC_LIVE=1` (`test/live/test_llm_live.py`). They need a
+`claude` CLI that can authenticate, as this machine's can through the local gateway. A
+live run counts only with its executed-test count recorded: `-rs` lists skips, and an
+all-skipped run proves nothing. M3's new host live tests use the same `PTC_LIVE` gate.
 
 Spike (M1): `uv run python test/spikes/s9_agent_host/drive.py --ramp 8,32,128,256` prints
 one line per step:
@@ -608,7 +673,7 @@ class HostUnavailable(RuntimeError): ...   # disabled, start failed, or crash-lo
 class AgentHost:
     def enabled(self) -> bool: ...          # PTC_HOST != "off" and not crash-looped
     async def ensure_started(self) -> None: ...   # raises HostUnavailable
-    async def submit(self, job: dict, timeout: float | None) -> dict: ...  # the Result; raises AgentFailed on host exit or timeout
+    async def submit(self, job: dict, deadline: float | None) -> dict: ...  # deadline in time.monotonic(); the Result; raises AgentFailed on host exit or deadline
     async def close(self) -> None: ...
 
 def get_host() -> AgentHost: ...            # the kernel's one instance
@@ -648,6 +713,16 @@ async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=3
 - Decision: Execution routing. Several milestones go to one `doperpowers:plan-executor`
   at its pins (opus/high; its task-executor opus/high, task-reviewer sol/xhigh).
   Rationale: execspec step 4.
+  Date/Author: 2026-10-20, doperpowers-15.
+
+- Decision: Buildability review folded in. Added the option-compatibility table, one
+  deadline per call (`AgentHost.submit` takes a monotonic deadline), an exhaustive M1
+  verdict whose every non-promote outcome is `BLOCKED` with a proposed revision for the
+  owner, Q9 (spawn `cwd`), and `PTC_LIVE=1` on the live commands.
+  Rationale: Without the table, a `cwd` or `output_schema` would have been dropped on the
+  host route. Without the deadline rule, `guarded` would have been assumed to expose a
+  remainder it does not expose. The spike had outcomes with no verdict. The live suites
+  skip silently without `PTC_LIVE`.
   Date/Author: 2026-10-20, doperpowers-15.
 
 ## Outcomes & Retrospective
