@@ -25,8 +25,10 @@ Everything runs on the kernel's own event loop (`STATE.loop`, the loop cells run
 ipykernel keeps running between cells: the server, the lease and the watcher live on it.
 """
 import asyncio
+import contextvars
 import hashlib
 import json
+import logging
 import os
 import signal
 import sys
@@ -786,15 +788,42 @@ async def _read_request(reader: asyncio.StreamReader):
 # ---- the real launch ----------------------------------------------------------------------
 
 
+#: The SDK's reader logs one ERROR, `Fatal error in message reader: Command failed with
+#: exit code …`, whenever its CLI exits under it, and with no handler of the kernel's that
+#: lands in the cell's stderr. A host the kernel retires is closed by `_SdkHost.close`,
+#: whose disconnect usually cancels the reader before the SIGTERM'd host has exited, but
+#: not always. So a host's reader carries this marker (the task inherits the context its
+#: `connect()` ran in) and the line is dropped once its host is being closed. A host that
+#: dies on its own (an OOM kill, a crash) still says so, in that one line.
+_READER: contextvars.ContextVar = contextvars.ContextVar("ptc_host_reader")
+_SDK_READER_LOGGER = "claude_agent_sdk._internal.query"
+
+
+class _Closing:
+    """Set by `_SdkHost.close`: from then on the host's exit is the kernel's doing."""
+    closing = False
+
+
+class _QuietRetirement(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        mark = _READER.get(None)
+        return not (mark is not None and mark.closing
+                    and record.getMessage().startswith("Fatal error in message reader"))
+
+
+_QUIET = _QuietRetirement()
+
+
 class _SdkHost:
     """A host started through `ClaudeSDKClient`: the SDK's bundled CLI, the version the CLI
     route runs. The SDK keeps the CLI's process on its transport and exposes no pid or
     exit status, so both are read from there."""
 
-    def __init__(self, client):
+    def __init__(self, client, mark: _Closing | None = None):
         self._client = client
         self._process = client._transport._process
         self.pid = self._process.pid
+        self._mark = mark or _Closing()
 
     async def wait(self) -> str:
         try:
@@ -809,6 +838,7 @@ class _SdkHost:
         return _exit_cause(rc)
 
     async def close(self) -> None:
+        self._mark.closing = True
         if self._process.returncode is None:
             try:
                 os.kill(self.pid, signal.SIGTERM)
@@ -838,15 +868,25 @@ async def _launch_sdk(env: dict, cwd: str, plugin_dir: Path) -> _SdkHost:
     # The host's tools are learned while it lives, so a host killed from outside the
     # kernel leaves none running (`ptc/toolgroups.py`).
     toolgroups.watch()
+    reader = logging.getLogger(_SDK_READER_LOGGER)
+    if _QUIET not in reader.filters:
+        reader.addFilter(_QUIET)
+    mark = _Closing()
+    token = _READER.set(mark)
     try:
         await client.connect()
-        return _SdkHost(client)
+        return _SdkHost(client, mark)
     except BaseException:
+        # A launch that fails or is cancelled is closed by the kernel: its reader's line
+        # would only repeat the start failure the kernel reports itself.
+        mark.closing = True
         try:
             await asyncio.wait_for(client.disconnect(), _TEARDOWN_S)
         except BaseException:            # noqa: BLE001 — teardown never masks the fault
             pass
         raise
+    finally:
+        _READER.reset(token)
 
 
 # ---- the kernel's one host ------------------------------------------------------------------
