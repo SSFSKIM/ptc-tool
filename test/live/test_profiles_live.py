@@ -115,3 +115,4 @@ def test_full_floor(first_prompt_tokens):
     [m] = first_prompt_tokens
     print("full:", m)
     assert m["ptc_server"], "the default tool set keeps the ptc server"
+    assert m["tokens"] <= 16_200          # measured 14,708 and 14,721 (M4), plus ~10 %

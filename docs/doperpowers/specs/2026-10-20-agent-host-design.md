@@ -988,7 +988,13 @@ are in `ledger.jsonl` beside the driver.
   7. Unit 721 passed (1 warning: the fork `DeprecationWarning` logged as tech debt);
      integration 69 passed; live `test_profiles_live.py` 4 passed (both runs), `test_llm_live.py` +
      `test_agents_live.py` 2 passed, `-k host` 7 passed and 1 failed (acceptance 2 above),
-     12 deselected, none skipped; acceptance 2's rerun 1 passed.
+     12 deselected, none skipped; acceptance 2's rerun 1 passed. After the title fix
+     (7c415dc), the full suites were **not green**: unit 726 passed, integration 68
+     passed and 1 failed (`test_mutation_footer.py::test_kernel_edit_shows_a_diff_block`,
+     `Kernel didn't respond in 20 seconds`; it passed 3/3 alone, one run at 18 s). The
+     residuals are left as they are: that start-timeout flake (friction tracker #4), the
+     unit suite's fork `DeprecationWarning`, and the SDK logger's `Fatal error in message
+     reader` on the cell's stderr during acceptance 4's intentional kill.
   Evidence: `test/live/test_host_live.py`, `test_profiles_live.py`; M4's task report.
 - Observation (M4, floors): a host `llm()` costs **34** prompt tokens for "Reply with
   exactly: OK" (`input_tokens` 34, nothing cached), against 61 for the CLI's `--bare`
@@ -1098,10 +1104,13 @@ are in `ledger.jsonl` beside the driver.
      tokens with no cap fails loudly as `AgentFailed` with the partial text, and
      `max_tokens` above 64,000 runs on the CLI.
 
-  Acceptance 1–7 pass. Acceptance 2 passed on the rerun, after the fixture fix; the record
-  is in Surprises & Discoveries. Suites: unit 726, integration 68 plus 1 load flake (it
-  passed 3/3 on rerun; friction tracker #4), and the live suites as recorded. Deferred as
-  tech debt:
+  Acceptance 1–6 pass; acceptance 2 passed on its rerun, after the fixture fix. The
+  record is in Surprises & Discoveries. Acceptance 7 is not clean: the last full run had
+  unit 726 passed, and integration 68 passed with 1 failed. The failure was
+  `test_mutation_footer`'s kernel start timeout; that test passed 3/3 alone, and the
+  failure is logged in friction tracker #4. The live suites ran as recorded, with their
+  residuals: the fork `DeprecationWarning`, and the SDK's fatal-reader stderr line
+  during acceptance 4's kill. Deferred as tech debt:
   - the hard-kill residual;
   - the 64k–128k difference;
   - the fork `DeprecationWarning`;

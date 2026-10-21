@@ -84,11 +84,13 @@ still need native Read.
     r = await agent.run("review this diff", provider="codex")   # a Codex worker instead
 
 Options that work on BOTH providers: `model=`, `system=`, `cwd=`, `effort=`,
-`output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock), `via=`.
-Claude-only: `profile=` and `tools=` (the built-in tool SET the child sees — `[]` for none,
-or exact names; see "Fan-out rules"), `allowed_tools=` (pre-approval only — the child still sees every
-definition), `max_turns=`, and any `permission_mode=` other than the default — passing one
-with `provider="codex"` raises `TypeError` rather than being silently dropped, because
+`output_schema=` (fills `r.structured`), `timeout=` (seconds, wall-clock), and `via=` on
+`run` and `spawn` (`fork` and `resume` are CLI-only and refuse it). Claude-only: `profile=`
+(a non-`full` one with `provider="codex"` raises `ValueError`; see "Fan-out rules"),
+`tools=` (the built-in tool SET the child sees — `[]` for none, or exact names),
+`allowed_tools=` (pre-approval only — the child still sees every definition), `max_turns=`,
+and any `permission_mode=` other than the default — passing one of these last four with
+`provider="codex"` raises `TypeError` rather than being silently dropped, because
 `codex app-server` has no tool set selection, no per-turn tool allowlist and no turn cap
 and PTC pins its codex threads to `approvalPolicy="never"` + `sandbox="read-only"`. `system=` rides as
 `developerInstructions` on codex. `agent.fork` is claude-only (`NotImplementedError`
@@ -135,20 +137,22 @@ to the CLI with one warning in the cell output (`PTC_HOST=off` skips the host).
 **Decide the concurrency.** On the CLI route, `PTC_MAX_CONCURRENCY` bounds one kernel,
 and every kernel on the machine — yours and each subagent's — has its own, so the machine
 carries the sum. A finished child still holds ~133 MB and ~1.5 % of a core until `close()`
-(measured: 80 such children, 10.7 GB and 1.2 cores, nine hours after their work was done); a
-working one costs more. Choose the bound per fan-out from what the machine can carry and
+(measured 2026-09-09 on an earlier CLI build: 80 such children, 10.7 GB and 1.2 cores,
+nine hours after their work was done); a working one costs more. Choose the bound per fan-out from what the machine can carry and
 what the child does, and state it: `workflow.parallel(..., limit=N)` over `agent.run`/`llm`
 awaitables, or `spawn` in batches of N and `gather` a batch before starting the next. On a
 laptop, 3–4 for children that run tools; up to 8 for one-shots; past 8 only on a machine
 measured to carry it, by raising `PTC_MAX_CONCURRENCY` deliberately. `agent.run` and `llm`
 end their process when the turn ends; a `spawn` handle keeps its CLI as a `send()` target,
 so close the ones you will not talk to again — `for h in hs: await h.close()` after the
-`gather`. On the host route the machine is not the bound (128 agents and 128 completions
-at once held one host at 581 MB; 64 `llm()` calls took 4 s there against 22 s on the CLI
-at 8) and `PTC_HOST_MAX_CONCURRENCY` (256) is its own cap; what binds is the account's rate
-limit. State a `limit=` there all the same, up to that cap, through `workflow.parallel`,
-which returns a rate-limited call's `AgentFailed` in place where a bare `gather` loses the
-batch to the first one.
+`gather`. On the host route a completion or a read-only agent costs no process (128
+agents and 128 completions at once held one host at 581 MB; 64 `llm()` calls took 4 s
+there against 22 s on the CLI at 8), and `PTC_HOST_MAX_CONCURRENCY` (256) is its own cap:
+for those the account's rate limit binds, so state a `limit=` up to that cap through
+`workflow.parallel`, which returns a rate-limited call's `AgentFailed` in place where a
+bare `gather` loses the batch to the first one. A host agent's tools still run on this
+machine — each `Bash` call is a process of its own — so size a fan-out of runners, builds
+or tests by the machine and the workload, as on the CLI.
 
 **Pick the profile.** A profile is what a child's prompt is made of. `profile=` takes a
 preset on `llm()` and `agent.*`, and `system=` / `tools=` override its fields:
@@ -166,7 +170,7 @@ Tool definitions are the cost (prompt tokens for a one-word reply, measured on C
     agent.run(..., profile="reader")               3 459   host, in a git repo (3 367 outside one)
     agent.run(..., profile="reader", via="cli")    3 079
     agent.run(...)                                14 708   full; 22 of its tools, ptc's among them, deferred
-    a general-purpose subagent (native Agent)     26 158
+    a general-purpose subagent (native Agent)     26 158   this machine's median, 2026-10-20
 
 Give each child exactly the tools its task needs — `profile="reader"` for a reader,
 `tools=["Bash"]` for a runner, `llm()` for a turn that needs none — and a `system=` only
