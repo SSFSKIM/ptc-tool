@@ -736,7 +736,9 @@ The live suites skip unless `PTC_LIVE=1` (`test/live/test_llm_live.py`). They ne
 live run counts only with its executed-test count recorded: `-rs` lists skips, and an
 all-skipped run proves nothing. M3's new host live tests use the same `PTC_LIVE` gate.
 
-Spike (M1): `uv run python test/spikes/s9_agent_host/drive.py --ramp 8,32,128,256` prints
+Spike (M1): `uv run python test/spikes/s9_agent_host/drive.py --ramp 8,32,128,256 --main-tools default`
+(the recorded run's host cwd was a temporary directory outside git; the driver's
+`--main-tools` default, `none`, cannot spawn agents, per Q2) prints
 one line per step:
 `width=<n> ok=<n> fail=<n> wall=<s> rss_peak=<MB> p50=<s> p95=<s>`.
 
@@ -806,10 +808,10 @@ are in `ledger.jsonl` beside the driver.
   run_in_background, model, subagent_type, cwd)` in the debug log). With main-loop
   `tools=[]`, or `["Read","Grep","Glob"]`, every spawn failed with `$.tool.call: no tool
   named "Agent" in this session`.
-- Observation (Q2): a type's tool list is intersected with the main loop's tools, so the
-  main loop must list every tool a type may name. With main-loop tools `Agent` alone, a
-  type naming Read/Grep/Glob was offered only `['Grep', 'Glob']`: Read was silently
-  dropped. With the main loop's default tools (`tools=None`, 24 listed) or
+- Observation (Q2): a type's tool list depends on the main loop's tools, by a rule the
+  spike did not pin down (it is not a plain intersection). With main-loop tools `Agent`
+  alone, a type naming Read/Grep/Glob was offered only `['Grep', 'Glob']`: Read was
+  silently dropped, while Grep and Glob, which the main loop did not list, stayed. With the main loop's default tools (`tools=None`, 24 listed) or
   `Agent,Read,Grep,Glob`, the type was offered exactly `['Read', 'Grep', 'Glob']`.
   Evidence: the `api-request-shape` row of each subagent transcript records the tools the
   request offered (`q2-20261020-193012`, `q2-20261020-193143`).
@@ -915,6 +917,13 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: M1's task review approved the spike with Minor findings only. Two bear on
+  M3 and are recorded here. Q2's tool rule is restated as observed, not as an
+  intersection (above). And the spike's result-POST retry is not bounded at 10 s: three
+  awaited fetches, each allowed 30 s, can take about 96 s. "The channel"'s 10 s bound is
+  M3's to implement with an overall deadline on the retries; the spike is no evidence for it.
+  Rationale: M3 builds against what the spike shows, not what its prototype claimed.
+  Date/Author: 2026-10-20, plan-executor.
 - Decision: Acceptance 2's floor becomes "a reader agent's first request on the host
   route, in a git cwd, is at most 4,200 prompt tokens": M1's 3,604 floor for the shipped
   host recipe plus about 15 %. The floor's parts (M1, Q2): the engine's floor for any lean
@@ -936,8 +945,9 @@ are in `ledger.jsonl` beside the driver.
   - **Launch recipe (Q1, Q2).** Through `ClaudeSDKClient`, `connect()` with no first
     query is enough. `/hello` came 0.8–0.9 s after `connect()` on a first start and 2.9 s
     after a restart. The main loop's tools must be the default set (`tools` left unset):
-    a spawn goes through the `Agent` tool, a cancel through `TaskStop`, and a type's
-    tools are intersected with the main loop's. The main loop never runs a turn, so its
+    a spawn goes through the `Agent` tool, a cancel through `TaskStop`, and only with
+    the default set was a type's tool list observed to hold exactly (Q2). M3 relies on
+    that configuration, not on a general rule. The main loop never runs a turn, so its
     tool list costs nothing. `setting_sources=[]`, no MCP servers, the plugin through
     `plugins`, `cwd` the kernel's. The environment:
     - `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`;
