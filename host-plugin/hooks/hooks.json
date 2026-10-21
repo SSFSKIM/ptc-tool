@@ -1,0 +1,3 @@
+{
+  "modules": ["./mods/host.tsx"]
+}

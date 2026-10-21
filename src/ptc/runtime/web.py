@@ -142,8 +142,12 @@ async def web_fetch(url: str, *, prompt: str | None = None,
                             r.headers.get("content-type", ""))
 
     # The shared pool bounds the fetch itself — but the permit is RELEASED before the
-    # summarization below. Holding it across `llm()`, which takes a permit of its own from
-    # the same pool, would deadlock every caller at max_concurrency.
+    # summarization below. Holding it across `llm()`, which may take a permit of its own
+    # from the same pool, would deadlock every caller at max_concurrency. On the host route
+    # `llm()` takes the host's semaphore instead, and nothing here holds either while it
+    # waits for the other: the fetch's permit is gone before `llm()` starts, and `llm()`
+    # falls back to the CLI (the shared pool) only before it holds a host permit
+    # (`AgentHost.submit` gives its permit back before raising `HostUnavailable`).
     final_url, status, body, encoding, ctype = await guarded(
         shared_semaphore(), _get, timeout)
     # One ADDITIONAL line under a policy, carrying where the fetch ENDED as well as where

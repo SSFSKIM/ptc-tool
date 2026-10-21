@@ -38,6 +38,10 @@ _INTERRUPT_DRAIN_S = 30.0
 
 _TERMINAL = ("done", "error", "interrupted")
 
+#: The provider a host agent's handle and registry row carry: Claude, run inside the
+#: kernel's agent host rather than as a process of its own.
+HOST_PROVIDER = "claude-host"
+
 #: Spec: ONE semaphore across agent/llm/web_search, not one pool per caller (two 8-permit
 #: pools would let 16 SDK-spawning calls run at once against an 8 cap). Module-level and
 #: lazily created from STATE.config so every caller — `_Agent`, `llm()`, and `web.py` —
@@ -119,6 +123,12 @@ class AgentResult:
     cost_usd: float | None
     num_turns: int | None
     duration_ms: int
+    #: Which route ran it: "cli" (a `claude` process of its own) or "host" (inside the
+    #: kernel's agent host, `host.py`).
+    via: str = "cli"
+    #: A host agent's subagent id: its transcript is
+    #: `<host session>/subagents/agent-<agent_id>.jsonl` (`agent.list()` names the path).
+    agent_id: str | None = None
 
 
 class AgentFailed(RuntimeError):
@@ -271,6 +281,10 @@ class AgentHandle:
             # wait, and a close()/interrupt() landing in that window would otherwise turn
             # the intended refusal into an AttributeError on None (M2).
             session = self._session
+            if session is None and self.provider == HOST_PROVIDER:
+                raise RuntimeError(
+                    f"agent {self.name!r} ran on the agent host, whose agents take no "
+                    "follow-up turns; spawn it with via='cli' to send() to it")
             if session is None:
                 raise RuntimeError(f"agent {self.name!r} has no live session to send to")
             self._status = "running"
@@ -325,6 +339,10 @@ class AgentHandle:
         default). `transcript._resolve_path`'s glob is the fallback that covers a child
         given a different `cwd=` at spawn.
         """
+        if self.provider == HOST_PROVIDER:
+            raise NotImplementedError(
+                f"agent {self.name!r} ran on the agent host as a subagent of the host's own "
+                "session; its transcript is the `transcript` path agent.list() gives it")
         if self.provider != "claude":
             # A codex handle's session_id is a THREAD id whose turns live in a codex
             # rollout ($CODEX_HOME/sessions/**.jsonl), a different store in a different
@@ -622,18 +640,70 @@ class _Agent:
         self._registry_write(h.name, h.provider, h.session_id, status, task_head, **extra)
 
     # -- public API ---------------------------------------------------------
-    async def run(self, task: str, **kw) -> AgentResult:
+    async def run(self, task: str, *, via: str = "auto", **kw) -> AgentResult:
+        """One turn to completion. `via` picks the route (`routes.py`): under `"auto"` a call
+        the agent host can serve — a plain system prompt, an explicit tool list, the
+        kernel's cwd, no output schema — runs there as a lean subagent; everything else,
+        `profile="full"` (the default) included, is a CLI child as before."""
+        from . import routes
         self._check_depth()
         o = self._opts(kw)
-        audit.append("agent", name=f"run-{o.provider}", task=task[:120], provider=o.provider)
+        deadline = routes.deadline_of(o.timeout)
+        route = await routes.settle(routes.choose(via, routes.agent_misfit(o)), via, deadline)
+        audit.append("agent", name=f"run-{o.provider}", task=task[:120], provider=o.provider,
+                     via=route)
+        if route == "host":
+            from .host import HostUnavailable
+            try:
+                return await self._run_on_host(task, o, deadline)
+            except HostUnavailable:
+                if via == "host":       # raised before the job was queued: nothing ran
+                    raise
         return await self._guarded(
-            lambda: self._backends[o.provider].run_once(task, o), o.timeout)
+            lambda: self._backends[o.provider].run_once(task, o), routes.remaining(deadline))
 
-    def spawn(self, task: str, *, name: str | None = None, **kw) -> AgentHandle:
+    async def _run_on_host(self, task: str, o: AgentOpts, deadline,
+                           name: str | None = None) -> AgentResult:
+        """One lean subagent on the host, with its registry row: `agent.list()` shows host
+        runs under provider `claude-host`, with the subagent id and its transcript path."""
+        from . import routes
+        from .host import get_host
+        from .transcript import _munge, _projects_root
+        host = get_host()
+        name = name or self._generated_name("host")
+        job = routes.agent_job(task, o)
+        self._registry_write(name, HOST_PROVIDER, host.session_id, "running", task_head=task)
+        t0 = time.time()
+        try:
+            res = await host.submit(job, deadline)
+        except asyncio.CancelledError:
+            self._registry_write(name, HOST_PROVIDER, host.session_id, "interrupted")
+            raise
+        except BaseException:
+            self._registry_write(name, HOST_PROVIDER, host.session_id, "error")
+            raise
+        r = routes.host_result(res, session_id=host.session_id, t0=t0, kind="agent")
+        extra = {}
+        if r.agent_id and r.session_id and host.host_cwd:
+            extra = {"agent_id": r.agent_id, "transcript": str(
+                _projects_root() / _munge(host.host_cwd) / r.session_id / "subagents"
+                / f"agent-{r.agent_id}.jsonl")}
+        self._registry_write(name, HOST_PROVIDER, r.session_id, "done", **extra)
+        return r
+
+    def spawn(self, task: str, *, name: str | None = None, via: str = "auto",
+              **kw) -> AgentHandle:
+        """A handle on a live child. Under `"auto"` it is always a CLI child: a handle is
+        for `send()` follow-ups, which host agents cannot take. `via="host"` runs it on the
+        host anyway, as a handle that settles once and refuses `send()`."""
+        from . import routes
         self._check_depth()
         o = self._opts(kw)
+        route = routes.choose(via, routes.agent_misfit(o), spawn=True)
         name = name or self._generated_name("agent")
         self._claim_name(name)
+        if route == "host":
+            return self._spawn_on_host(task, name, o)
         h = AgentHandle(self, name, o.provider, o.timeout)
         self._handles[name] = h
         audit.append("agent", name=name, task=task[:120], provider=o.provider)
@@ -669,6 +739,36 @@ class _Agent:
                 h._status = "error"
                 self._registry_update(h, "error")
                 await h.close()            # tear down the CLI process tree (F6)
+                h._settle_exception(e)
+        h._driver = asyncio.ensure_future(drive())
+        return h
+
+    def _spawn_on_host(self, task: str, name: str, o: AgentOpts) -> AgentHandle:
+        from . import routes
+        from .host import get_host
+        deadline = routes.deadline_of(o.timeout)
+        h = AgentHandle(self, name, HOST_PROVIDER, o.timeout)
+        self._handles[name] = h
+        audit.append("agent", name=name, task=task[:120], provider=o.provider, via="host")
+
+        async def drive():
+            try:
+                await routes.settle("host", "host", deadline)
+                r = await self._run_on_host(task, o, deadline, name=name)
+                h._session_id_seen = r.session_id
+                h._status = "done"
+                h._settle_result(r)
+            except asyncio.CancelledError:
+                # A cancelled host job is cancelled in the host too (`AgentHost.submit`).
+                if h._status not in _TERMINAL and not h._interrupting:
+                    h._status = "interrupted"
+                    self._registry_update(h, "interrupted")
+                    h._settle_exception(RuntimeError(f"agent {h.name!r} was cancelled"))
+                raise
+            except Exception as e:  # noqa: BLE001 — surfaced through result()
+                h._status = "error"
+                h._session_id_seen = get_host().session_id
+                self._registry_update(h, "error")
                 h._settle_exception(e)
         h._driver = asyncio.ensure_future(drive())
         return h

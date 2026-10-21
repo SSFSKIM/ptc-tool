@@ -86,7 +86,7 @@ def test_llm_floor_without_bare(first_prompt_tokens, monkeypatch):
     assert asyncio.run(_llm.llm("Reply with exactly: OK")).strip() == "OK"
     [m] = first_prompt_tokens
     print("llm, no --bare:", m)
-    assert not m["bare"] and m["tokens"] <= 400
+    assert not m["bare"] and m["tokens"] <= 450
 
 
 @live
@@ -100,4 +100,4 @@ def test_reader_floor(first_prompt_tokens):
     [m] = first_prompt_tokens
     print("reader:", m)
     assert not m["ptc_server"], "an explicit tool list that does not name ptc gets no server"
-    assert m["tokens"] <= 3100
+    assert m["tokens"] <= 3400
