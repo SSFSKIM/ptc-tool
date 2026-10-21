@@ -2,18 +2,23 @@
 
 Requires PTC_LIVE=1. Three one-word haiku replies, each read off the first assistant
 message's usage (`input + cache_creation + cache_read`), through the real `llm()` and
-`agent.run()` paths in this process — no kernel, since a kernel's child would carry the
-ptc MCP server (see the reader case).
+`agent.run()` paths in this process. `PTC_LAUNCHER` is set to this checkout's launcher, as
+it is in every real kernel, so a child that would get the ptc MCP server does: the reader's
+floor is the one a ptc cell sees.
 
 The cwd is a fresh, short directory outside git. A child that is not `--bare` describes its
 cwd in an environment block, and the floors move with it (CLI 2.1.305, the `llm()` form
 without `--bare`): 392 tokens in `/tmp/<short>`, 417 under pytest's long `tmp_path`, 634 in
-a linked git worktree, whose description alone is ~240 tokens. The floors are taken where
-that block is smallest, and the dependence is stated here rather than hidden in a margin.
+a linked git worktree, whose description alone is ~240 tokens; the reader is 3,068 here
+and 3,302 in that worktree. `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, which every non-`full`
+profile sets, does not remove those worktree lines (both worktree figures are with it). The
+floors are taken where the block is smallest, and the dependence is stated here rather
+than hidden in a margin.
 """
 import asyncio
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -32,7 +37,8 @@ def first_prompt_tokens(tmp_path, monkeypatch):
     STATE.kernel_dir = tmp_path
     STATE.config = {"key": "profiles-live", "depth": 0, "max_depth": 1,
                     "max_concurrency": 8, "cwd": cwd}
-    monkeypatch.delenv("PTC_LAUNCHER", raising=False)
+    launcher = Path(__file__).resolve().parents[2] / "bin" / "ptc-launch"
+    monkeypatch.setenv("PTC_LAUNCHER", str(launcher))
     seen: list[dict] = []
     real = claude_agent_sdk.query
 
@@ -41,10 +47,13 @@ def first_prompt_tokens(tmp_path, monkeypatch):
         async for m in real(prompt=prompt, options=options):
             if first and type(m).__name__ == "AssistantMessage":
                 first = False
-                u = m.usage or {}
-                seen.append({"tokens": sum(u.get(k, 0) for k in (
-                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")),
-                    "bare": "bare" in (options.extra_args or {})})
+                u = m.usage
+                assert u and "input_tokens" in u, f"no usage on the first reply: {m!r}"
+                tokens = sum(u.get(k) or 0 for k in (
+                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                assert tokens > 0, f"a prompt of no tokens is no measurement: {u!r}"
+                seen.append({"tokens": tokens, "bare": "bare" in (options.extra_args or {}),
+                             "ptc_server": bool(options.mcp_servers)})
             yield m
     monkeypatch.setattr(claude_agent_sdk, "query", capture)
     yield seen
@@ -66,10 +75,12 @@ def test_llm_floor_with_credentials_runs_bare(first_prompt_tokens):
 def test_llm_floor_without_bare(first_prompt_tokens, monkeypatch):
     """The form the rule picks when the child's environment has no credential.
 
-    `--bare` is withheld through the rule itself rather than by removing the credential:
-    on a machine that signs in only through the environment (the MacBook's gateway), a
-    child without it cannot authenticate at all, so the form would never be measured.
-    `test_profiles.py` pins that a credential-free environment selects this form."""
+    `--bare` is withheld through the rule itself, with the credential left in place, rather
+    than by removing the credential: on a machine that signs in only through the
+    environment (the MacBook's gateway; its keychain login reads "OAuth session expired"),
+    a child without it cannot authenticate at all, so the form would never be measured.
+    The prompt is the same either way. `test_profiles.py` pins that a credential-free
+    environment selects this form."""
     from ptc.runtime import _llm, claude_backend
     monkeypatch.setattr(claude_backend, "_bare", lambda *a: False)
     assert asyncio.run(_llm.llm("Reply with exactly: OK")).strip() == "OK"
@@ -88,4 +99,5 @@ def test_reader_floor(first_prompt_tokens):
     assert r.text.strip() == "OK"
     [m] = first_prompt_tokens
     print("reader:", m)
+    assert not m["ptc_server"], "an explicit tool list that does not name ptc gets no server"
     assert m["tokens"] <= 3100

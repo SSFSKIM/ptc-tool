@@ -112,7 +112,7 @@ def _project_files(cwd: str) -> list[Path]:
     The git root is the nearest ancestor holding `.git` (a directory, or a linked
     worktree's file). Outside git the walk is `cwd` alone: nothing above it is project.
     """
-    here = Path(cwd).absolute()
+    here = Path(cwd).resolve()     # a symlinked cwd walks its target's ancestors
     chain = [here, *here.parents]
     root = next((d for d in chain if (d / ".git").exists()), here)
     dirs = chain[:chain.index(root) + 1]

@@ -9,7 +9,7 @@ import os
 import time
 
 from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
-from .profiles import Profile, memory_text, resolve
+from .profiles import PRESETS, Profile, memory_text, resolve
 from .state import STATE
 
 
@@ -34,6 +34,23 @@ _SETTING_SOURCES = {"none": [], "user": ["user"], "all": ["user", "project", "lo
 #: Either one means the child can authenticate under `--bare`, which reads neither the
 #: keychain nor an OAuth login (CLI help; the agent-host spec's measurements).
 _BARE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+#: A child whose tool list names this server, or one of its tools, gets the ptc MCP server.
+_PTC_SERVER = "mcp__ptc"
+
+
+def _names_ptc(tool: str) -> bool:
+    return tool == _PTC_SERVER or tool.startswith(_PTC_SERVER + "__")
+
+
+def _wants_ptc(p: Profile) -> bool:
+    """Whether an `agent.*` child gets the ptc MCP server: with Claude Code's default tool
+    set (today's child), or when its explicit list names the server. `--tools` does not
+    filter MCP tools (measured on 2.1.305: `--tools Read,mcp__ptc__exec` still listed all
+    six `mcp__ptc__*`), so a server attached to an explicit list would add its ~2.5k tokens,
+    and `exec`, to every reader. Naming one of its tools attaches the whole server."""
+    return p.tools == "default" or any(_names_ptc(t) for t in p.tools)
 
 
 def _profile(o: AgentOpts) -> Profile:
@@ -78,6 +95,10 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
     from claude_agent_sdk import ClaudeAgentOptions
     env = _child_env(o)
     p = _profile(o)
+    if p != PRESETS["full"]:
+        # A profile's prompt is the same on both routes: the host runs with this too. `full`
+        # stays exactly today's child, git context included.
+        env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
     kw: dict = dict(
         model=o.model,
         cwd=env["PTC_CWD"],
@@ -97,7 +118,8 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
     if o.allowed_tools is not None:
         kw["allowed_tools"] = o.allowed_tools
     if p.tools != "default":
-        kw["tools"] = p.tools
+        # ptc's names select its server (below); `--tools` takes the built-in set.
+        kw["tools"] = [t for t in p.tools if not _names_ptc(t)]
     if o.output_schema:
         kw["output_format"] = {"type": "json_schema", "schema": o.output_schema}
     if bare_llm:
@@ -106,9 +128,9 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
     else:
         # Children do not inherit --plugin-dir, so the ptc capability is passed explicitly.
         launcher = os.environ.get("PTC_LAUNCHER")
-        if launcher:
+        if launcher and _wants_ptc(p):
             kw["mcp_servers"] = {"ptc": {"type": "stdio", "command": launcher}}
-    if _bare(p, kw.get("tools"), env):
+    if _bare(p, [] if bare_llm else p.tools, env):
         kw["extra_args"] = {"bare": None}
     if resume:
         kw["resume"] = resume

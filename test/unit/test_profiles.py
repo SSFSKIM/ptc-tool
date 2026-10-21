@@ -5,6 +5,7 @@ The `--bare` rule and the setting-sources mapping are read off the argv the SDK'
 transport builds from `_sdk_options`, so what is pinned is what the CLI is actually given.
 """
 import asyncio
+import json
 
 import pytest
 
@@ -62,12 +63,12 @@ def test_resolved_tool_lists_never_alias_a_preset():
 
 
 @pytest.mark.parametrize("kw, match", [
-    (dict(system=3, tools=[]), "system"),
-    (dict(system=("other", "x"), tools=[]), "system"),
-    (dict(system="x", tools="all"), "tools"),
-    (dict(system="x", tools=["Read", 1]), "tools"),
-    (dict(system="x", tools=[], memory="home"), "memory"),
-    (dict(system="x", tools=[], settings="project"), "settings"),
+    ({"system": 3, "tools": []}, "system"),
+    ({"system": ("other", "x"), "tools": []}, "system"),
+    ({"system": "x", "tools": "all"}, "tools"),
+    ({"system": "x", "tools": ["Read", 1]}, "tools"),
+    ({"system": "x", "tools": [], "memory": "home"}, "memory"),
+    ({"system": "x", "tools": [], "settings": "project"}, "settings"),
 ])
 def test_profile_refuses_values_outside_its_axes(kw, match):
     with pytest.raises(ValueError, match=match):
@@ -123,6 +124,24 @@ def test_memory_text_a_worktree_root_is_its_git_root(tmp_path, monkeypatch):
     (wt / "CLAUDE.md").write_text("worktree rules")
     assert memory_text("project", str(wt)) == \
         f"Contents of {wt}/CLAUDE.md ({PROJECT}):\n\nworktree rules"
+
+
+def test_memory_text_follows_a_symlinked_cwd_to_its_repo(tmp_path, monkeypatch):
+    """A cwd reached through a symlink walks its target's ancestors, not the link's."""
+    monkeypatch.setenv("HOME", str(tmp_path / "nobody"))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "CLAUDE.md").write_text("repo rules")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "CLAUDE.md").write_text("pkg rules")
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / "CLAUDE.md").write_text("beside the link")
+    (links / "here").symlink_to(repo / "pkg")
+    real = repo.resolve()
+    assert memory_text("project", str(links / "here")) == (
+        f"Contents of {real}/CLAUDE.md ({PROJECT}):\n\nrepo rules\n\n"
+        f"Contents of {real}/pkg/CLAUDE.md ({PROJECT}):\n\npkg rules")
 
 
 def test_memory_text_outside_git_reads_the_cwd_alone(tmp_path, monkeypatch):
@@ -266,12 +285,65 @@ def test_project_memory_is_read_from_the_childs_cwd(kernel, no_creds):
         f"x\n\nContents of {repo}/CLAUDE.md ({PROJECT}):\n\nrepo rules"
 
 
-def test_bare_llm_keeps_zero_tools_and_no_mcp_server(kernel, creds, monkeypatch):
-    monkeypatch.setenv("PTC_LAUNCHER", "/opt/ptc/bin/ptc-launch")
+LAUNCHER = "/opt/ptc/bin/ptc-launch"
+
+
+def _ptc_server(argv) -> bool:
+    if "--mcp-config" not in argv:
+        return False
+    return json.loads(_flag(argv, "--mcp-config"))["mcpServers"]["ptc"]["command"] == LAUNCHER
+
+
+def test_llm_never_gets_the_ptc_server(kernel, creds, monkeypatch):
+    monkeypatch.setenv("PTC_LAUNCHER", LAUNCHER)
     o = claude_backend._sdk_options(AgentOpts(profile=PRESETS["bare"]), bare_llm=True)
     assert o.tools == [] and o.max_turns == 1 and not o.mcp_servers
-    o = claude_backend._sdk_options(AgentOpts(profile=PRESETS["reader"]))
-    assert o.mcp_servers == {"ptc": {"type": "stdio", "command": "/opt/ptc/bin/ptc-launch"}}
+    # bare_llm holds even for a profile that names the server
+    argv = _argv(AgentOpts(profile=Profile("x", ["mcp__ptc"])), bare_llm=True)
+    assert not _ptc_server(argv) and _flag(argv, "--tools") == ""
+
+
+@pytest.mark.parametrize("tools, server, builtins", [
+    ("default", True, None),                       # today's child keeps it
+    (["Read", "Grep", "Glob"], False, "Read,Grep,Glob"),
+    ([], False, ""),
+    (["Read", "mcp__ptc"], True, "Read"),            # the whole server, by name
+    (["Read", "mcp__ptc__exec"], True, "Read"),      # one of its tools names it too
+    (["mcp__ptcx"], False, "mcp__ptcx"),             # a different server's prefix
+])
+def test_ptc_server_only_when_the_tools_name_it(kernel, no_creds, monkeypatch,
+                                                 tools, server, builtins):
+    monkeypatch.setenv("PTC_LAUNCHER", LAUNCHER)
+    argv = _argv(AgentOpts(profile=Profile("x", tools)))
+    assert _ptc_server(argv) is server
+    if builtins is None:
+        assert "--tools" not in argv
+    else:
+        assert _flag(argv, "--tools") == builtins
+
+
+def test_reader_and_default_agent_through_opts(kernel, no_creds, monkeypatch):
+    monkeypatch.setenv("PTC_LAUNCHER", LAUNCHER)
+    assert _ptc_server(_argv(AgentOpts()))
+    assert not _ptc_server(_argv(AgentOpts(profile=PRESETS["reader"])))
+    assert not _ptc_server(_argv(AgentOpts(tools=["Read"])))
+
+
+GIT_OFF = "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"
+
+
+@pytest.mark.parametrize("o, bare_llm, off", [
+    (AgentOpts(), False, False),                                   # full: today's child
+    (AgentOpts(profile=PRESETS["full"]), False, False),
+    (AgentOpts(profile=PRESETS["bare"]), True, True),
+    (AgentOpts(profile=PRESETS["reader"]), False, True),
+    (AgentOpts(profile=PRESETS["worker"]), False, True),
+    (AgentOpts(system="be terse"), False, True),                   # not full any more
+])
+def test_git_context_is_off_for_every_profile_but_full(kernel, no_creds, o, bare_llm, off):
+    env = claude_backend._sdk_options(o, bare_llm=bare_llm).env
+    assert (env.get(GIT_OFF) == "1") is off
+    assert off or GIT_OFF not in env
 
 
 def test_the_bare_decision_audits_and_logs_nothing(kernel, monkeypatch, capsys):
