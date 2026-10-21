@@ -310,8 +310,9 @@ def _signal(pid: int, sig: int) -> None:
 def stop_group(pgid: int) -> bool:
     """SIGSTOP the process group `pgid`, for a caller about to SIGKILL it
     (`kill_process_tree`): once it is stopped no `claude` in it can start another tool, so
-    `tool_groups_under` reads them exactly. True when this call stopped the group, and then
-    the caller owes it a `resume_group` should the kill not follow. A caller inside that
+    `tool_groups_under` reads them exactly. True when this call stopped the group. The caller
+    owes it a `resume_group` should the kill not follow, and must arm that before calling:
+    an exception can land after the SIGSTOP and before this returns. A caller inside that
     group does not stop it (it would stop itself before the kill)."""
     try:
         if os.getpgid(0) == pgid:

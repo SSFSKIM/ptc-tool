@@ -377,6 +377,21 @@ def test_kill_process_tree_leaves_nothing_stopped_when_interrupted(kernel, monke
     assert not _stopped(kernel.agent)
 
 
+def test_kill_process_tree_leaves_nothing_stopped_when_interrupted_inside_the_stop(
+        kernel, monkeypatch):
+    """The interrupt lands after the SIGSTOP was sent, before `stop_group` returns: the
+    cleanup must already be armed, or the whole group stays stopped for good."""
+    def killpg(pgid, sig):
+        _KILLPG(pgid, sig)
+        if (pgid, sig) == (kernel.pid, signal.SIGSTOP):
+            raise KeyboardInterrupt
+    monkeypatch.setattr(os, "killpg", killpg)
+    with pytest.raises(KeyboardInterrupt):
+        kill_process_tree(kernel.pid)
+    assert not _stopped(kernel.pid)
+    assert not _stopped(kernel.agent)
+
+
 @pytest.mark.parametrize("path", ["stop_and_kill", "stop_all_and_reap"])
 def test_the_trackers_stops_are_followed_by_their_kills_when_interrupted(
         agents, tmp_path, monkeypatch, path):

@@ -425,19 +425,22 @@ def kill_process_tree(pid: int) -> None:
     reaped while their `claude`s still stand (`ptc.toolgroups.stop_group`). The reap
     comes before the group kill, not after: with the `claude`s stopped the order is
     otherwise immaterial, and a caller inside the group (`ptc kill` run from a cell) does
-    not live past the kill. A group stopped here and not killed — the kill raised, or an
-    interrupt came first — is continued, never left stopped.
+    not live past the kill. A group a stop was attempted on and not killed — the kill raised, or an
+    interrupt came first, even one landing inside `stop_group` after its SIGSTOP — is
+    continued, never left stopped: the cleanup is armed before the stop is sent, and
+    continuing a group that was never stopped is harmless.
     """
     try:
         if os.getpgid(pid) == pid:
-            stopped = toolgroups.stop_group(pid)
-            killed = False
+            attempted = killed = False
             try:
+                attempted = True              # armed before the SIGSTOP can land
+                toolgroups.stop_group(pid)
                 toolgroups.reap_rows(toolgroups.tool_groups_under(pid))
                 os.killpg(pid, signal.SIGKILL)
                 killed = True
             finally:
-                if stopped and not killed:
+                if attempted and not killed:
                     toolgroups.resume_group(pid)
             return
     except OSError:
