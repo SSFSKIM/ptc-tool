@@ -136,9 +136,10 @@ works; `r.via` says where a result ran. A host that fails to start or keeps dyin
 
 **Decide the concurrency.** On the CLI route, `PTC_MAX_CONCURRENCY` bounds one kernel,
 and every kernel on the machine — yours and each subagent's — has its own, so the machine
-carries the sum. A finished child still holds ~133 MB and ~1.5 % of a core until `close()`
-(measured 2026-09-09 on an earlier CLI build: 80 such children, 10.7 GB and 1.2 cores,
-nine hours after their work was done); a working one costs more. Choose the bound per
+carries the sum. A finished child still holds ~200 MB and ~0.5 % of a core until `close()`,
+plus ~12 MB for its ptc MCP server (measured 2026-10-21 on Claude Code 2.1.305, ten minutes
+after the turn; 2026-09-09, on an earlier build: 80 children held 10.7 GB and 1.2 cores nine
+hours after their work was done); a working one costs more. Choose the bound per
 fan-out from what the machine can carry and what the child does, and state it: `workflow.parallel(..., limit=N)` over `agent.run`/`llm`
 awaitables, or `spawn` in batches of N and `gather` a batch before starting the next. On a
 laptop, 3–4 for children that run tools; up to 8 for one-shots; past 8 only on a machine
