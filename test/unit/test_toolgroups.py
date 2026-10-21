@@ -16,6 +16,11 @@ import time
 import pytest
 
 from ptc import bgroups, toolgroups
+from ptc.kernel import kill_process_tree
+from ptc.ownership import proc_start_time
+
+#: The real calls, for cleanups that run while a test's monkeypatch still stands.
+_KILLPG = os.killpg
 
 #: An agent: starts each "tool" in a session of its own (Claude Code's `detached`), plus
 #: one child in its own group, prints their pids, then waits on stdin to be told more.
@@ -167,8 +172,105 @@ def test_a_failed_listing_is_not_read_as_the_agent_dying(agents, tmp_path, monke
 def test_a_child_named_like_an_agent_is_never_taken(agents, monkeypatch):
     """A `claude` the engine started (its own daemon, say) is not a tool group."""
     a = agents(1)
-    monkeypatch.setattr(toolgroups, "AGENT_COMMS", frozenset({toolgroups.comm(a.tools[0])}))
+    monkeypatch.setattr(toolgroups, "AGENT_COMMS",
+                        frozenset({toolgroups.snapshot(a.tools[0]).comm}))
     assert not {r["pgid"] for r in toolgroups.tool_groups(a.pid)} & set(a.tools)
+
+
+def test_a_snapshot_is_one_reading_of_one_process():
+    s = toolgroups.snapshot(os.getpid())
+    assert (s.ppid, s.pgid, s.birth) == (os.getppid(), os.getpgid(0), proc_start_time(os.getpid()))
+    assert s.comm
+    zombie = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 3
+    while not subprocess.run(["ps", "-o", "stat=", "-p", str(zombie.pid)], capture_output=True,
+                             text=True).stdout.strip().startswith("Z"):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    try:
+        assert toolgroups.snapshot(zombie.pid) is None
+    finally:
+        zombie.wait()
+
+
+def test_a_pid_that_is_not_the_agents_child_when_read_is_not_recorded(agents, tmp_path,
+                                                                       monkeypatch):
+    """A tool listed, then gone, its pid handed to an unrelated group leader before the
+    read: that leader's group is not the agent's to record (it would be SIGKILLed with
+    the agent's death)."""
+    a = agents(1)
+    stranger = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        real = toolgroups.children
+        monkeypatch.setattr(toolgroups, "children",
+                            lambda pid: [*real(pid), stranger.pid] if pid == a.pid else real(pid))
+        t = toolgroups.Tracker(os.getpid(), tmp_path)
+        t.tick()
+        rows = {r["pgid"] for r in t.rows()}
+        assert set(a.tools) <= rows
+        assert stranger.pid not in rows
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_an_agent_pid_that_changes_hands_during_the_listing_gives_no_rows(agents, tmp_path,
+                                                                          monkeypatch):
+    """The agent died, was reaped, and its pid went to another process mid-listing: the
+    children read are that process's, not the agent's."""
+    a = agents(2)
+    listed = []
+    real_children, real_snapshot = toolgroups.children, toolgroups.snapshot
+
+    def children(pid):
+        listed.append(pid)
+        return real_children(pid)
+
+    def snapshot(pid):
+        s = real_snapshot(pid)
+        if pid == a.pid and a.pid in listed and s is not None:
+            return s._replace(birth="btime=1.000000")
+        return s
+    monkeypatch.setattr(toolgroups, "children", children)
+    monkeypatch.setattr(toolgroups, "snapshot", snapshot)
+    t = toolgroups.Tracker(os.getpid(), tmp_path)
+    t.tick()
+    assert not set(a.tools) & {r["pgid"] for r in t.rows()}
+
+
+def test_a_new_agent_on_a_recycled_pid_reaps_the_old_ones_tools(agents, tmp_path):
+    a = agents(1)
+    old_tool = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        t = toolgroups.Tracker(os.getpid(), tmp_path)
+        t.agents[a.pid] = {"start": "btime=1.000000", "groups": {old_tool.pid: {
+            "pgid": old_tool.pid, "pid": old_tool.pid,
+            "leader_start": proc_start_time(old_tool.pid), "started_at": time.time(),
+            "pgid_source": "setsid", "agent": a.pid}}}
+        t.tick()
+        assert _gone_soon([old_tool.pid])
+        assert t.agents[a.pid]["start"] == toolgroups.snapshot(a.pid).birth
+        assert set(a.tools) <= set(t.agents[a.pid]["groups"])
+    finally:
+        old_tool.kill()
+        old_tool.wait()
+
+
+def test_a_child_that_cannot_be_read_is_not_recorded(agents, tmp_path, monkeypatch):
+    """Its name unread, it may be a `claude` the engine started (its daemon): not taken,
+    until a later tick reads it."""
+    a = agents(2)
+    real = toolgroups.snapshot
+    monkeypatch.setattr(toolgroups, "snapshot",
+                        lambda pid: None if pid == a.tools[0] else real(pid))
+    t = toolgroups.Tracker(os.getpid(), tmp_path)
+    t.tick()
+    rows = {r["pgid"] for r in t.rows()}
+    assert a.tools[0] not in rows
+    assert a.tools[1] in rows
+    monkeypatch.setattr(toolgroups, "snapshot", real)
+    t.tick()
+    assert a.tools[0] in {r["pgid"] for r in t.rows()}
 
 
 def test_bgroups_reap_consumes_the_agent_registry(agents, tmp_path):
@@ -196,35 +298,129 @@ def test_a_row_whose_leader_is_now_someone_else_is_spared(tmp_path):
         stranger.wait()
 
 
-def test_freeze_tree_reads_the_tools_of_a_stopped_kernels_agents(monkeypatch):
-    """`kill_process_tree`'s path: a kernel leading its group, an agent in that group."""
-    script = (f"import subprocess, sys\n"
-              f"a = subprocess.Popen([sys.executable, '-c', {_AGENT!r}, '2'], "
-              f"stdout=subprocess.PIPE, stdin=subprocess.PIPE, text=True)\n"
-              f"print(a.pid, a.stdout.readline().strip(), flush=True)\n"
-              f"import time; time.sleep(300)\n")
-    kern = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
-                            start_new_session=True)
-    agent_pid, *rest = map(int, kern.stdout.readline().split())
-    tools = rest[:2]
-    monkeypatch.setattr(toolgroups, "is_agent", lambda pid: pid == agent_pid)
-    try:
-        rows = toolgroups.freeze_tree(kern.pid)
-        assert {r["pgid"] for r in rows} >= set(tools)
-        os.killpg(kern.pid, signal.SIGKILL)
-        assert set(toolgroups.reap_rows(rows)) >= set(tools)
-        assert _gone_soon(tools)
-    finally:
-        for p in (*rest, agent_pid):
+class _Kernel:
+    """`kill_process_tree`'s subject: a kernel leading its group, an agent in that group."""
+
+    def __init__(self):
+        script = (f"import subprocess, sys\n"
+                  f"a = subprocess.Popen([sys.executable, '-c', {_AGENT!r}, '2'], "
+                  f"stdout=subprocess.PIPE, stdin=subprocess.PIPE, text=True)\n"
+                  f"print(a.pid, a.stdout.readline().strip(), flush=True)\n"
+                  f"import time; time.sleep(300)\n")
+        self.proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                                     text=True, start_new_session=True)
+        self.pid = self.proc.pid
+        self.agent, *self.rest = map(int, self.proc.stdout.readline().split())
+        self.tools = self.rest[:2]
+
+    def cleanup(self) -> None:
+        for p in (*self.rest, self.agent):
             try:
                 os.kill(p, signal.SIGKILL)
             except OSError:
                 pass
         try:
-            os.killpg(kern.pid, signal.SIGKILL)
+            _KILLPG(self.pid, signal.SIGKILL)
         except OSError:
             pass
-        kern.wait()
+        self.proc.wait()
+
+
+@pytest.fixture
+def kernel(monkeypatch):
+    k = _Kernel()
+    monkeypatch.setattr(toolgroups, "is_agent", lambda pid: pid == k.agent)
+    yield k
+    k.cleanup()
+
+
+def _stopped(pid: int) -> bool:
+    """In state T, after a moment for a SIGCONT to land."""
+    deadline = time.monotonic() + 1
+    while True:
+        stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                              text=True).stdout.strip()
+        if not stat.startswith("T") or time.monotonic() > deadline:
+            return stat.startswith("T")
+        time.sleep(0.05)
+
+
+def test_kill_process_tree_takes_the_tools_of_the_kernels_agents(kernel):
+    """`ptc kill` and restart: the group is stopped, its agent's tools read and reaped."""
+    kill_process_tree(kernel.pid)
+    assert _gone_soon([*kernel.tools, kernel.agent])
+
+
+def test_kill_process_tree_leaves_nothing_stopped_when_its_kill_fails(kernel, monkeypatch):
+    """The group SIGKILL raises, and only the kernel pid is killed: the agent it stopped
+    must not stay stopped forever."""
+    def killpg(pgid, sig):
+        if (pgid, sig) == (kernel.pid, signal.SIGKILL):
+            raise PermissionError("refused")
+        return _KILLPG(pgid, sig)
+    monkeypatch.setattr(os, "killpg", killpg)
+    kill_process_tree(kernel.pid)
+    assert not _stopped(kernel.agent)
+
+
+def test_kill_process_tree_leaves_nothing_stopped_when_interrupted(kernel, monkeypatch):
+    real = toolgroups.children
+
+    def children(pid):
+        if pid == kernel.pid:
+            raise KeyboardInterrupt           # mid-enumeration, after the stop
+        return real(pid)
+    monkeypatch.setattr(toolgroups, "children", children)
+    with pytest.raises(KeyboardInterrupt):
+        kill_process_tree(kernel.pid)
+    assert not _stopped(kernel.pid)
+    assert not _stopped(kernel.agent)
+
+
+@pytest.mark.parametrize("path", ["stop_and_kill", "stop_all_and_reap"])
+def test_the_trackers_stops_are_followed_by_their_kills_when_interrupted(
+        agents, tmp_path, monkeypatch, path):
+    a = agents(1)
+    t = toolgroups.Tracker(os.getpid(), tmp_path)
+    real = toolgroups.children
+
+    def children(pid):
+        if pid == a.pid:
+            raise KeyboardInterrupt           # reading the stopped agent's tools
+        return real(pid)
+    monkeypatch.setattr(toolgroups, "children", children)
+    with pytest.raises(KeyboardInterrupt):
+        t.stop_and_kill(a.pid) if path == "stop_and_kill" else t.stop_all_and_reap()
+    assert not _stopped(a.pid)
+    assert a.proc.wait(timeout=3) == -signal.SIGKILL
+
+
+def test_an_in_group_caller_reaps_the_tools_before_the_group_kill(kernel, monkeypatch):
+    """`ptc kill` from a cell: the caller is in the kernel's group, so it does not stop
+    the group, and the group kill ends the caller too. The tools must be reaped by then."""
+    class CallerDied(BaseException):
+        pass
+    events = []
+    real_getpgid, real_reap = os.getpgid, toolgroups.reap_rows
+
+    def killpg(pgid, sig):
+        if (pgid, sig) == (kernel.pid, signal.SIGKILL):
+            events.append("group-kill")
+            raise CallerDied                  # what the real kill does to this caller
+        return _KILLPG(pgid, sig)
+
+    def reap_rows(rows):
+        killed = real_reap(rows)
+        events.append(("reap", set(killed)))
+        return killed
+    monkeypatch.setattr(os, "getpgid", lambda pid: kernel.pid if pid == 0 else real_getpgid(pid))
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(toolgroups, "reap_rows", reap_rows)
+    with pytest.raises(CallerDied):
+        kill_process_tree(kernel.pid)
+    assert [e if e == "group-kill" else e[0] for e in events] == ["reap", "group-kill"]
+    assert set(kernel.tools) <= events[0][1]
+    assert not _stopped(kernel.agent)         # an in-group caller never stopped it
 
 
 def test_the_hosts_sigkill_escalation_takes_its_tools(agents, monkeypatch):

@@ -421,14 +421,24 @@ def kill_process_tree(pid: int) -> None:
 
     The kernel's `claude` children (the agent host, CLI-route agents) are a second such
     case, and a closable one: each runs its Bash tools in groups of their own, which this
-    kill would orphan. So the group is stopped first and those tool groups read while
-    their `claude`s still stand, then killed with it (`ptc.toolgroups.freeze_tree`).
+    kill would orphan. So the group is stopped first and those tool groups read and
+    reaped while their `claude`s still stand (`ptc.toolgroups.stop_group`). The reap
+    comes before the group kill, not after: with the `claude`s stopped the order is
+    otherwise immaterial, and a caller inside the group (`ptc kill` run from a cell) does
+    not live past the kill. A group stopped here and not killed — the kill raised, or an
+    interrupt came first — is continued, never left stopped.
     """
     try:
         if os.getpgid(pid) == pid:
-            tools = toolgroups.freeze_tree(pid)
-            os.killpg(pid, signal.SIGKILL)
-            toolgroups.reap_rows(tools)
+            stopped = toolgroups.stop_group(pid)
+            killed = False
+            try:
+                toolgroups.reap_rows(toolgroups.tool_groups_under(pid))
+                os.killpg(pid, signal.SIGKILL)
+                killed = True
+            finally:
+                if stopped and not killed:
+                    toolgroups.resume_group(pid)
             return
     except OSError:
         pass

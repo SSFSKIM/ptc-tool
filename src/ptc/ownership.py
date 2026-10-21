@@ -104,11 +104,14 @@ def _darwin_bsdinfo(pid: int) -> "tuple[_ProcBsdInfo | None, int]":
     return info, 0
 
 
+def _darwin_stamp(info: _ProcBsdInfo) -> str:
+    """The birth stamp a filled struct carries (`ptc.toolgroups.snapshot` reads it too)."""
+    return f"{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
+
+
 def _darwin_birth(pid: int) -> str | None:
     info, _ = _darwin_bsdinfo(pid)
-    if info is None:
-        return None
-    return f"{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
+    return _darwin_stamp(info) if info is not None else None
 
 
 def _ps(pid: int, fmt: str, *, pinned: bool = True) -> str | None:

@@ -16,21 +16,41 @@ it lives:
     group in `<kernel_dir>/agent-pgids.json` in `bgroups`' row format: the pgid with its
     leader's birth stamp, `leader_exited` once the leader is gone while the group lives on.
     A thread, not a task: a cell that blocks the event loop must not blind it.
-  * When a recorded `claude` is gone, its rows are reaped under `bgroups.signalable`'s rule.
-    The file is what `bgroups.reap` consumes on every kernel exit, kill and restart, so a
-    kernel that dies with its children loses none of what it had learned.
+  * When a recorded `claude` is gone, or its pid is worn by a later `claude` of ours, its
+    rows are reaped under `bgroups.signalable`'s rule. The file is what `bgroups.reap`
+    consumes on every kernel exit, kill and restart, so a kernel that dies with its
+    children loses none of what it had learned.
   * Where ptc's own code does the killing, the `claude` is stopped (SIGSTOP) first and its
     tool groups read then, so a tool started since the last tick is not missed:
     `stop_and_kill` (the host's escalation), `stop_all_and_reap` (the kernel's TTL exit),
-    `freeze_tree` (`kill_process_tree`, for `ptc kill` and restart).
+    `stop_group` and `tool_groups_under` (`kill_process_tree`, for `ptc kill` and restart).
+    No stop is left standing: the kill follows it whatever happens in between, and a
+    group `kill_process_tree` stopped but did not kill is continued (SIGCONT).
 
-Only groups led by a `claude`'s DIRECT children are taken, and never one led by a `claude`:
-a per-user daemon a tool happens to start (the `claude` daemon, tmux, gpg-agent) sits in a
-group of its own below the tool's shell and is never reaped here.
+A row is a licence to SIGKILL a group long after it was read, so it is recorded on proof.
+A listing of children is only a list of numbers, each of which may have exited and been
+handed to an unrelated process by the time it is read. So every process is read in ONE
+observation (`snapshot`: its parent, its group, its name and its birth stamp together), and
+a group is recorded only where that observation shows a direct child of the `claude`
+leading its own group, under a name that was read and is not `claude`'s; the birth stamp
+recorded is the one read with that parentage. The parent's identity must hold across the
+listing too: it is read before its children are listed and again after their reads, and
+both readings must show the birth recorded for it, or a pid that ended and was reused
+mid-listing would hand over a stranger's children. The `claude`s are found the same way,
+as children of the kernel. A read that fails records nothing, and the next tick looks
+again.
+
+Only groups led by a `claude`'s DIRECT children are taken: a per-user daemon a tool happens
+to start (tmux, gpg-agent) sits in a group of its own below the tool's shell. And never one
+led by a `claude` (the engine starts its own daemon as a direct child), nor by a process
+whose name could not be read, which might be one.
 
 Residual, accepted: a kill ptc does not make reaches only what a tick saw, so a tool whose
 shell had lived less than `TICK_S` when its `claude` was killed from outside keeps running,
-as does a process that left its tool's group (`setsid`, a double fork).
+as does a process that left its tool's group (`setsid`, a double fork). And the stop and
+the kill of a `claude` go to the pid its proof was read from a moment before, as
+`kill_process_tree`'s own read-then-signal does: no portable handle pins a process across
+that gap.
 
 Nothing here raises: every caller is on a path whose job is to end something cleanly.
 """
@@ -42,9 +62,21 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from . import bgroups
-from .ownership import _darwin_bsdinfo, _has_exited, _libc, proc_start_time, start_time_matches
+from .ownership import (
+    _BIRTH_MARK,
+    _EXITED_STATES,
+    _darwin_bsdinfo,
+    _darwin_stamp,
+    _has_exited,
+    _libc,
+    _proc_stat,
+    _start_ticks,
+    _stat_fields,
+    start_time_matches,
+)
 from .paths import private_write_text, secure_dir
 
 FILENAME = "agent-pgids.json"
@@ -122,48 +154,82 @@ def _linux_scan_children(pid: int) -> list[int]:
     return out
 
 
-def comm(pid: int) -> str | None:
-    """The process's name (`claude` for the engine), None when it cannot be read — a zombie
-    on macOS, whose libproc read fails."""
+class Snapshot(NamedTuple):
+    """One process as a single read of the process table saw it."""
+    ppid: int
+    pgid: int
+    comm: str
+    #: `ownership.proc_start_time`'s birth stamp for the same process, so that a row's
+    #: `leader_start` taken from here is what `bgroups.signalable` compares it with later.
+    birth: str
+
+
+def snapshot(pid: int) -> Snapshot | None:
+    """`pid`'s parent, process group, name and birth stamp, every field from ONE read, so
+    that all four describe the same process: libproc's `proc_bsdinfo` on macOS,
+    `/proc/<pid>/stat` on Linux. None when that read fails, finds no process, or finds one
+    that has exited (libproc refuses a zombie; Linux's state field says so)."""
     if _ON_DARWIN:
         info, _ = _darwin_bsdinfo(pid)
-        return info.pbi_comm.decode(errors="replace") if info is not None else None
+        if info is None:
+            return None
+        return Snapshot(info.pbi_ppid, info.pbi_pgid, info.pbi_comm.decode(errors="replace"),
+                        _BIRTH_MARK + _darwin_stamp(info))
     if _ON_LINUX:
         try:
-            return Path(f"/proc/{pid}/comm").read_text().strip()
-        except OSError:
+            stat = _proc_stat(pid)
+            fields = _stat_fields(stat) if stat else []
+            if len(fields) < 20 or fields[0] in _EXITED_STATES:
+                return None
+            # Field 2, the name, is everything between the first '(' and the last ')'.
+            name = stat[stat.index("(") + 1:stat.rindex(")")]
+            return Snapshot(int(fields[1]), int(fields[2]), name,
+                            _BIRTH_MARK + _start_ticks(stat))
+        except ValueError:               # a stat that is not text, or not stat's layout
             return None
     return None
 
 
+def _held_children(parent: int, born: str | None = None) -> list[tuple[int, Snapshot]]:
+    """`parent`'s direct children, each with the snapshot that shows it one, or [] when
+    `parent`'s identity did not hold across the read: it is read before the listing and
+    again after the children's reads, and both must show one birth (`born`, when given).
+    Then its pid did not change hands in between, and a child whose snapshot names it as
+    the parent was its child (module docstring)."""
+    before = snapshot(parent)
+    if before is None or (born is not None and before.birth != born):
+        return []
+    kids = [(c, s) for c in children(parent)
+            if (s := snapshot(c)) is not None and s.ppid == parent]
+    after = snapshot(parent)
+    if after is None or after.birth != before.birth:
+        return []
+    return kids
+
+
 def is_agent(pid: int) -> bool:
-    """A live Claude Code engine. A zombie is not one: its children are already init's."""
-    return comm(pid) in AGENT_COMMS and not _has_exited(pid)
+    """A live Claude Code engine. A zombie is not one (it has no snapshot): its children
+    are already init's."""
+    s = snapshot(pid)
+    return s is not None and s.comm in AGENT_COMMS
 
 
-def _pgid(pid: int) -> int | None:
-    try:
-        return os.getpgid(pid)
-    except OSError:
-        return None
+def agents_of(root: int) -> dict[int, str]:
+    """`root`'s `claude` children, each with its birth stamp."""
+    return {c: s.birth for c, s in _held_children(root) if is_agent(c)}
 
 
-def _group_row(agent: int, child: int) -> dict | None:
-    """The row for `child`'s process group when `child` leads it and is not a `claude`,
-    else None. A child in someone else's group is covered by that group's own kill, and a
-    `claude` is never taken (module docstring)."""
-    if _pgid(child) != child or comm(child) in AGENT_COMMS:
-        return None
-    start = proc_start_time(child) or proc_start_time(child)
+def tool_groups(agent: int, born: str | None = None) -> list[dict]:
+    """A row for every process group led by one of `agent`'s direct children: its tools.
+    `born` is the agent's recorded birth stamp, and nothing is returned unless it holds
+    across the read. A child in someone else's group is covered by that group's own kill,
+    and a `claude`, or a child whose name is empty, is never taken (module docstring)."""
     # The pgid was READ equal to the pid: a detached child leads its group by setsid, which
     # is what `bgroups` lets stand in for a birth stamp once the leader has exited.
-    return {"pgid": child, "pid": child, "leader_start": start, "started_at": time.time(),
-            "pgid_source": "setsid", "agent": agent}
-
-
-def tool_groups(agent: int) -> list[dict]:
-    """A row for every process group led by one of `agent`'s direct children: its tools."""
-    return [r for c in children(agent) if (r := _group_row(agent, c)) is not None]
+    return [{"pgid": c, "pid": c, "leader_start": s.birth, "started_at": time.time(),
+             "pgid_source": "setsid", "agent": agent}
+            for c, s in _held_children(agent, born)
+            if s.pgid == c and s.comm and s.comm not in AGENT_COMMS]
 
 
 def _group_alive(pgid: int) -> bool:
@@ -234,28 +300,43 @@ def reap_file(kernel_dir) -> list[int]:
     return killed
 
 
-def _stop(pid: int) -> None:
+def _signal(pid: int, sig: int) -> None:
     try:
-        os.kill(pid, signal.SIGSTOP)
+        os.kill(pid, sig)
     except OSError:
         pass
 
 
-def freeze_tree(kernel: int) -> list[dict]:
-    """Stop `kernel`'s process group and read its `claude` children's tool groups, for a
-    caller about to SIGKILL that group (`kill_process_tree`). Once the group is stopped no
-    `claude` in it can start another tool, so the rows are exact. A caller inside that
-    group is not stopped (it would stop itself before the kill); its read is a snapshot."""
+def stop_group(pgid: int) -> bool:
+    """SIGSTOP the process group `pgid`, for a caller about to SIGKILL it
+    (`kill_process_tree`): once it is stopped no `claude` in it can start another tool, so
+    `tool_groups_under` reads them exactly. True when this call stopped the group, and then
+    the caller owes it a `resume_group` should the kill not follow. A caller inside that
+    group does not stop it (it would stop itself before the kill)."""
     try:
-        if os.getpgid(0) != kernel:
-            os.killpg(kernel, signal.SIGSTOP)
+        if os.getpgid(0) == pgid:
+            return False
+        os.killpg(pgid, signal.SIGSTOP)
+    except OSError:
+        return False
+    return True
+
+
+def resume_group(pgid: int) -> None:
+    """Undo `stop_group`: SIGCONT the group."""
+    try:
+        os.killpg(pgid, signal.SIGCONT)
     except OSError:
         pass
+
+
+def tool_groups_under(root: int) -> list[dict]:
+    """The tool groups of `root`'s `claude` children, exact once `stop_group` has stopped
+    them; for a caller inside the group, which does not stop it, as current as the read."""
     rows = []
     try:
-        for child in children(kernel):
-            if is_agent(child):
-                rows += tool_groups(child)
+        for agent, born in agents_of(root).items():
+            rows += tool_groups(agent, born)
     except Exception:                    # noqa: BLE001 — the kill must follow regardless
         pass
     return rows
@@ -283,25 +364,32 @@ class Tracker:
 
     def tick(self) -> None:
         try:
-            live = {c: proc_start_time(c) for c in children(self.root) if is_agent(c)}
+            live = agents_of(self.root)
             with self.lock:
                 changed = False
                 for pid, entry in list(self.agents.items()):
                     if pid not in live and _gone(pid, entry["start"]):
                         self._reap_agent(pid)
                         changed = True
-                for pid, start in live.items():
-                    changed |= self._refresh(pid, start)
+                for pid, born in live.items():
+                    changed |= self._refresh(pid, born)
                 if changed:
                     self._persist()
         except Exception:                # noqa: BLE001 — a bad tick must not end the watcher
             pass
 
-    def _refresh(self, agent: int, start) -> bool:
-        """Drop rows whose group emptied, mark exited leaders, add new tool groups."""
-        entry = self.agents.setdefault(agent, {"start": start, "groups": {}})
-        groups = entry["groups"]
+    def _refresh(self, agent: int, born: str) -> bool:
+        """Drop rows whose group emptied, mark exited leaders, add new tool groups. An entry
+        recorded under another birth stamp is an earlier `claude` whose pid this one wears
+        now: that one is dead, so its rows are reaped first."""
         changed = False
+        entry = self.agents.get(agent)
+        if entry is not None and entry["start"] != born:
+            self._reap_agent(agent)
+            entry, changed = None, True
+        if entry is None:
+            entry = self.agents[agent] = {"start": born, "groups": {}}
+        groups = entry["groups"]
         for pgid, row in list(groups.items()):
             if not _group_alive(pgid):
                 del groups[pgid]
@@ -310,9 +398,9 @@ class Tracker:
             was = row.get("leader_exited")
             _note_leader(row)
             changed |= row.get("leader_exited") != was
-        for child in children(agent):
-            if child not in groups and (row := _group_row(agent, child)) is not None:
-                groups[child] = row
+        for row in tool_groups(agent, born):
+            if row["pgid"] not in groups:
+                groups[row["pgid"]] = row
                 changed = True
         return changed
 
@@ -323,36 +411,38 @@ class Tracker:
 
     def stop_and_kill(self, agent: int) -> None:
         """SIGKILL a `claude` this process spawned and the tools it was running: stop it,
-        read its tool groups (exact, since it can start no other), kill it, reap them.
-        `agent` must be an unreaped child, so that its pid is still its own."""
-        _stop(agent)
+        read its tool groups (exact, since it can start no other), kill it, reap them. The
+        kill follows the stop whatever comes between. `agent` must be an unreaped child,
+        so that its pid is still its own."""
+        try:
+            _signal(agent, signal.SIGSTOP)
+            with self.lock:
+                s = snapshot(agent)
+                if s is not None and s.ppid == self.root:
+                    self._refresh(agent, s.birth)
+        finally:
+            _signal(agent, signal.SIGKILL)
         with self.lock:
-            self._refresh(agent, proc_start_time(agent))
-            try:
-                os.kill(agent, signal.SIGKILL)
-            except OSError:
-                pass
             self._reap_agent(agent)
             self._persist()
 
     def stop_all_and_reap(self) -> None:
         """The kernel is exiting: stop every `claude` child, read their tool groups, reap
-        them, and SIGKILL the stopped children (the group kill that follows would too; this
-        does not leave them stopped where it does not run)."""
-        agents = [c for c in children(self.root) if is_agent(c)]
-        for a in agents:
-            _stop(a)
-        with self.lock:
+        them, and SIGKILL the stopped children whatever comes between (the group kill that
+        follows would too; this does not leave them stopped where it does not run)."""
+        agents = agents_of(self.root)
+        try:
             for a in agents:
-                self._refresh(a, proc_start_time(a))
-            for a in list(self.agents):
-                self._reap_agent(a)
-            self._persist()
-        for a in agents:
-            try:
-                os.kill(a, signal.SIGKILL)
-            except OSError:
-                pass
+                _signal(a, signal.SIGSTOP)
+            with self.lock:
+                for a, born in agents.items():
+                    self._refresh(a, born)
+                for a in list(self.agents):
+                    self._reap_agent(a)
+                self._persist()
+        finally:
+            for a in agents:
+                _signal(a, signal.SIGKILL)
 
     def _persist(self) -> None:
         if self.kernel_dir is None:
