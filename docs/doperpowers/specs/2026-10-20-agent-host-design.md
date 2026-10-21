@@ -265,7 +265,8 @@ retired.
  "timeoutMs": 600000}   // timeoutMs null when the call has no deadline
 // Result
 {"ok": true, "text": "…", "textFile": null, "usage": {…}, "agentId": "…"}
-{"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout|too-large", "detail": "…", "status": 429}
+{"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout|too-large|max-tokens", "detail": "…", "status": 429,
+ "text": "<partial reply, when there is one>", "agentId": "…"}
 ```
 
 - **Delivery.** A response, with every job and cancel in it, counts as delivered when
@@ -1076,6 +1077,18 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: The whole-branch review (reviewer-high) found three P2 defects, fixed in 33df0fc:
+  a launch that returned as a `close()` cancelled the start was left unowned (now every
+  launched process not handed to its generation gets a bounded close); the mod spawned an
+  agent after a cancel that arrived during its preflight (it now rechecks and posts
+  `aborted` without creating the child); and a failed agent's partial text travelled only as
+  `detail` (a failed Result now carries `text`, above). The same wave fixed the deferred
+  double audit record: a schema call whose host goes away after it took attempt 1 now fails
+  on the host with `AgentFailed` carrying the first reply, rather than running again on the
+  CLI, so one call keeps one route and one record, as a host dying under any running job
+  already does. The preflight-cancel fix is covered by the mod's typecheck only: the Python
+  fake cannot drive the mod, and no live calls remained.
+  Date/Author: 2026-10-20, M3 task-executor, folded by the plan-executor.
 - Decision: **v0.6.0 shipped** (`.claude-plugin/plugin.json`, `marketplace.json`). It
   carries the agent host and prompt profiles:
   - `via=` on `llm()` and `agent.*`;
