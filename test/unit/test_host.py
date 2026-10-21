@@ -304,8 +304,11 @@ def test_a_lapsed_lease_retires_the_generation(tmp_path):
         h = make_host(tmp_path, launcher, lease_s=0.5)
         try:
             with pytest.raises(AgentFailed, match="agent host retired: lease"):
-                await h.submit(agent_job(), None)
+                await h.submit(agent_job("lost"), None)
             assert launcher.procs[0].closed
+            launcher.plan.append({"handler": echo})
+            await h.submit(complete("next"), soon(5))
+            assert [j["prompt"] for j in launcher.mod.jobs] == ["next"]   # nothing replayed
         finally:
             await h.close()
     asyncio.run(main())
@@ -318,7 +321,10 @@ def test_a_lost_delivery_retires_the_generation(tmp_path):
         h = make_host(tmp_path, launcher)
         try:
             with pytest.raises(AgentFailed, match="agent host retired: delivery"):
-                await h.submit(agent_job(), None)
+                await h.submit(agent_job("lost"), None)
+            launcher.plan.append({"ack": True, "handler": echo})
+            await h.submit(complete("next"), soon(5))
+            assert [j["prompt"] for j in launcher.mod.jobs] == ["next"]   # nothing replayed
         finally:
             await h.close()
     asyncio.run(main())
@@ -584,4 +590,24 @@ def test_a_job_with_no_deadline_has_no_timeout(tmp_path):
             assert launcher.mod.jobs[0]["timeoutMs"] is None
         finally:
             await h.close()
+    asyncio.run(main())
+
+
+def test_the_kernels_release_path_closes_the_host(tmp_path, monkeypatch):
+    """Kernel exit and idle reap reach the host through `bootstrap._release_backends`, the
+    path that releases CLI children; a kernel that never asked for a host creates none."""
+    from ptc.runtime import bootstrap
+
+    async def main():
+        await bootstrap._release_backends()
+        assert host_mod.current_host() is None
+        launcher = FakeLauncher(handler=hold)
+        h = make_host(tmp_path, launcher)
+        monkeypatch.setattr(host_mod, "_HOST", h)
+        call = asyncio.ensure_future(h.submit(agent_job(), None))
+        await until(lambda: launcher.procs and launcher.mod.jobs)
+        await bootstrap._release_backends()
+        with pytest.raises(AgentFailed, match="closed"):
+            await call
+        assert launcher.procs[0].closed and not h.enabled()
     asyncio.run(main())
