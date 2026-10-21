@@ -34,8 +34,8 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) M2 — prompt profiles on the CLI route (3777674, fix 3e554d5; review clean).
 - [x] (2026-10-20) M3 — the host route (22e4c1b, 17ddb4e, fix be5003b; review clean). 335 of 400 haiku calls.
 - [x] (2026-10-20) M4 — doctrine, acceptance, ship (v0.6.0).
-- [ ] Whole-branch review (review-code, high).
-- [ ] Outcomes & Retrospective.
+- [x] (2026-10-20) Whole-branch review (review-code, high): three P2 defects found, fixed in 33df0fc, re-review correct.
+- [x] (2026-10-20) Outcomes & Retrospective.
 
 ## Terms of art
 
@@ -1384,4 +1384,46 @@ are in `ledger.jsonl` beside the driver.
 
 ## Outcomes & Retrospective
 
-Pending — written at finish.
+**What shipped (v0.6.0).** A kernel now runs one long-lived headless `claude`, the agent host,
+and runs `llm()` calls and lean subagents inside it; every child on either route is built
+from a profile. Against the purpose this spec opened with:
+
+- *Fan-out bounded by the machine, not the rate limit.* One host held 128 completes and 128
+  reader agents in flight in 581 MB (M1, Q4). A 64-wide `llm()` fan-out took 4.2 s on one
+  host pid against 21.5 s on the CLI route at its cap of 8 (acceptance 1).
+  `PTC_HOST_MAX_CONCURRENCY` defaults to 256.
+- *A profile chooses what goes into the prompt.* `llm()` on the CLI is 61 tokens with
+  `--bare` (379–421 without, by cwd); on the host 34. A host reader is 3,459 against
+  `general-purpose`'s ~26 k. `full` stays exactly today's child.
+- *Nothing dropped silently.* Every option either travels to the host or sends the call to
+  the CLI; the host's death, lease lapse, lost delivery or abandoned cap retires its
+  generation and fails its jobs, never replaying; a crash loop sends `"auto"` to the CLI for
+  the kernel's life.
+
+**Where the spec was wrong, and what the execution revised.** M1 overturned three design
+assumptions: a spawn's `cwd` is not honored (so a non-kernel `cwd` routes to the CLI), the
+host's main loop must keep the default tools (spawns go through `Agent`, cancels through
+`TaskStop`), and the engine refuses rather than queues a spawn past its cap. The reader floor
+had grown with the 2.1.305 tool schemas, so acceptance 2 moved from 3,000 to 4,200, and
+acceptance 3 got margin for the cwd-dependent environment block. `full` turned out to be an
+empty system prompt, not the `claude_code` preset. Three findings changed shipped behavior
+beyond the host: an explicit tool list no longer drags the ptc MCP server into a child
+(enforcing v0.5.4's own doctrine), `run_once` folds the SDK's `ResultError` into
+`AgentFailed`, and no CLI child makes the engine's hidden session-title request any more,
+which halves the requests of every CLI child.
+
+**What remains.** Tech debt, logged on ptc-tool issue #1 under v0.6.0: Bash tool process groups
+outlive a host SIGKILLed from outside the kernel (as on the CLI route; fix sketched); a reply
+between 64 k and 128 k tokens with no cap fails loudly on the host where the CLI returns it
+whole; the fork `DeprecationWarning` and two load-sensitive integration flakes (friction #4).
+
+**Lessons.**
+- Count requests at the gateway, not calls in the driver. The CLI's hidden title request
+  made every CLI-route count low (M3 ~408 requests against a reported 335) and was found only
+  in M4, by reading a session's billed input against its first request.
+- A spike whose deliverable is knowledge earned its budget: every one of M1's nine answers
+  was consumed by M3, and three of them would have been shipped wrong from the design text.
+- The whole-branch review at high found three real races and losses that four task reviews
+  did not (a launch handed off during shutdown, a spawn after a preflight cancel, a failed
+  agent's partial text); the deep read at the end was worth its rung.
+
