@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from ptc.paths import KEY_MAX, private_write_text, secure_dir
 
 from . import audit
+from .profiles import PRESETS, Profile, resolve
 from .state import STATE
 
 #: Teardown gets its own budget, separate from any call deadline. S1 measured a cancelled
@@ -104,6 +105,10 @@ class AgentOpts:
     effort: str | None = None
     output_schema: dict | None = None
     timeout: float | None = None
+    #: What the child's prompt is made of (`profiles.py`), claude-only. `_Agent._opts`
+    #: stores it resolved, `system=`/`tools=` laid over it; `None` reads as the `full`
+    #: preset with this option set's own `system`/`tools`, which is today's child.
+    profile: Profile | str | None = None
 
 
 @dataclass
@@ -507,6 +512,15 @@ class _Agent:
         bad = set(kw) - set(AgentOpts.__dataclass_fields__)
         if bad:
             raise TypeError(f"unsupported agent options: {sorted(bad)}")
+        profile = kw.pop("profile", None)
+        if provider == "claude":
+            kw["profile"] = resolve(profile, default="full",
+                                    system=kw.get("system"), tools=kw.get("tools"))
+        elif profile is not None and resolve(profile, default="full") != PRESETS["full"]:
+            # Profiles shape a Claude child's prompt; a codex thread has no tool set or
+            # setting sources to shape, so accepting one would drop it silently.
+            raise ValueError(f"profiles are claude-only; provider {provider!r} takes "
+                             f"profile='full' or none, got {profile!r}")
         return AgentOpts(provider=provider, **kw)
 
     def _claim_name(self, name: str) -> None:

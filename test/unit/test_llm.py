@@ -20,7 +20,7 @@ def test_llm_calls_backend_bare(monkeypatch, tmp_path):
     seen = {}
 
     async def fake_run_once(task, o, *, resume=None, fork=False, bare_llm=False):
-        seen.update(task=task, model=o.model, system=o.system, bare=bare_llm,
+        seen.update(task=task, model=o.model, system=o.profile.system, bare=bare_llm,
                     schema=o.output_schema)
         from ptc.runtime.agents import AgentResult
         return AgentResult('{"a": 1}', "s", {"a": 1} if o.output_schema else None, 0, 1, 5)
@@ -69,7 +69,7 @@ def test_llm_default_system_prompt_is_terse(monkeypatch, tmp_path):
     seen = {}
 
     async def fake_run_once(task, o, *, resume=None, fork=False, bare_llm=False):
-        seen["system"] = o.system
+        seen["system"] = o.profile.system
         from ptc.runtime.agents import AgentResult
         return AgentResult("ok", "s", None, 0, 1, 5)
 

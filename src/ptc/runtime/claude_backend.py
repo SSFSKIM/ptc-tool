@@ -9,6 +9,7 @@ import os
 import time
 
 from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
+from .profiles import Profile, memory_text, resolve
 from .state import STATE
 
 
@@ -27,10 +28,56 @@ def _child_env(o: AgentOpts) -> dict:
     return child_ptc_env(o)
 
 
+#: How a profile's `settings` axis reaches the CLI.
+_SETTING_SOURCES = {"none": [], "user": ["user"], "all": ["user", "project", "local"]}
+
+#: Either one means the child can authenticate under `--bare`, which reads neither the
+#: keychain nor an OAuth login (CLI help; the agent-host spec's measurements).
+_BARE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _profile(o: AgentOpts) -> Profile:
+    """The option set's profile, resolved. `_Agent._opts` already resolved it for agent
+    calls; any other caller's `AgentOpts` (`llm()`, `web.py`, a test) gets the same rule."""
+    return resolve(o.profile, default="full", system=o.system, tools=o.tools)
+
+
+def _system_prompt(system, memory: str):
+    """The profile's system axis as the SDK's `system_prompt`, memory text appended."""
+    if isinstance(system, str) and system != "claude_code":
+        return "\n\n".join(t for t in (system, memory) if t)
+    append = system[1] if isinstance(system, tuple) else ""
+    append = "\n\n".join(t for t in (append, memory) if t)
+    preset = {"type": "preset", "preset": "claude_code"}
+    return {**preset, "append": append} if append else preset
+
+
+def _bare(p: Profile, tools, env: dict) -> bool:
+    """Whether the child runs `--bare`: settings off, a plain system prompt, NO tools, and
+    a credential in its environment.
+
+    `--bare` takes a settings-off `llm()` child from about 400 prompt tokens to about 60,
+    but it is not prompt trimming alone (measured on CLI 2.1.305): it cuts the default tool set to Bash, Edit and
+    Read, cuts any explicit list to its part of those three (`reader`'s Read/Grep/Glob
+    became Read), and replaces Claude Code's system prompt with a ~40-token stub. The one
+    child it cannot change is a plain-prompt child with no tools to cut. And it signs in
+    only from the environment, so without a credential there it would fail to start.
+
+    `env` is checked as the SDK will pass it — the kernel's environment with `env` laid
+    over it — and only for presence: it is never copied out, logged or audited (the trust
+    note in `_child_env`).
+    """
+    if p.settings != "none" or tools != [] or not isinstance(p.system, str) \
+            or p.system == "claude_code":
+        return False
+    return any((env[k] if k in env else os.environ.get(k)) for k in _BARE_CREDENTIALS)
+
+
 def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
                  bare_llm: bool = False):
     from claude_agent_sdk import ClaudeAgentOptions
     env = _child_env(o)
+    p = _profile(o)
     kw: dict = dict(
         model=o.model,
         cwd=env["PTC_CWD"],
@@ -38,19 +85,19 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
         env=env,
         # S1: the default (None) loads the host user's settings, CLAUDE.md and HOOKS into
         # every child — measured 4.7x the cost of an isolated call, plus foreign hook
-        # execution inside our child. PTC configures children explicitly instead.
-        setting_sources=[],
+        # execution inside our child. PTC configures children explicitly instead, and a
+        # profile's `settings` axis is the only way back in.
+        setting_sources=list(_SETTING_SOURCES[p.settings]),
+        system_prompt=_system_prompt(p.system, memory_text(p.memory, env["PTC_CWD"])),
     )
-    if o.system:
-        kw["system_prompt"] = o.system
     if o.max_turns:
         kw["max_turns"] = o.max_turns
     if o.effort:
         kw["effort"] = o.effort
     if o.allowed_tools is not None:
         kw["allowed_tools"] = o.allowed_tools
-    if o.tools is not None:
-        kw["tools"] = o.tools
+    if p.tools != "default":
+        kw["tools"] = p.tools
     if o.output_schema:
         kw["output_format"] = {"type": "json_schema", "schema": o.output_schema}
     if bare_llm:
@@ -61,6 +108,8 @@ def _sdk_options(o: AgentOpts, *, resume: str | None = None, fork: bool = False,
         launcher = os.environ.get("PTC_LAUNCHER")
         if launcher:
             kw["mcp_servers"] = {"ptc": {"type": "stdio", "command": launcher}}
+    if _bare(p, kw.get("tools"), env):
+        kw["extra_args"] = {"bare": None}
     if resume:
         kw["resume"] = resume
         kw["fork_session"] = fork
