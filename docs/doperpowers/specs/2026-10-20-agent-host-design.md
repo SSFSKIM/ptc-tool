@@ -139,7 +139,8 @@ sends a job to the agent host.
 - `agent.spawn()`, `agent.fork()` and `agent.resume()` always go to the **CLI**. A spawn
   handle's purpose is `send()` follow-ups on a live conversation, which host agents do not
   offer (non-goal below). Routing `spawn` to the host under `auto` would turn a later
-  `send()` into an error the caller did not choose.
+  `send()` into an error the caller did not choose. `agent.spawn(via="host")` is allowed
+  and single-shot: its handle settles once, and `send()` raises.
 - The CLI route is required for: `provider="codex"`; a profile whose system is
   `"claude_code"`; `settings` other than `"none"`; and `json_schema=` when M1's verdict says
   host schema calls are not reliable enough (see "Structured output").
@@ -397,7 +398,9 @@ that cannot express a value falls back as described under "Routes".
     default), `tools=[]`, no memory, settings `"none"`. This is `llm()`'s profile.
   - `reader`: system `READER_SYSTEM`, `tools=["Read", "Grep", "Glob"]`, no memory,
     settings `"none"`. `READER_SYSTEM` is a short read-only investigator prompt: use the
-    tools given, cite absolute paths, end with the findings. The executor writes it and
+    tools given, and, only when the task names no reply format of its own, cite absolute
+    paths and end with the findings. (M3: a citation instruction stated unconditionally
+    outweighed a task's "number only" in 7 of 32 haiku readers.) The executor writes it and
     keeps it under 120 words.
   - `worker`: system `"claude_code"`, tools `["Read", "Grep", "Glob", "Bash", "Edit", "Write"]`,
     memory `"global"`, settings `"none"`. Its system means it runs on the CLI route.
@@ -492,7 +495,7 @@ cell or a shell.
    is `1`, and no other bundled CLI belongs to this kernel. The same fan-out with
    `via="cli"` takes longer at its cap of 8: report both times.
 2. **32 reader agents run on the host.** `agent.run(f"How many lines does {p} have? Reply
-   with the number only.", profile="reader")` over 32 files whose line counts the test
+   with the number only.", profile="reader", model="haiku")` over 32 files whose line counts the test
    knows, in a git cwd. All 32 are right, and the first request in each run's transcript
    has a prompt of at most 4,200 tokens.
 3. **CLI-route floors**, in a non-git cwd, with `PTC_LAUNCHER` set as in a real kernel. `llm("Reply with exactly: OK",
@@ -783,7 +786,8 @@ def get_host() -> AgentHost: ...            # the kernel's one instance
 
 # public, in the kernel namespace
 async def llm(prompt, *, model="haiku", system=None, json_schema=None, timeout=300.0,
-              profile="bare", via="auto", max_tokens=4096, effort=None): ...
+              profile="bare", via="auto", max_tokens=None, effort=None): ...
+# max_tokens=None: the CLI's own per-model output cap, so both routes return the same reply
 # agent.run / agent.spawn gain: profile=None (→ "full"), via="auto"
 # AgentResult gains: via: str = "cli", agent_id: str | None = None
 ```
@@ -938,8 +942,66 @@ are in `ledger.jsonl` beside the driver.
   Read,mcp__ptc__exec` still listed all six ptc tools. The backend therefore drops ptc
   names from `--tools`, and naming any one ptc tool attaches the whole server.
 
+- Observation (M3): live, in real kernels. Acceptance 1: host 64/64 in 4.2 s on one host
+  pid; `via="cli"` 64/64 in 21.5 s at cap 8. Acceptance 2: 32/32 readers in a git cwd,
+  every first request 3,448 prompt tokens, all on `claude-haiku-5-5` with the session's
+  `CLAUDE_CODE_SUBAGENT_MODEL=opus` exported. Acceptance 4: all 32 in-flight calls raised
+  `AgentFailed: agent host retired: killed by signal 9 (SIGKILL)` and the next `llm()`
+  answered on a new pid. Acceptance 5: the old host pid gone within 10 s of a restart.
+  Acceptance 6: both fallbacks answer on the CLI, the unloadable plugin with exactly one
+  warning. 324 haiku calls.
+- Observation (M3): on 2.1.305 the Read tool shows an empty numbered line after a trailing
+  newline, and haiku readers counted it as a line 3 times in 32. The live test's files end
+  without a newline. The host reader floor is 3,448 in a plain git repository and 3,369
+  outside git; M1's 3,604 was a worktree, whose environment block is longer.
+- Observation (M3): on a host crash the SDK's logger writes `Fatal error in message
+  reader: Command failed with exit code -9` to the cell's stderr before the calls fail.
+  `jsonschema` was already in `uv.lock`, through `mcp`.
+
 ## Decision Log
 
+- Decision: The author's rulings on M3's concerns. (1) `llm()`'s `max_tokens` defaults to
+  the CLI's own per-model output cap, not 4096 (Interfaces), and a reply cut at the cap
+  ends the same way on both routes, as the CLI route already surfaces it; the route
+  choice must not change the answer. (2) Acceptance 2 runs on haiku (`model="haiku"`), as
+  the live test does. (3) `READER_SYSTEM` cites files and ends with findings only when the
+  task names no reply format of its own; acceptance 2 is re-checked with it in M4's
+  acceptance run. (4) The mod's bounded result retry gets a stub-channel test if cheap,
+  else a tech-debt entry; no live calls on it.
+  Rationale: under `"auto"` a 4096 cap would cut replies the CLI returns whole. The
+  citation instruction outweighed "number only" (M3, Discoveries).
+  Date/Author: 2026-10-20, doperpowers-15 (the spec's author), recorded by the plan-executor.
+- Decision: M3's executor decisions, accepted by the author as in intent and folded.
+  - The host runs `bypassPermissions` only: another `permission_mode` goes to the CLI
+    (`via="host"` raises), because a bypass parent's mode takes precedence over a
+    subagent's own and another mode would be dropped silently. `allowed_tools` is
+    therefore always "carried as nothing".
+  - Tools that start agents (`Agent`, `Task`, `Workflow`) send a call to the CLI, for the
+    `PTC_MAX_DEPTH` reason the spec gives for `Agent`.
+  - The session's variables (`host.EMPTIED`: the subagent-model, workflow-model, plugin-dir
+    and session-identity variables) are set to empty in `options.env`, since the SDK
+    merges `env` over `os.environ` and cannot delete a key; the engine reads each empty
+    one as unset (checked in the bundle, and live: haiku on every host request with
+    `opus` exported).
+  - One socket per generation, `<kernel_dir>/host/g<n>.sock`; a retired generation's
+    server answers 410, which ends that mod's poll loop. A poll superseded by a newer one
+    is answered empty; the kernel caps any hold at 25 s.
+  - Protocol 1 additions: `/hello` carries `session` and `cwd` (the transcript path and
+    `session_id`), and its response carries `outDir`. A `textFile` is accepted only at
+    `out/<id>.txt`. A job's `cwd` field is sent as `null` (Q9).
+  - A job that waited for a slot while its generation retired starts the next
+    generation; `submit` raises `HostUnavailable` only before anything is queued. A
+    caller abandoning a never-delivered job releases its slot at once.
+  - `enabled()` is false when the host is closed or `PTC_LAUNCHER` is unset (no plugin to
+    find); then `"auto"` uses the CLI and nothing counts toward the crash loop. A missing
+    `host-plugin/.claude-plugin/plugin.json` fails the start at once.
+  - Warnings: one per failed start, shared by its waiters; one at the crash-loop switch.
+  - A result with reason `"timeout"` raises `TimeoutError`, like the kernel's own deadline.
+  - `PTC_HOST*` are read once from the kernel's environment in `get_host()`, not added to
+    `Config`.
+  - The route logic lives in `routes.py`, the channel and lifecycle in `host.py`.
+  Rationale: each follows the spec's stated reasons where its letter was silent.
+  Date/Author: 2026-10-20, M3 task-executor, accepted by doperpowers-15, folded by the plan-executor.
 - Decision: Acceptance 3's limits get margin: `llm()` without `--bare` at most 450, the
   CLI reader at most 3,400, `llm()` with `--bare` still at most 100, in any non-git cwd
   (the length condition dropped; M4 runs it under pytest's `tmp_path`).
