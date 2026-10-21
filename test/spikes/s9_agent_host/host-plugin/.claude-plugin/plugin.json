@@ -1,0 +1,5 @@
+{
+  "name": "ptc-host",
+  "version": "0.0.1",
+  "description": "ptc agent host (spike S9): long-polls the kernel's channel and runs its model calls and lean subagents in this one process"
+}
