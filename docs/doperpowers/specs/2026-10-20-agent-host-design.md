@@ -27,7 +27,7 @@ routes and concurrency and nothing else.
 
 - [x] (2026-10-20) Design discussed and approved with the owner; measurements below taken.
 - [x] (2026-10-20) Spec written.
-- [ ] SDK pin to `claude-agent-sdk==0.2.169` (bundled CLI 2.1.305) shipped on `main` as v0.5.5 — a separate change, in flight; M1 needs it.
+- [x] (2026-10-20) SDK pin to `claude-agent-sdk==0.2.169` (bundled CLI 2.1.305) shipped on `main` as v0.5.5 (5a6bca7), merged into this branch at 1f50755.
 - [x] (2026-10-20) Spec review, round 1: adversarial design review and buildability review, both folded in (Decision Log).
 - [x] (2026-10-20) Spec review, round 2 on the round-1 fixes: folded in (Decision Log).
 - [ ] M1 — spike: host feasibility.
