@@ -92,10 +92,14 @@ class Session:
         self.mode, self.args = mode, args
         self.dir = OUT / f"{mode}-{time.strftime('%Y%m%d-%H%M%S')}"
         self.dir.mkdir(parents=True)
-        self.work = self.dir / "work"
-        self.work.mkdir()
+        if args.outside_git:
+            import tempfile
+            self.work = Path(tempfile.mkdtemp(prefix="s9-work-"))
+        else:
+            self.work = self.dir / "work"
+            self.work.mkdir()
         self.complete_calls = 0
-        self.agent_calls = 0
+        self.transcripts: list[Path] = []
         self.main_calls = 0
         self.uncounted_agents = 0
         self.models: set[str] = set()
@@ -116,7 +120,8 @@ class Session:
         self.host = await start_host(
             self.chan, cwd=self.work, run_dir=self.dir, first_query=first_query,
             main_tools=main_tools or self.args.main_tools,
-            subagent_cap=cap or self.args.subagent_cap or 64, hello_timeout=hello_timeout)
+            subagent_cap=cap or self.args.subagent_cap or 64, hello_timeout=hello_timeout,
+            extra_env=dict(kv.split("=", 1) for kv in self.args.host_env))
         return self.host
 
     async def stop(self):
@@ -144,6 +149,10 @@ class Session:
             res = r if isinstance(r, dict) else {"ok": False, "reason": "driver", "detail": repr(r)}
             rows.append({"job": j, "result": res,
                          "latency": None if rec.result_at is None else rec.result_at - rec.submitted})
+        if any(row["job"]["kind"] == "agent" for row in rows):
+            # The engine writes a subagent's last transcript rows after its turn.complete
+            # reaches the mod: read too soon, the final request is missed.
+            await asyncio.sleep(2)
         for row in rows:
             if row["job"]["kind"] == "agent":
                 self.count_agent(row)
@@ -154,15 +163,21 @@ class Session:
         sid = self.hello()["spike"]["sessionId"]
         path = transcript(sid, agent_id) if agent_id else None
         if path is None:
-            if agent_id or row["result"].get("reason") not in ("denied",):
+            # No agentId: the spawn never started a subagent (denied, or refused before
+            # it ran), so it made no request. An id with no transcript is estimated.
+            if agent_id:
                 self.uncounted_agents += 1
             row["requests"] = None
             return
         reqs = requests_of(path)
         row["requests"] = reqs
         row["transcript"] = str(path)
-        self.agent_calls += len(reqs)
+        self.transcripts.append(path)
         self.models |= {r["model"] for r in reqs if r["model"]}
+
+    @property
+    def agent_calls(self) -> int:
+        return sum(len(requests_of(p)) for p in self.transcripts)
 
     @property
     def calls(self) -> int:
@@ -280,13 +295,14 @@ async def q2(s: Session):
                         "reason": r["result"].get("reason"), "detail": r["result"].get("detail"),
                         "requests": len(reqs),
                         "first_prompt_tokens": reqs[0]["prompt_tokens"] if reqs else None,
+                        "offered_tools": reqs[0].get("tools") if reqs else None,
                         "models": sorted({q["model"] for q in reqs}),
                         "transcript": r.get("transcript")})
         rows_all[setting] = {"main_tools": main_tools, "agents": out}
         for o in out:
             print(f"main_tools={setting} ({len(main_tools)} listed) type_tools={o['tools']} "
                   f"ok={o['ok']} right={o['right']} requests={o['requests']} "
-                  f"first_prompt_tokens={o['first_prompt_tokens']} models={o['models']}"
+                  f"first_prompt_tokens={o['first_prompt_tokens']} offered={o['offered_tools']} models={o['models']}"
                   + (f" reason={o['reason']} detail={str(o['detail'])[:200]}" if not o["ok"] else ""))
     s.report["settings"] = rows_all
 
@@ -362,7 +378,7 @@ async def q5(s: Session):
     """Can a running subagent be stopped? Does aborting $.model.complete resolve `aborted`?"""
     out = {}
     await s.start()
-    j = complete_job("Count from 1 to 400, one number per line, nothing else.", max_tokens=4096)
+    j = complete_job("Count from 1 to 2000, one number per line, nothing else.", max_tokens=16000)
     s.complete_calls += 1
     fut = s.chan.submit(j)
     await asyncio.sleep(s.args.cancel_after)
@@ -382,7 +398,7 @@ async def q5(s: Session):
           f"cancel_to_result_s={fmt_s(out['complete']['cancel_to_result_s'])}")
     files = write_files(s.work, 8, "q5")
     listing = " ".join(str(p) for p, _ in files)
-    for via in s.args.cancel_vias.split(","):
+    for via in [v for v in s.args.cancel_vias.split(",") if v]:
         job = agent_job(f"Read each of these files one at a time, one Read call per turn, in "
                         f"order: {listing}. Then reply with how many you read.",
                         type_=reader_type(max_turns=10), cancel_via=via)
@@ -563,6 +579,32 @@ async def q9(s: Session):
     s.report["cwd"] = out
 
 
+async def floor(s: Session):
+    """The reader floor by cause: each job differs from the last in one part of the type."""
+    await s.start()
+    base = reader_type()
+    variants = [("no tools, type prompt '.'", {**base, "prompt": ".", "tools": []}),
+                ("no tools, READER_SYSTEM", {**base, "tools": []}),
+                ("Read", {**base, "tools": ["Read"]}),
+                ("Grep", {**base, "tools": ["Grep"]}),
+                ("Glob", {**base, "tools": ["Glob"]}),
+                ("Read,Grep,Glob (reader)", base)]
+    rows = await s.run_jobs([agent_job("Reply with exactly: OK", type_=t) for _, t in variants])
+    await s.stop()
+    out = []
+    for (label, _), r in zip(variants, rows):
+        reqs = r.get("requests") or []
+        first = reqs[0] if reqs else {}
+        out.append({"variant": label, "ok": r["result"].get("ok"),
+                    "first_prompt_tokens": first.get("prompt_tokens"),
+                    "offered": first.get("tools"), "system_chars": first.get("system_chars"),
+                    "transcript": r.get("transcript")})
+        print(f"{label}: first_prompt_tokens={first.get('prompt_tokens')} "
+              f"offered={first.get('tools')} system_chars={first.get('system_chars')}")
+    s.report["floor"] = out
+    s.report["host_env"] = s.args.host_env
+
+
 # ---- entry --------------------------------------------------------------------------------
 
 
@@ -575,7 +617,8 @@ def projection(args) -> tuple[str, int]:
     q = args.q
     n = args.n or 16
     return f"q{q}", {1: 1, 2: 2 * len(args.q2_settings.split(";")) + 1, 3: n,
-                     5: 1 + 10 * len(args.cancel_vias.split(",")), 7: 0, 8: 3, 9: 6}[q]
+                     5: 1 + 10 * len([v for v in args.cancel_vias.split(",") if v]), 7: 0, 8: 3, 9: 6,
+                     10: 6}[q]
 
 
 async def amain(args) -> int:
@@ -596,7 +639,7 @@ async def amain(args) -> int:
         elif args.schema:
             await q6(s, args.schema)
         else:
-            await {1: q1, 2: q2, 3: q3, 5: q5, 7: q7, 8: q8, 9: q9}[args.q](s)
+            await {1: q1, 2: q2, 3: q3, 5: q5, 7: q7, 8: q8, 9: q9, 10: floor}[args.q](s)
     finally:
         await s.stop()
         s.finish()
@@ -605,7 +648,8 @@ async def amain(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--q", type=int, choices=[1, 2, 3, 4, 5, 7, 8, 9])
+    ap.add_argument("--q", type=int, choices=[1, 2, 3, 4, 5, 7, 8, 9, 10],
+                    help="a question; 10 is the reader floor broken down by cause")
     ap.add_argument("--ramp", help="Q4: widths, e.g. 8,32,128,256")
     ap.add_argument("--schema", type=int, help="Q6: number of schema calls")
     ap.add_argument("--n", type=int, help="Q3: number of concurrent completes (16)")
@@ -617,6 +661,10 @@ def main() -> int:
                     help="CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS (default: width + 8, else 64)")
     ap.add_argument("--cancel-vias", default="taskstop,step,tooldeny")
     ap.add_argument("--cancel-after", type=float, default=4.0)
+    ap.add_argument("--outside-git", action="store_true",
+                    help="run the host in a fresh /tmp directory (no git context)")
+    ap.add_argument("--host-env", action="append", default=[], metavar="K=V",
+                    help="an extra variable in the host's environment (repeatable)")
     ap.add_argument("--budget", type=int, default=BUDGET)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()

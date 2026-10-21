@@ -208,11 +208,14 @@ def transcript(session_id: str, agent_id: str) -> Path | None:
 def requests_of(path: Path) -> list[dict]:
     """One entry per model request in a subagent transcript (assistant rows by message id)."""
     seen: dict[str, dict] = {}
+    shape: dict | None = None
     for line in path.read_text().splitlines():
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if d.get("type") == "api-request-shape" and shape is None:
+            shape = d.get("shape") or {}
         m = d.get("message") or {}
         if d.get("type") == "assistant" and m.get("id") and m["id"] not in seen:
             u = m.get("usage") or {}
@@ -221,4 +224,8 @@ def requests_of(path: Path) -> list[dict]:
                 "prompt_tokens": (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                                   + u.get("cache_read_input_tokens", 0)),
             }
+            if shape is not None and len(seen) == 1:
+                # The first request's shape, as the engine records it: the tools it offered.
+                seen[m["id"]]["tools"] = [t.get("name") for t in shape.get("tools", [])]
+                seen[m["id"]]["system_chars"] = sum(len(b.get("text", "")) for b in shape.get("system", []))
     return list(seen.values())

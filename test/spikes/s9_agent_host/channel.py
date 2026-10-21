@@ -150,7 +150,7 @@ class StubChannel:
                 await writer.drain()
                 if not keep:
                     break
-        except (ConnectionError, asyncio.IncompleteReadError):
+        except (OSError, asyncio.IncompleteReadError):
             pass
         finally:
             writer.close()
