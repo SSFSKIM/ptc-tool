@@ -32,7 +32,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) Spec review, round 2 on the round-1 fixes: folded in (Decision Log).
 - [x] (2026-10-20) M1 — spike: host feasibility. Verdict: Promote (Decision Log), 823 of 850 haiku calls.
 - [x] (2026-10-20) M2 — prompt profiles on the CLI route (3777674, fix 3e554d5; review clean).
-- [ ] M3 — the host route.
+- [x] (2026-10-20) M3 — the host route (22e4c1b, 17ddb4e, fix be5003b; review clean). 335 of 400 haiku calls.
 - [ ] M4 — doctrine, acceptance, ship.
 - [ ] Whole-branch review (review-code, high).
 - [ ] Outcomes & Retrospective.
