@@ -7,6 +7,7 @@ import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty
 
 from .cells import (
     READ_CHUNK_BYTES,
@@ -355,6 +356,27 @@ class KernelClient:
         o = read_owner(self.key)
         return (o.epoch, o.nonce) if o else None
 
+    def _wait_shell_ready(self, kc, timeout: float = 20.0) -> None:
+        """Confirm shell dispatch before sending a cell, without waiting on IOPub.
+
+        A delayed shell must fail BEFORE an unidentified pending marker is written:
+        after sending, the shorter cell-id wait could otherwise leave a marker that
+        late completion cannot discharge. A kernel_info reply proves the shell can
+        dispatch; its IOPub side effects are irrelevant to disk-backed cell output.
+        """
+        deadline = time.monotonic() + timeout
+        request = kc.kernel_info()
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                reply = kc.get_shell_msg(timeout=min(1.0, remaining))
+            except Empty:
+                continue
+            if (reply.get("msg_type") == "kernel_info_reply"
+                    and reply.get("parent_header", {}).get("msg_id") == request):
+                return
+        raise TimeoutError(f"kernel {self.key} shell did not respond within {timeout:g}s; "
+                           "nothing was sent — retry once it is responsive")
+
     def _connect_to_current_owner(self):
         """Connect, and return the connection WITH the incarnation it really reached.
 
@@ -374,16 +396,24 @@ class KernelClient:
         window costs one retry; two in a row is a key being replaced faster than anything
         can bind to it, and that is reported rather than papered over.
 
-        No IOPub readiness barrier is needed here: output comes from the cell's
-        disk log, and `_await_cell_id` can learn a missed `execute_input` from
-        current.json under the submit lock. Requiring
-        Jupyter's shell-plus-IOPub handshake as well made healthy kernels fail after
-        20 s under load, even though the durable witness was available. Bootstrap is
-        different: it installs that witness and must synchronize first (`_exec_raw`).
+        The shell must answer before anything is sent, but IOPub need not: output
+        comes from the cell's disk log, and `_await_cell_id` can learn a missed
+        `execute_input` from current.json under the submit lock. Jupyter's extra
+        IOPub handshake made healthy kernels fail after 20 s under load despite
+        that durable witness. Bootstrap installs the witness and still needs the
+        full synchronization (`_exec_raw`).
         """
         for attempt in (0, 1):
             owner = self._owner_identity()
+            if owner is None:
+                raise RuntimeError(f"kernel {self.key} has no owner while connecting; "
+                                   "nothing was sent — retry after the restart settles")
             kc = self._connect()
+            try:
+                self._wait_shell_ready(kc)
+            except BaseException:
+                kc.stop_channels()
+                raise
             if self._owner_identity() == owner:
                 return kc, owner
             kc.stop_channels()
