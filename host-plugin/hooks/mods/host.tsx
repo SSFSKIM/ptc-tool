@@ -416,6 +416,11 @@ async function pollLoop($: EngineInterface): Promise<void> {
     } catch {
       res = undefined
     }
+    if (state.stopped) {
+      // A result went undelivered while this poll was held: what it carries could not
+      // report back, and the lease is retiring this host.
+      return
+    }
     if (res === undefined || res.status !== 200) {
       if (res?.status === 410) {
         return // retired: the kernel is done with this host

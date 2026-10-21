@@ -617,6 +617,25 @@ describe('the result POST', () => {
     expect(w.polls).toHaveLength(polled)
   })
 
+  test('once a result went undelivered, the poll in flight is dropped whole: its jobs not run, its cancels not applied', async ($, on) => {
+    const w = world($, on, { result: () => ({ status: 500 }) })
+    await w.start()
+    // j1's result is never delivered; agent j2 runs on meanwhile.
+    await w.send({ jobs: [completeJob('j1'), agentJob('j2')] })
+    expect(w.spawns).toHaveLength(1)
+    await w.clock.advance(10_000)
+    expect(w.results).toHaveLength(3)
+    const polled = w.polls.length
+    await w.send({ jobs: [completeJob('j3'), agentJob('j4')], cancel: ['j2'] })
+    await w.clock.advance(30_000)
+    expect(w.completes).toHaveLength(1)
+    expect(w.registers).toHaveLength(1)
+    expect(w.spawns).toHaveLength(1)
+    expect(w.stops).toEqual([])
+    expect(w.results.map((r) => r.id)).toEqual(['j1', 'j1', 'j1'])
+    expect(w.polls).toHaveLength(polled)
+  })
+
   test('a second try that lands ends the retries and the poll goes on', async ($, on) => {
     const w = world($, on, { result: (_, __, n) => (n === 1 ? { status: 500 } : { status: 200 }) })
     await w.start()
