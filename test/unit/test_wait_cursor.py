@@ -6,6 +6,9 @@ which is exactly the surface the cursor lives on.
 import json
 import multiprocessing as mp
 import os
+import subprocess
+import sys
+import textwrap
 
 from ptc.client import Completed, KernelClient
 from ptc.paths import cells_dir, secure_dir
@@ -75,22 +78,32 @@ def test_a_forked_child_does_not_inherit_its_parents_cursor(monkeypatch, tmp_pat
     """
     monkeypatch.setenv("PTC_HOME", str(tmp_path))
     _seed("c4", 5, "the whole output\n")
+    # The suite has live threads (kernel reapers, peek servers). Forking pytest
+    # itself is unsafe, not merely noisy. A fresh, single-threaded interpreter still
+    # forks AFTER consuming the cursor, so it tests inheritance rather than spawn.
+    result = subprocess.run([sys.executable, "-W", "error::DeprecationWarning", "-c",
+                            textwrap.dedent("""
+        import os
+        from ptc.client import KernelClient
 
-    kc = KernelClient("c4")
-    assert "the whole output" in kc.wait_cell(5, timeout_s=10).output   # parent consumes it
-    r, w = os.pipe()
-    pid = os.fork()
-    if pid == 0:                                    # child: never returns to pytest
-        try:
-            os.write(w, KernelClient("c4").wait_cell(5, timeout_s=10).output.encode())
-        finally:
-            os._exit(0)
-    os.close(w)
-    seen = os.read(r, 4096).decode()
-    os.close(r)
-    os.waitpid(pid, 0)
-
-    assert "the whole output" in seen, "the forked child inherited the parent's cursor"
+        kc = KernelClient("c4")
+        assert "the whole output" in kc.wait_cell(5, timeout_s=10).output
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            try:
+                os.write(w, KernelClient("c4").wait_cell(5, timeout_s=10).output.encode())
+            finally:
+                os._exit(0)
+        os.close(w)
+        seen = os.read(r, 4096).decode()
+        os.close(r)
+        _, status = os.waitpid(pid, 0)
+        assert status == 0
+        assert "the whole output" in seen, "the forked child inherited the parent's cursor"
+    """)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_an_epoch_rotation_does_not_replay_what_this_caller_already_read(monkeypatch,

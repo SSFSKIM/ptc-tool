@@ -138,14 +138,23 @@ def test_a_registered_foreground_group_is_reaped_by_the_host(tmp_path):
     async def flow() -> int:
         task = asyncio.ensure_future(
             shell.bash(f"sleep 300 & echo $! > {pidfile}; wait", timeout=120))
-        pid = int(await _wait_for(pidfile))
-        killed.extend(bgroups.reap(tmp_path))       # the host's reap, mid-command
-        task.cancel()
         try:
-            await task
-        except BaseException:
-            pass
-        return pid
+            # The child can publish its pid before create_subprocess_shell returns
+            # to the parent and _register persists the group. This test is about a
+            # REGISTERED group: wait for the host's actual witness, not that pidfile.
+            deadline = time.monotonic() + 10
+            while not bgroups.read(tmp_path):
+                assert time.monotonic() < deadline, "foreground group was never registered"
+                await asyncio.sleep(0.01)
+            pid = int(await _wait_for(pidfile))
+            killed.extend(bgroups.reap(tmp_path))       # the host's reap, mid-command
+            return pid
+        finally:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
 
     pid = asyncio.run(flow())
     try:
