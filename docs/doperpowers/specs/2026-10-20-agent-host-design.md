@@ -28,7 +28,7 @@ routes and concurrency and nothing else.
 - [x] (2026-10-20) Design discussed and approved with the owner; measurements below taken.
 - [x] (2026-10-20) Spec written.
 - [ ] SDK pin to `claude-agent-sdk==0.2.169` (bundled CLI 2.1.305) shipped on `main` as v0.5.5 — a separate change, in flight; M1 needs it.
-- [ ] Spec review (adversarial spec review + buildability review of the execution section).
+- [x] (2026-10-20) Spec review, round 1: adversarial design review and buildability review, both folded in (Decision Log).
 - [ ] M1 — spike: host feasibility.
 - [ ] M2 — prompt profiles on the CLI route.
 - [ ] M3 — the host route.
@@ -247,15 +247,16 @@ path the peek socket uses for the 104-byte `sun_path` cap (`runtime/peek.py`
 ```jsonc
 // Job, kind "complete"
 {"id": "j-<uuid>", "kind": "complete", "model": "haiku", "system": "…", "prompt": "…",
- "promptFile": null, "maxTokens": 4096, "effort": null, "timeoutMs": 300000}
+ "promptFile": null, "systemFile": null, "maxTokens": 4096, "effort": null, "timeoutMs": 300000}
 // Job, kind "agent"
 {"id": "j-<uuid>", "kind": "agent",
  "type": {"prompt": "…", "tools": ["Read", "Grep", "Glob"], "model": "haiku", "effort": null,
-          "permissionMode": "bypassPermissions", "maxTurns": null},
- "prompt": "…", "promptFile": null, "description": "ptc agent", "timeoutMs": 600000}
+          "permissionMode": "bypassPermissions", "maxTurns": 50},
+ "prompt": "…", "promptFile": null, "cwd": "/abs/dir", "description": "ptc agent",
+ "timeoutMs": 600000}   // timeoutMs null when the call has no deadline
 // Result
 {"ok": true, "text": "…", "textFile": null, "usage": {…}, "agentId": "…"}
-{"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout", "detail": "…", "status": 429}
+{"ok": false, "reason": "api-error|refusal|aborted|error|denied|timeout|too-large", "detail": "…", "status": 429}
 ```
 
 - **Delivery.** A job counts as delivered when the next poll acks it. If a poll arrives
