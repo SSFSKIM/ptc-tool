@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from channel import POLL_BUDGET, StubChannel  # noqa: E402
+from channel import POLL_BUDGET, StubChannel
 
 
 async def http(path: str, method: str = "GET", target: str = "/", body=None):
@@ -142,6 +142,6 @@ def test_probe_routes(tmp_path):
     async def body(c):
         st, r = await http(c.path, "POST", "/probe/echo", b"x" * 1000)
         assert r == {"ok": True, "received": 1000}
-        st, r = await http(c.path, target="/probe/big?n=5000")
+        _, r = await http(c.path, target="/probe/big?n=5000")
         assert len(r) == 5000
     run(_with_channel(tmp_path, body))
