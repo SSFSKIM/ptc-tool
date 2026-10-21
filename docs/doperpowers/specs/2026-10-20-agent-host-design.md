@@ -960,6 +960,36 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: M3's fix wave, accepted by the author.
+  - `llm(max_tokens=None)` sends the host `maxTokens: null`, which the mod asks as 64,000
+    (`$.model.complete`'s cap), retrying once at the figure the engine names for a smaller
+    model. An explicit cap reaches a CLI child as its `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+    (`AgentOpts.max_output_tokens`, `llm()`'s alone; `agent.*` refuses it). A cap over
+    64,000 sends `"auto"` to the CLI, and `via="host"` refuses it.
+  - A cut is read from usage, `output_tokens >=` the caller's cap: the engine reports no
+    stop reason and adds 2,048 tokens of thinking headroom on the wire, while the CLI's
+    limit counts thinking too. Both routes then raise `AgentFailed` naming the cap, with
+    the partial text. On the CLI that needed `run_once` to fold the SDK's `ResultError`
+    into `AgentFailed`, which changes every is_error one-shot (max turns, a rate limit)
+    for today's callers too; the 0.6.0 changelog says so.
+  - Launch and hello share one start deadline; a launch that never returns fails the start
+    and counts toward the crash loop.
+  - A failed host result keeps its `agentId`, session and partial text, and the registry
+    row gets `agent_id` and `transcript`. The `claude-host` row is written when the job is
+    queued, so a call that fell back leaves none. Each logical call writes one audit record,
+    once its route is final; a `HostUnavailable` before queuing writes none of its own.
+  - Known limit, accepted: with no cap given, a reply between 64,000 and 128,000 tokens
+    (the CLI's own default on this machine is 128,000) is whole on the CLI and fails loudly
+    on the host as `AgentFailed` with the partial text. M4's doctrine says so in one line,
+    with `max_tokens` above 64,000 as the way to the CLI.
+  - Residual, logged as tech debt, not fixed: Bash tool processes run in their own process
+    groups (`detached`), so a host SIGKILLed from outside the kernel, or one that ignores
+    SIGTERM for 3 s, leaves its tools' groups running, as on the CLI route and codex. The
+    optional fix: killpg the host's direct children's groups before the SIGKILL escalation
+    in `_SdkHost.close`. Every exit that runs ptc's code reaps them (live probe).
+  Rationale: the route choice must not change the answer, within what `$.model.complete`
+  can produce.
+  Date/Author: 2026-10-20, M3 task-executor; rulings by doperpowers-15; folded by the plan-executor.
 - Decision: The author's rulings on M3's concerns. (1) `llm()`'s `max_tokens` defaults to
   the CLI's own per-model output cap, not 4096 (Interfaces), and a reply cut at the cap
   ends the same way on both routes, as the CLI route already surfaces it; the route
