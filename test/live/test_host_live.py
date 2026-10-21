@@ -28,6 +28,9 @@ live = pytest.mark.skipif(os.environ.get("PTC_LIVE") != "1", reason="PTC_LIVE=1 
 
 LAUNCHER = Path(__file__).resolve().parents[2] / "bin" / "ptc-launch"
 BUNDLED = "claude_agent_sdk/_bundled/claude"
+#: The skill's host floors with about 10 % over what was measured (M4, CLI 2.1.305).
+LLM_HOST_FLOOR = 40           # measured 34
+READER_HOST_FLOOR = 3_700     # measured 3,367 outside git
 
 
 @pytest.fixture
@@ -163,8 +166,10 @@ def test_32_reader_agents_run_on_the_host(host_kernel, tmp_path):
     for i in range(32):
         n = 3 + i
         # No trailing newline: after one, the Read tool shows an empty numbered line past
-        # the last, and a reader counting rows is off by one (3 of 32 were, live).
-        (repo / f"f{i:02d}.txt").write_text("\n".join(f"line {k}" for k in range(n)))
+        # the last, and a reader counting rows is off by one (3 of 32 were, live). Lines are
+        # labelled from 1, as Read numbers them: labelled from 0, the last line of a 29-line
+        # file read `29\tline 28` and a haiku reader answered 28 (1 of 32, M4).
+        (repo / f"f{i:02d}.txt").write_text("\n".join(f"line {k}" for k in range(1, n + 1)))
         counts[str(repo / f"f{i:02d}.txt")] = n
     git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run([*git, "init", "-q"], check=True)
@@ -203,6 +208,43 @@ def test_32_reader_agents_run_on_the_host(host_kernel, tmp_path):
     assert max(firsts) <= 4200
     assert models and all("haiku" in m for m in models)
 
+
+
+@live
+def test_the_host_floors(host_kernel, tmp_path):
+    """The host rows of the skill's floors table, outside git: an `llm()` completion (its
+    usage, as the mod posts it) and a `reader` agent (its transcript's first request).
+    Acceptance 2 gives the reader's figure in a git cwd. Three model calls at most."""
+    work = tmp_path / "floors"
+    work.mkdir()
+    kc = host_kernel("floorshost", work)
+    out = run_cell(kc, """
+        import json
+        from ptc.runtime import routes
+        from ptc.runtime.host import get_host
+        from ptc.runtime.profiles import LLM_SYSTEM
+        res = await get_host().submit(routes.complete_job(
+            "Reply with exactly: OK", system=LLM_SYSTEM, model="haiku", max_tokens=None,
+            effort=None), None)
+        print("LLM", res["text"].strip(), json.dumps(res["usage"]))
+        r = await agent.run("Reply with exactly: OK", profile="reader", model="haiku")
+        print("READER", r.text.strip(), r.via, r.agent_id)
+    """, timeout_s=180)
+    text = full_output("floorshost", out)
+    reply, usage = re.search(r"LLM (\S+) (\{.*\})", text).groups()
+    u = json.loads(usage)
+    llm_tokens = sum(u.get(k) or 0 for k in (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    answer, via, agent_id = re.search(r"READER (\S+) (\S+) (\S+)", text).groups()
+    time.sleep(3)              # the engine writes a subagent's last rows after its answer
+    row = next(r for r in json.loads((kernel_dir("floorshost") / "agents.json").read_text())
+               if r.get("agent_id") == agent_id)
+    reqs = _requests(Path(row["transcript"]))
+    print(f"\nhost llm(): {llm_tokens} prompt tokens ({u}); host reader outside git: "
+          f"{reqs[0]['tokens']}; model calls: {1 + len(reqs)}")
+    assert reply == "OK" and answer == "OK" and via == "host"
+    assert 0 < llm_tokens <= LLM_HOST_FLOOR
+    assert reqs[0]["tokens"] <= READER_HOST_FLOOR
 
 @live
 def test_a_host_crash_fails_its_jobs_and_a_new_host_takes_the_next_call(host_kernel, tmp_path):

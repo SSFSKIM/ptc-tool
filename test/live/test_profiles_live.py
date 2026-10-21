@@ -1,23 +1,23 @@
 """Acceptance 3 of the agent-host spec: the CLI route's prompt floors, measured live.
 
-Requires PTC_LIVE=1. Three one-word haiku replies, each read off the first assistant
+Requires PTC_LIVE=1. Four one-word haiku replies (the fourth is the `full` row of the skill's
+floors table), each read off the first assistant
 message's usage (`input + cache_creation + cache_read`), through the real `llm()` and
 `agent.run()` paths in this process. `PTC_LAUNCHER` is set to this checkout's launcher, as
 it is in every real kernel, so a child that would get the ptc MCP server does: the reader's
 floor is the one a ptc cell sees.
 
-The cwd is a fresh, short directory outside git. A child that is not `--bare` describes its
-cwd in an environment block, and the floors move with it (CLI 2.1.305, the `llm()` form
-without `--bare`): 392 tokens in `/tmp/<short>`, 417 under pytest's long `tmp_path`, 634 in
-a linked git worktree, whose description alone is ~240 tokens; the reader is 3,068 here
-and 3,302 in that worktree. `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, which every non-`full`
-profile sets, does not remove those worktree lines (both worktree figures are with it). The
-floors are taken where the block is smallest, and the dependence is stated here rather
-than hidden in a margin.
+The cwd is a directory under pytest's `tmp_path`, outside git (the spec author's ruling: the
+limits carry ~10 % margin so the criterion checks how the prompt is made up, not how long
+the path is). A child that is not `--bare` describes its cwd in an environment block, and
+the floors move with it (CLI 2.1.305, the `llm()` form without `--bare`): 392 tokens in
+`/tmp/<short>`, 417 under `tmp_path`, 634 in a linked git worktree, whose description alone
+is ~240 tokens; the reader is 3,068 in `/tmp/<short>` and 3,302 in that worktree.
+`CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, which every non-`full` profile sets, does not
+remove those worktree lines (both worktree figures are with it).
 """
 import asyncio
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -29,8 +29,9 @@ live = pytest.mark.skipif(os.environ.get("PTC_LIVE") != "1", reason="PTC_LIVE=1 
 
 @pytest.fixture
 def first_prompt_tokens(tmp_path, monkeypatch):
-    import tempfile
-    cwd = tempfile.mkdtemp(prefix="ptc-", dir="/tmp")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    cwd = str(cwd)
     # Trust model: the key would shadow OAuth and silently flip billing to metered API.
     assert "ANTHROPIC_API_KEY" not in os.environ
     import claude_agent_sdk
@@ -57,7 +58,6 @@ def first_prompt_tokens(tmp_path, monkeypatch):
             yield m
     monkeypatch.setattr(claude_agent_sdk, "query", capture)
     yield seen
-    shutil.rmtree(cwd, ignore_errors=True)
 
 
 @live
@@ -101,3 +101,17 @@ def test_reader_floor(first_prompt_tokens):
     print("reader:", m)
     assert not m["ptc_server"], "an explicit tool list that does not name ptc gets no server"
     assert m["tokens"] <= 3400
+
+
+@live
+def test_full_floor(first_prompt_tokens):
+    """The `full` row of the skill's floors table: `agent.run`'s default child, which keeps
+    Claude Code's whole tool set and, in a kernel, the ptc MCP server."""
+    from ptc.runtime import claude_backend
+    from ptc.runtime.agents import _Agent
+    a = _Agent(STATE.config, {"claude": claude_backend})
+    r = asyncio.run(a.run("Reply with exactly: OK", model="haiku", max_turns=1))
+    assert r.text.strip() == "OK" and r.via == "cli"
+    [m] = first_prompt_tokens
+    print("full:", m)
+    assert m["ptc_server"], "the default tool set keeps the ptc server"
