@@ -374,8 +374,9 @@ class KernelClient:
         window costs one retry; two in a row is a key being replaced faster than anything
         can bind to it, and that is reported rather than papered over.
 
-        No IOPub readiness barrier is needed here: `_await_cell_id` can learn a
-        missed `execute_input` from current.json under the submit lock. Requiring
+        No IOPub readiness barrier is needed here: output comes from the cell's
+        disk log, and `_await_cell_id` can learn a missed `execute_input` from
+        current.json under the submit lock. Requiring
         Jupyter's shell-plus-IOPub handshake as well made healthy kernels fail after
         20 s under load, even though the durable witness was available. Bootstrap is
         different: it installs that witness and must synchronize first (`_exec_raw`).
