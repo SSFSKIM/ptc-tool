@@ -180,9 +180,10 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
   } catch (err) {
     body = JSON.stringify({ ok: false, reason: 'error', detail: `the result could not be written: ${String(err)}` })
   }
-  const until = Date.now() + RESULT_WINDOW_MS
+  // Deadlines read the clock the waits sleep on.
+  const until = (await $.clock.now()) + RESULT_WINDOW_MS
   for (let attempt = 1; attempt <= RESULT_TRIES; attempt++) {
-    const left = until - Date.now()
+    const left = until - (await $.clock.now())
     if (left <= 0) {
       break
     }
@@ -197,7 +198,7 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
     if (status === 200 || status === 404) {
       return
     }
-    const gap = Math.min(RESULT_GAP_MS, until - Date.now())
+    const gap = Math.min(RESULT_GAP_MS, until - (await $.clock.now()))
     if (attempt < RESULT_TRIES && gap > 0) {
       await $.clock.sleep(gap)
     }
@@ -205,12 +206,20 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
   state.stopped = true
 }
 
-async function textOf($: EngineInterface, inline: string | null, file: string | null): Promise<string> {
-  if (file !== null) {
-    const read = await $.fs.read(file)
-    return typeof read === 'string' ? read : ''
+/** A job file the mod could not read; its message, which names the file, is the result's
+ *  detail as it stands. */
+class ReadFailed extends Error {}
+
+/** A job's text: inline, or read from the file the kernel moved it to. */
+async function textOf($: EngineInterface, field: 'prompt' | 'system', inline: string | null, file: string | null): Promise<string> {
+  if (file === null) {
+    return inline ?? ''
   }
-  return inline ?? ''
+  try {
+    return await $.fs.read(file)
+  } catch (err) {
+    throw new ReadFailed(`could not read the job's ${field} file ${file}: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 /** `$.model.complete`'s own ceiling on a reply, whatever the model can give. */
@@ -223,8 +232,8 @@ async function runComplete($: EngineInterface, job: CompleteJob, run: Running): 
   if (run.cancelRequested) {
     controller.abort()
   }
-  const prompt = await textOf($, job.prompt, job.promptFile)
-  const system = await textOf($, job.system, job.systemFile)
+  const prompt = await textOf($, 'prompt', job.prompt, job.promptFile)
+  const system = await textOf($, 'system', job.system, job.systemFile)
   const call = (maxTokens: number) =>
     $.model.complete(
       {
@@ -325,7 +334,7 @@ async function runAgent($: EngineInterface, job: AgentJob, run: Running): Promis
     return
   }
   const subagentType = await leanType($, job.type)
-  const prompt = await textOf($, job.prompt, job.promptFile)
+  const prompt = await textOf($, 'prompt', job.prompt, job.promptFile)
   // A cancel that landed while the type registered or the prompt was read stops the job
   // here: no child is created only to be stopped, with calls and tool runs in between.
   if (run.cancelRequested) {
@@ -378,7 +387,7 @@ async function dispatch($: EngineInterface, job: Job): Promise<void> {
     }
   } catch (err) {
     // A mod failure surfaces as a failed call, never as a hang.
-    await post($, job.id, { ok: false, reason: 'error', detail: String(err) })
+    await post($, job.id, { ok: false, reason: 'error', detail: err instanceof ReadFailed ? err.message : String(err) })
   }
 }
 
@@ -407,12 +416,18 @@ async function pollLoop($: EngineInterface): Promise<void> {
     } catch {
       res = undefined
     }
+    if (state.stopped) {
+      // A result went undelivered while this poll was held: what it carries could not
+      // report back, and the lease is retiring this host.
+      return
+    }
     if (res === undefined || res.status !== 200) {
       if (res?.status === 410) {
         return // retired: the kernel is done with this host
       }
-      failingSince ??= Date.now()
-      if (Date.now() - failingSince > POLL_GIVE_UP_MS) {
+      const now = await $.clock.now()
+      failingSince ??= now
+      if (now - failingSince > POLL_GIVE_UP_MS) {
         return
       }
       await $.clock.sleep(POLL_RETRY_MS)
