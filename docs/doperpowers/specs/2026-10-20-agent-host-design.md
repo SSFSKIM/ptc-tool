@@ -144,7 +144,7 @@ sends a job to the agent host.
   `"claude_code"`; `settings` other than `"none"`; and `json_schema=` when M1's verdict says
   host schema calls are not reliable enough (see "Structured output").
 
-So `agent.run()` with its default profile (`full`, whose system is `"claude_code"`) stays on
+So `agent.run()` with its default profile (`full`, whose tools are `"default"`) stays on
 the CLI route, exactly as today; a `reader` or custom-system run takes the host. A type
 whose tools name `Agent` or any `mcp__*` tool is CLI-only too: the host carries no MCP
 servers, and a host subagent that could spawn subagents would bypass the `PTC_MAX_DEPTH`
@@ -401,8 +401,8 @@ that cannot express a value falls back as described under "Routes".
     keeps it under 120 words.
   - `worker`: system `"claude_code"`, tools `["Read", "Grep", "Glob", "Bash", "Edit", "Write"]`,
     memory `"global"`, settings `"none"`. Its system means it runs on the CLI route.
-  - `full`: system `"claude_code"`, tools `"default"`, no memory, settings `"none"`. This
-    is exactly today's `agent.run` child, and `agent.*`'s default profile, so existing
+  - `full`: system `""` (the empty system prompt the SDK sends today, `--system-prompt ""`),
+    tools `"default"`, no memory, settings `"none"`. This is exactly today's `agent.run` child, and `agent.*`'s default profile, so existing
     callers see no change.
 - **Memory text.** Each file appears in the same framing Claude Code uses for its own:
   `Contents of <absolute path> (<user's private global instructions for all projects |
@@ -411,9 +411,12 @@ that cannot express a value falls back as described under "Routes".
   - `"project"` is every `CLAUDE.md` from the child's working directory up to its git
     root, in Claude Code's order: root first.
   - A missing file contributes nothing.
-- **The `--bare` rule.** The CLI route with settings `"none"` adds `--bare` (through
-  `extra_args`) exactly when the child's environment carries `ANTHROPIC_API_KEY` or
-  `ANTHROPIC_AUTH_TOKEN`. Measured: it takes `llm()` from 379 to 52 tokens on this
+- **The `--bare` rule.** The CLI route adds `--bare` (through `extra_args`) exactly when
+  the profile's settings are `"none"`, its system is a plain string, its tools are `[]`,
+  and the child's environment carries a non-empty `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_AUTH_TOKEN`. (M2: on 2.1.305 `--bare` cuts any tool list to Bash, Edit and
+  Read and replaces Claude Code's system prompt with a stub, so a profile with tools
+  never takes it.) Measured: it takes `llm()` from 379 to 52 tokens on this
   machine. Without credentials in the environment it would fail authentication, so the
   route keeps the 379-token form. `--bare` also skips hooks, LSP and plugin sync, which a
   settings-`"none"` child does not load anyway; it keeps `--mcp-config`, so `agent.*`
@@ -917,6 +920,19 @@ are in `ledger.jsonl` beside the driver.
 
 ## Decision Log
 
+- Decision: M2's executor decisions, folded. (1) `full`'s system is `""`, not
+  `"claude_code"`: today's `agent.run` child runs on the SDK's empty `--system-prompt ""`
+  (619 tokens), and the preset would cost 3,733; "exactly today's child" is the intent.
+  `full` still stays on the CLI route, through `tools="default"`. (2) `--bare` only for a
+  tool-less, string-system, settings-`"none"` profile with a credential present, since on
+  2.1.305 it cuts a tool list to Bash/Edit/Read (`reader` lost Grep and Glob). (3) `llm()`
+  refuses a profile whose settings are not `"none"`: user settings load plugins and MCP
+  servers, ptc's among them, and break `bare_llm`'s no-tools guarantee. (4) Memory uses
+  Claude Code's exact label, `project instructions, checked into the codebase`; the
+  project walk stops at the nearest `.git` (a worktree's `.git` file counts), and outside
+  git only the cwd's own `CLAUDE.md` is read. (5) `READER_SYSTEM` is 25 words.
+  Rationale: each keeps the spec's stated intent where its letter was wrong about 2.1.305.
+  Date/Author: 2026-10-20, M2 task-executor, folded by the plan-executor.
 - Decision: M1's task review approved the spike with Minor findings only. Two bear on
   M3 and are recorded here. Q2's tool rule is restated as observed, not as an
   intersection (above). And the spike's result-POST retry is not bounded at 10 s: three
