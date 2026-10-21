@@ -180,9 +180,10 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
   } catch (err) {
     body = JSON.stringify({ ok: false, reason: 'error', detail: `the result could not be written: ${String(err)}` })
   }
-  const until = Date.now() + RESULT_WINDOW_MS
+  // Deadlines read the clock the waits sleep on.
+  const until = (await $.clock.now()) + RESULT_WINDOW_MS
   for (let attempt = 1; attempt <= RESULT_TRIES; attempt++) {
-    const left = until - Date.now()
+    const left = until - (await $.clock.now())
     if (left <= 0) {
       break
     }
@@ -197,7 +198,7 @@ async function post($: EngineInterface, id: string, result: Result): Promise<voi
     if (status === 200 || status === 404) {
       return
     }
-    const gap = Math.min(RESULT_GAP_MS, until - Date.now())
+    const gap = Math.min(RESULT_GAP_MS, until - (await $.clock.now()))
     if (attempt < RESULT_TRIES && gap > 0) {
       await $.clock.sleep(gap)
     }
@@ -411,8 +412,9 @@ async function pollLoop($: EngineInterface): Promise<void> {
       if (res?.status === 410) {
         return // retired: the kernel is done with this host
       }
-      failingSince ??= Date.now()
-      if (Date.now() - failingSince > POLL_GIVE_UP_MS) {
+      const now = await $.clock.now()
+      failingSince ??= now
+      if (now - failingSince > POLL_GIVE_UP_MS) {
         return
       }
       await $.clock.sleep(POLL_RETRY_MS)
