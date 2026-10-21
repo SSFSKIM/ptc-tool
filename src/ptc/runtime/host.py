@@ -37,6 +37,7 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from ptc import toolgroups
 from ptc.paths import private_open, secure_dir
 
 from .agents import AgentFailed, AgentOpts, AgentResult, child_ptc_env
@@ -818,10 +819,9 @@ class _SdkHost:
         except BaseException:            # noqa: BLE001 — teardown never raises
             pass
         if self._process.returncode is None:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            # Its Bash tools run in groups of their own, which a SIGKILL would orphan:
+            # stopped first, the host's tool groups are read exactly, then killed with it.
+            toolgroups.tracker().stop_and_kill(self.pid)
 
 
 async def _launch_sdk(env: dict, cwd: str, plugin_dir: Path) -> _SdkHost:
@@ -835,6 +835,9 @@ async def _launch_sdk(env: dict, cwd: str, plugin_dir: Path) -> _SdkHost:
     client = ClaudeSDKClient(options=ClaudeAgentOptions(
         cwd=cwd, setting_sources=[], permission_mode="bypassPermissions", env=env,
         plugins=[{"type": "local", "path": str(plugin_dir)}]))
+    # The host's tools are learned while it lives, so a host killed from outside the
+    # kernel leaves none running (`ptc/toolgroups.py`).
+    toolgroups.watch()
     try:
         await client.connect()
         return _SdkHost(client)

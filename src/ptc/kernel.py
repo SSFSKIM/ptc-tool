@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import bgroups
+from . import bgroups, toolgroups
 from .discovery import read_meta, write_meta
 from .lock import key_lock
 from .memory import footprint
@@ -418,10 +418,17 @@ def kill_process_tree(pid: int) -> None:
     through its own cancellation path. A hard kill from another process — `ptc kill`,
     `ptc restart` — has no such moment and no reach here. NOTHING below pretends
     otherwise; the honest statement is that those grandchildren survive it.
+
+    The kernel's `claude` children (the agent host, CLI-route agents) are a second such
+    case, and a closable one: each runs its Bash tools in groups of their own, which this
+    kill would orphan. So the group is stopped first and those tool groups read while
+    their `claude`s still stand, then killed with it (`ptc.toolgroups.freeze_tree`).
     """
     try:
         if os.getpgid(pid) == pid:
+            tools = toolgroups.freeze_tree(pid)
             os.killpg(pid, signal.SIGKILL)
+            toolgroups.reap_rows(tools)
             return
     except OSError:
         pass
