@@ -1818,6 +1818,34 @@ discovery gap for a wrapper-launched `claude`, deferred until a real wrapper cas
   build, down from the ~5 200 recorded in S1; the cost that remains is the process launch).
   Suite: unit 594 passed.
   Date/Author: 2026-10-11 / Claude.
+- Decision: v0.5.5 — `claude-agent-sdk` pinned at 0.2.169 (was 0.2.142), so every Claude
+  child (`agent.*`, `llm()`, `web_search`) runs the SDK's bundled Claude Code 2.1.305
+  instead of 2.1.237. No PTC code changed.
+  Rationale: a child runs the bundled CLI (the SDK prefers its `_bundled/claude` over the
+  one on PATH), and 2.1.237 had fallen behind the host's 2.1.305 far enough to break: the
+  API refuses claude-opus-5-5 to a CLI below 2.1.280, so `llm(model="opus")` and
+  `agent.run(model="opus")` failed at start (a 262-call fan-out on 2026-10-20, friction
+  tracker #4). Follow-up work also builds on current-CLI features. The SDK side of the jump
+  changes nothing PTC uses: across the two sdists, `ResultMessage` (`terminal_reason`,
+  `structured_output`, `errors`, `api_error_status`) and the message parser are
+  byte-identical, `ClaudeSDKClient`'s connect/query/interrupt/disconnect keep their
+  signatures, and the argv the transport builds for each option set PTC passes (a full
+  agent, the default agent, the bare `llm()` child, fork, resume) is identical under both.
+  The two wire changes are ones PTC does not read: the transport sets
+  `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` in the child's environment and drops the
+  `session_state_changed` frames that asks for, and the wait before stdin closes now follows
+  those frames, which matters only for runs with hooks, `can_use_tool` or SDK MCP servers (a
+  PTC child has none). One CLI behavior the new build brings, taken from the SDK's
+  documentation of `SystemPromptPreset.snapshot` and not measured here: from 2.1.265, a
+  session given a custom prompt (PTC always passes one, `""` when `system=` is unset)
+  records its system prompt on its first request and resends it on every later one,
+  resume included, so `system=` given to `agent.resume(sid)` no longer replaces the resumed
+  session's prompt. Live: `llm(model="opus")` in a kernel on the new build answers.
+  Suite: unit 594 passed; integration 68 passed, 1 failed
+  (`test_bash.py::test_background_group_is_forgotten_when_it_ends`: the bash process-group
+  registry file was gone when read, a path that does not touch the SDK; the file passed 3/3
+  on rerun); live (agents, llm, fork, web, plugin smoke) 5 passed.
+  Date/Author: 2026-10-20 / Claude.
 
 ## Surprises & Discoveries
 
@@ -2409,6 +2437,8 @@ reviewer's marginal yield fell, and only a declining multi-round trend, not one 
 round, supports stopping.
 
 ## Revision Notes
+
+- 2026-10-20 (SDK bump, v0.5.5): `claude-agent-sdk` pinned at 0.2.169, whose bundled Claude Code 2.1.305 replaces 2.1.237 for every Claude child, so `model="opus"` works again (the API refuses claude-opus-5-5 below CLI 2.1.280). No PTC code changed: the SDK's message types and the CLI argv PTC's options build are the same in both versions. The Decision Log entry carries the review of what changed and the suite record.
 
 - 2026-10-11 (fan-out rules + `tools=`, v0.5.4): the skill gains a "Fan-out rules" section — decide and state the concurrency per fan-out (the per-kernel cap is a ceiling that sums across kernels; close finished `spawn` handles), and strip each child's context with the new `tools=` option (a default child carries 23 863 prompt tokens of tool definitions; `tools=[]` 147, a two-tool reader 2 776) or, for a direct `claude -p`, the flag set that takes 23 786 → 368 tokens. `llm()` doc remeasured (~150-token prompt; the process launch is the cost). Decision Log entry carries the measurements.
 
